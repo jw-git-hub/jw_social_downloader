@@ -1,0 +1,26 @@
+services:
+  bot:
+    build: .
+    container_name: jw_downloader_bot
+    restart: always
+    # Бот работает только на исходящих соединениях (long polling, без входящих
+    # портов). Docker-NAT на этом хосте роняет крупные аплоады в Telegram:
+    # путь до Telegram имеет MTU 1280, а ICMP «fragmentation needed» не
+    # доставляется обратно в контейнер через NAT — отправка файлов >~1.5 МБ
+    # висит и отваливается по таймауту. Сеть хоста тот же аплоад отдаёт за ~4с,
+    # поэтому используем host-сеть напрямую и обходим проблему NAT целиком.
+    network_mode: host
+    env_file: .env
+    volumes:
+      - bot_data:/app/data
+      - ./secrets:/app/secrets
+    tmpfs:
+      - /tmp/jw_downloads:size=200M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  bot_data:
