@@ -12,6 +12,18 @@
 
 ---
 
+## 📱 Демонстрация / Demo
+
+<p align="center">
+  <img src="assets/screenshots/demo-instagram.jpg" width="270" alt="Скачивание видео из Instagram / Downloading a video from Instagram" />
+  &nbsp;&nbsp;
+  <img src="assets/screenshots/demo-facebook.jpg" width="270" alt="Скачивание видео из Facebook / Downloading a video from Facebook" />
+</p>
+
+<p align="center"><sub>Слева — скачивание Reels из Instagram · справа — видео из Facebook: бот принимает ссылку и возвращает готовое медиа.<br/>Left — an Instagram Reel · right — a Facebook video: the bot takes a link and returns ready-to-use media.</sub></p>
+
+---
+
 ## Русский
 
 ### Содержание
