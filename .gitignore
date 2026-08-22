@@ -3,10 +3,12 @@
 .env.*
 !.env.example
 cookies.txt
+*cookies*.txt
 secrets/
 
 # ── Данные рантайма ──
 data/
+backups/
 *.db
 *.sqlite
 *.sqlite3
