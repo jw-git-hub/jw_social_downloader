@@ -5,3 +5,10 @@ __pycache__
 data/
 .venv/
 secrets/
+.env.*
+!.env.example
+backups/
+.claude/
+.superpowers/
+docs/
+BOT_AUDIT_REPORT.md
