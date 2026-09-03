@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM python:3.12-slim AS base
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg curl unzip ca-certificates \
@@ -14,6 +14,11 @@ RUN pip install --no-cache-dir -r requirements.txt \
 
 COPY . .
 
-RUN mkdir -p /app/data /tmp/jw_downloads
+RUN mkdir -p /app/data /srv/jw_downloads
 
 CMD ["python", "-m", "bot"]
+
+# Стадия для прогона тестов. В прод-образ (target: base) не попадает.
+FROM base AS test
+RUN pip install --no-cache-dir -r requirements-dev.txt
+CMD ["python", "-m", "pytest", "-q"]

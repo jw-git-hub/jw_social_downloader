@@ -1,6 +1,8 @@
 services:
   bot:
-    build: .
+    build:
+      context: .
+      target: base
     container_name: jw_downloader_bot
     restart: always
     # Бот работает только на исходящих соединениях (long polling, без входящих
