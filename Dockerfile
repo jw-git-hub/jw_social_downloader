@@ -12,13 +12,18 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt \
     && pip install --no-cache-dir --upgrade "yt-dlp[default,curl-cffi]" gallery-dl
 
+# Тестовые зависимости ставятся ДО копирования кода: иначе любая правка
+# исходников инвалидирует слой и каждый прогон тестов заново тянет pytest из сети.
+FROM base AS testdeps
+COPY requirements-dev.txt .
+RUN pip install --no-cache-dir -r requirements-dev.txt
+
+FROM base AS runtime
 COPY . .
-
 RUN mkdir -p /app/data /srv/jw_downloads
-
 CMD ["python", "-m", "bot"]
 
-# Стадия для прогона тестов. В прод-образ (target: base) не попадает.
-FROM base AS test
-RUN pip install --no-cache-dir -r requirements-dev.txt
+FROM testdeps AS test
+COPY . .
+RUN mkdir -p /app/data /srv/jw_downloads
 CMD ["python", "-m", "pytest", "-q"]
