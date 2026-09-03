@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import html
 import os
+import shutil
+import tempfile
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
@@ -73,7 +77,29 @@ def _parse_error(stderr: str, platform: str) -> str:
     return f"❌ Ошибка загрузки:\n<code>{html.escape(short_err)}</code>"
 
 
-def _build_command(url: str, platform: str, output_path: Path) -> list[str]:
+@contextlib.contextmanager
+def _ephemeral_cookies() -> Iterator[Path | None]:
+    # yt-dlp и gallery-dl по завершении перезаписывают файл, переданный в --cookies,
+    # свежей cookie-jar. Если платформа в этот момент отдаёт транзиторный
+    # неавторизованный ответ (разлогин), они пишут обрезанную банку без sessionid
+    # поверх мастер-файла — и рабочие креды теряются безвозвратно. Поэтому утилитам
+    # всегда подсовываем одноразовую копию во временной директории: что бы они в неё
+    # ни записали, мастер-файл (secrets/cookies.txt) не трогаем.
+    cookies_file = Path(settings.COOKIES_FILE) if settings.COOKIES_FILE else None
+    if not cookies_file or not cookies_file.exists():
+        yield None
+        return
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="jw_cookies_"))
+    try:
+        tmp_cookies = tmp_dir / "cookies.txt"
+        shutil.copyfile(cookies_file, tmp_cookies)
+        yield tmp_cookies
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _build_command(url: str, platform: str, output_path: Path, cookies_path: Path | None) -> list[str]:
     cmd = [
         "yt-dlp",
         "--no-check-certificates",
@@ -84,8 +110,7 @@ def _build_command(url: str, platform: str, output_path: Path) -> list[str]:
         "-o", str(output_path),
     ]
 
-    cookies_path = Path(settings.COOKIES_FILE) if settings.COOKIES_FILE else None
-    if cookies_path and cookies_path.exists():
+    if cookies_path is not None:
         cmd.extend(["--cookies", str(cookies_path)])
         logger.debug("Using cookies file: {}", cookies_path)
 
@@ -211,42 +236,42 @@ def _cleanup_glob(directory: Path, prefix: str) -> None:
 
 
 async def _try_gallery_dl(url: str, filename: str) -> list[Path] | None:
-    cmd = [
-        "gallery-dl",
-        "-D", str(DOWNLOAD_DIR),
-        "-f", f"{filename}_{{num}}.{{extension}}",
-    ]
-    cookies_path = Path(settings.COOKIES_FILE) if settings.COOKIES_FILE else None
-    if cookies_path and cookies_path.exists():
-        cmd.extend(["--cookies", str(cookies_path)])
-    cmd.append(url)
+    with _ephemeral_cookies() as cookies_path:
+        cmd = [
+            "gallery-dl",
+            "-D", str(DOWNLOAD_DIR),
+            "-f", f"{filename}_{{num}}.{{extension}}",
+        ]
+        if cookies_path is not None:
+            cmd.extend(["--cookies", str(cookies_path)])
+        cmd.append(url)
 
-    logger.info("Falling back to gallery-dl | url={}", url)
+        logger.info("Falling back to gallery-dl | url={}", url)
 
-    try:
-        process = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        )
         try:
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=settings.DOWNLOAD_TIMEOUT)
-        except asyncio.TimeoutError:
-            logger.warning("gallery-dl timeout | url={}", url)
-            process.kill()
-            await process.wait()
-            return None
+            process = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=settings.DOWNLOAD_TIMEOUT)
+            except asyncio.TimeoutError:
+                logger.warning("gallery-dl timeout | url={}", url)
+                process.kill()
+                await process.wait()
+                return None
 
-        if process.returncode != 0:
-            stderr_text = stderr.decode(errors="replace").strip()
-            logger.warning("gallery-dl failed | code={} stderr={}", process.returncode, stderr_text[:300])
-            return None
+            if process.returncode != 0:
+                stderr_text = stderr.decode(errors="replace").strip()
+                logger.warning("gallery-dl failed | code={} stderr={}", process.returncode, stderr_text[:300])
+                return None
 
-        files = _find_downloaded_files(DOWNLOAD_DIR, filename)
-        if files:
-            return files
-        return None
-    except Exception as exc:
-        logger.exception("gallery-dl error: {}", exc)
-        return None
+            files = _find_downloaded_files(DOWNLOAD_DIR, filename)
+            if files:
+                return files
+            return None
+        except Exception as exc:
+            logger.exception("gallery-dl error: {}", exc)
+            return None
 
 
 async def _try_gallery_dl_fallback(url: str, filename: str) -> DownloadResult | None:
@@ -306,112 +331,113 @@ async def download_media(url: str, platform: str) -> DownloadResult:
         logger.info("gallery-dl primary returned nothing, falling back to yt-dlp | platform={} url={}", platform, url)
         _cleanup_glob(DOWNLOAD_DIR, filename)
 
-    if platform in ("pinterest", "instagram"):
-        if platform == "instagram":
-            output_template = DOWNLOAD_DIR / (filename + "_%(playlist_index)s.%(ext)s")
-        else:
-            output_template = DOWNLOAD_DIR / (filename + ".%(ext)s")
-        cmd = _build_command(url, platform, output_template)
-    else:
-        cmd = _build_command(url, platform, output_path)
-
-    logger.info("Starting download | platform={} url={}", platform, url)
-
-    # Для TikTok делаем несколько попыток запуска yt-dlp: транзиторный WAF-челлендж
-    # (rehydration / 403) часто проходит со второй попытки. Для остальных платформ
-    # max_attempts=1 — поведение полностью прежнее.
-    max_attempts = TIKTOK_MAX_ATTEMPTS if platform == "tiktok" else 1
-
-    try:
-        stdout = b""
-        stderr = b""
-        actual_files: list[Path] = []
-        process = None
-        for attempt in range(1, max_attempts + 1):
-            process = await asyncio.create_subprocess_exec(
-                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            )
-
-            try:
-                stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=settings.DOWNLOAD_TIMEOUT)
-            except asyncio.TimeoutError:
-                logger.warning("Download timeout | url={}", url)
-                process.kill()
-                await process.wait()
-                _cleanup_glob(DOWNLOAD_DIR, filename)
-                return DownloadResult(success=False, error_message="⏱ Таймаут: сервер не ответил за 120 секунд")
-
-            actual_files = _find_downloaded_files(DOWNLOAD_DIR, filename)
-
-            if actual_files or attempt == max_attempts:
-                break
-            stderr_text = stderr.decode(errors="replace").lower()
-            if platform == "tiktok" and any(m in stderr_text for m in TIKTOK_TRANSIENT_MARKERS):
-                logger.info("TikTok transient failure, retry {}/{} after {}s", attempt, max_attempts, TIKTOK_RETRY_DELAY)
-                _cleanup_glob(DOWNLOAD_DIR, filename)
-                await asyncio.sleep(TIKTOK_RETRY_DELAY)
-                continue
-            break
-
-        # Если файлы скачаны — это успех, даже если exit code != 0
-        # (yt-dlp может вернуть code 1 из-за проблем с записью cookies, но файлы уже есть)
-        if actual_files:
-            valid_files = [f for f in actual_files if f.stat().st_size > 0]
-            if not valid_files:
-                stderr_text = stderr.decode(errors="replace").strip()
-                stdout_text = stdout.decode(errors="replace").strip()
-                full_output = stderr_text or stdout_text
-                logger.error("yt-dlp produced zero-size files | code={}", process.returncode)
-                _cleanup_glob(DOWNLOAD_DIR, filename)
-
-                if platform in GALLERY_DL_FALLBACK_PLATFORMS:
-                    gd_result = await _try_gallery_dl_fallback(url, filename)
-                    if gd_result:
-                        return gd_result
-
-                return DownloadResult(success=False, error_message=_parse_error(full_output, platform))
-
-            total_size_mb = round(sum(f.stat().st_size for f in valid_files) / (1024 * 1024), 2)
-            logger.info("Download complete | files={} total_size={}MB", len(valid_files), total_size_mb)
-            if process.returncode != 0:
-                stderr_text = stderr.decode(errors="replace").strip()
-                logger.warning("yt-dlp exited with code {} but files exist | stderr={}", process.returncode, stderr_text[:200])
-
-            first_file = valid_files[0]
-            ext = first_file.suffix.lower()
-            media_type = "image" if ext in IMAGE_EXTS else "video"
-
-            if len(valid_files) > 1:
-                return DownloadResult(
-                    file_path=str(first_file),
-                    file_paths=[str(f) for f in valid_files],
-                    file_size_mb=total_size_mb,
-                    success=True,
-                    media_type=media_type,
-                )
+    with _ephemeral_cookies() as cookies_path:
+        if platform in ("pinterest", "instagram"):
+            if platform == "instagram":
+                output_template = DOWNLOAD_DIR / (filename + "_%(playlist_index)s.%(ext)s")
             else:
-                return DownloadResult(
-                    file_path=str(first_file),
-                    file_size_mb=total_size_mb,
-                    success=True,
-                    media_type=media_type,
+                output_template = DOWNLOAD_DIR / (filename + ".%(ext)s")
+            cmd = _build_command(url, platform, output_template, cookies_path)
+        else:
+            cmd = _build_command(url, platform, output_path, cookies_path)
+
+        logger.info("Starting download | platform={} url={}", platform, url)
+
+        # Для TikTok делаем несколько попыток запуска yt-dlp: транзиторный WAF-челлендж
+        # (rehydration / 403) часто проходит со второй попытки. Для остальных платформ
+        # max_attempts=1 — поведение полностью прежнее.
+        max_attempts = TIKTOK_MAX_ATTEMPTS if platform == "tiktok" else 1
+
+        try:
+            stdout = b""
+            stderr = b""
+            actual_files: list[Path] = []
+            process = None
+            for attempt in range(1, max_attempts + 1):
+                process = await asyncio.create_subprocess_exec(
+                    *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
                 )
 
-        stderr_text = stderr.decode(errors="replace").strip()
-        stdout_text = stdout.decode(errors="replace").strip()
-        full_output = stderr_text or stdout_text
-        logger.error("yt-dlp failed | code={} stderr={}", process.returncode, full_output)
+                try:
+                    stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=settings.DOWNLOAD_TIMEOUT)
+                except asyncio.TimeoutError:
+                    logger.warning("Download timeout | url={}", url)
+                    process.kill()
+                    await process.wait()
+                    _cleanup_glob(DOWNLOAD_DIR, filename)
+                    return DownloadResult(success=False, error_message="⏱ Таймаут: сервер не ответил за 120 секунд")
 
-        if platform in GALLERY_DL_FALLBACK_PLATFORMS:
-            gd_result = await _try_gallery_dl_fallback(url, filename)
-            if gd_result:
-                return gd_result
+                actual_files = _find_downloaded_files(DOWNLOAD_DIR, filename)
 
-        _cleanup_glob(DOWNLOAD_DIR, filename)
-        return DownloadResult(success=False, error_message=_parse_error(full_output, platform))
+                if actual_files or attempt == max_attempts:
+                    break
+                stderr_text = stderr.decode(errors="replace").lower()
+                if platform == "tiktok" and any(m in stderr_text for m in TIKTOK_TRANSIENT_MARKERS):
+                    logger.info("TikTok transient failure, retry {}/{} after {}s", attempt, max_attempts, TIKTOK_RETRY_DELAY)
+                    _cleanup_glob(DOWNLOAD_DIR, filename)
+                    await asyncio.sleep(TIKTOK_RETRY_DELAY)
+                    continue
+                break
 
-    except Exception as exc:
-        logger.exception("Unexpected download error: {}", exc)
-        _cleanup_glob(DOWNLOAD_DIR, filename)
-        # Экранируем текст исключения — уходит с parse_mode=HTML.
-        return DownloadResult(success=False, error_message=f"Непредвиденная ошибка: {html.escape(str(exc))}")
+            # Если файлы скачаны — это успех, даже если exit code != 0
+            # (yt-dlp может вернуть code 1 из-за проблем с записью cookies, но файлы уже есть)
+            if actual_files:
+                valid_files = [f for f in actual_files if f.stat().st_size > 0]
+                if not valid_files:
+                    stderr_text = stderr.decode(errors="replace").strip()
+                    stdout_text = stdout.decode(errors="replace").strip()
+                    full_output = stderr_text or stdout_text
+                    logger.error("yt-dlp produced zero-size files | code={}", process.returncode)
+                    _cleanup_glob(DOWNLOAD_DIR, filename)
+
+                    if platform in GALLERY_DL_FALLBACK_PLATFORMS:
+                        gd_result = await _try_gallery_dl_fallback(url, filename)
+                        if gd_result:
+                            return gd_result
+
+                    return DownloadResult(success=False, error_message=_parse_error(full_output, platform))
+
+                total_size_mb = round(sum(f.stat().st_size for f in valid_files) / (1024 * 1024), 2)
+                logger.info("Download complete | files={} total_size={}MB", len(valid_files), total_size_mb)
+                if process.returncode != 0:
+                    stderr_text = stderr.decode(errors="replace").strip()
+                    logger.warning("yt-dlp exited with code {} but files exist | stderr={}", process.returncode, stderr_text[:200])
+
+                first_file = valid_files[0]
+                ext = first_file.suffix.lower()
+                media_type = "image" if ext in IMAGE_EXTS else "video"
+
+                if len(valid_files) > 1:
+                    return DownloadResult(
+                        file_path=str(first_file),
+                        file_paths=[str(f) for f in valid_files],
+                        file_size_mb=total_size_mb,
+                        success=True,
+                        media_type=media_type,
+                    )
+                else:
+                    return DownloadResult(
+                        file_path=str(first_file),
+                        file_size_mb=total_size_mb,
+                        success=True,
+                        media_type=media_type,
+                    )
+
+            stderr_text = stderr.decode(errors="replace").strip()
+            stdout_text = stdout.decode(errors="replace").strip()
+            full_output = stderr_text or stdout_text
+            logger.error("yt-dlp failed | code={} stderr={}", process.returncode, full_output)
+
+            if platform in GALLERY_DL_FALLBACK_PLATFORMS:
+                gd_result = await _try_gallery_dl_fallback(url, filename)
+                if gd_result:
+                    return gd_result
+
+            _cleanup_glob(DOWNLOAD_DIR, filename)
+            return DownloadResult(success=False, error_message=_parse_error(full_output, platform))
+
+        except Exception as exc:
+            logger.exception("Unexpected download error: {}", exc)
+            _cleanup_glob(DOWNLOAD_DIR, filename)
+            # Экранируем текст исключения — уходит с parse_mode=HTML.
+            return DownloadResult(success=False, error_message=f"Непредвиденная ошибка: {html.escape(str(exc))}")
