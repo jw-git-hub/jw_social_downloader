@@ -37,7 +37,12 @@ class Settings(BaseSettings):
     SUBSCRIPTION_PRICE_VND: int = 125000
     SUBSCRIPTION_PRICE_THB: int = 175
 
-    model_config = {"env_file": ".env"}
+    # extra="ignore" обязателен: в .env лежат ключи для контейнера telegram-bot-api
+    # (TELEGRAM_API_ID/TELEGRAM_API_HASH), которые Settings не объявляет. Источник
+    # dotenv, в отличие от переменных окружения, подаёт в валидацию ВСЕ непустые
+    # ключи файла, а pydantic-settings по умолчанию запрещает лишние поля — без
+    # этого бот падает на импорте, как только ключи заполнены.
+    model_config = {"env_file": ".env", "extra": "ignore"}
 
 
 settings = Settings()
