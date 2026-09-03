@@ -41,7 +41,11 @@ def _rotation(stream: dict) -> int:
 
 
 def parse_ffprobe_json(raw: str) -> MediaInfo | None:
-    """Разбирает вывод `ffprobe -print_format json`. None — если вывод нечитаем."""
+    """Разбирает вывод `ffprobe -print_format json`.
+
+    None — если вывод нечитаем как JSON или имеет неожиданную структуру
+    (не тот тип полей, не список и т.п.). Никогда не бросает исключений.
+    """
     try:
         data = json.loads(raw)
     except (json.JSONDecodeError, TypeError):
@@ -49,33 +53,40 @@ def parse_ffprobe_json(raw: str) -> MediaInfo | None:
     if not isinstance(data, dict):
         return None
 
-    streams = data.get("streams") or []
-    fmt = data.get("format") or {}
+    try:
+        streams = data.get("streams") or []
+        fmt = data.get("format") or {}
 
-    video = next((s for s in streams if s.get("codec_type") == "video"), None)
-    audio = next((s for s in streams if s.get("codec_type") == "audio"), None)
+        video = next((s for s in streams if s.get("codec_type") == "video"), None)
+        audio = next((s for s in streams if s.get("codec_type") == "audio"), None)
 
-    width = height = 0
-    if video is not None:
-        width = int(_first_float(video.get("width")))
-        height = int(_first_float(video.get("height")))
-        # Повёрнутое видео: Telegram ждёт отображаемые размеры, а не размеры кадра.
-        if abs(_rotation(video)) % 180 == 90:
-            width, height = height, width
+        width = height = 0
+        if video is not None:
+            width = int(_first_float(video.get("width")))
+            height = int(_first_float(video.get("height")))
+            # Повёрнутое видео: Telegram ждёт отображаемые размеры, а не размеры кадра.
+            if abs(_rotation(video)) % 180 == 90:
+                width, height = height, width
 
-    duration = _first_float(
-        fmt.get("duration"),
-        video.get("duration") if video else None,
-        audio.get("duration") if audio else None,
-    )
+        duration = _first_float(
+            fmt.get("duration"),
+            video.get("duration") if video else None,
+            audio.get("duration") if audio else None,
+        )
 
-    return MediaInfo(
-        has_video=video is not None,
-        has_audio=audio is not None,
-        duration=duration,
-        width=width,
-        height=height,
-    )
+        return MediaInfo(
+            has_video=video is not None,
+            has_audio=audio is not None,
+            duration=duration,
+            width=width,
+            height=height,
+        )
+    except Exception as exc:
+        # Форма JSON неожиданная (не тот тип поля, не dict/list там, где ждали
+        # dict/list, "inf"/"nan" в размерах и т.п.) — не наша забота чинить её,
+        # наша забота не упасть.
+        logger.warning("ffprobe json has unexpected structure: {}", exc)
+        return None
 
 
 def video_reject_reason(info: MediaInfo | None) -> str | None:
@@ -93,8 +104,40 @@ def video_reject_reason(info: MediaInfo | None) -> str | None:
     return None
 
 
+# Коды причин — чтобы вызывающий мог различать их программно, а не по тексту.
+REJECT_NO_METADATA = "no_metadata"
+REJECT_NO_VIDEO = "no_video"
+REJECT_NO_AUDIO = "no_audio"
+REJECT_ZERO_DURATION = "zero_duration"
+REJECT_NO_DIMENSIONS = "no_dimensions"
+
+
+def video_reject_code(info: MediaInfo | None) -> str | None:
+    """Машиночитаемая причина отказа. None — файл годен к отправке как видео.
+
+    Отсутствие звука выделено отдельным кодом: это единственная причина,
+    которую вызывающий обрабатывает не отказом, а повторной загрузкой.
+    """
+    if info is None:
+        return REJECT_NO_METADATA
+    if not info.has_video:
+        return REJECT_NO_VIDEO
+    if not info.has_audio:
+        return REJECT_NO_AUDIO
+    if info.duration <= 0:
+        return REJECT_ZERO_DURATION
+    if info.width <= 0 or info.height <= 0:
+        return REJECT_NO_DIMENSIONS
+    return None
+
+
 async def probe_media(path: Path) -> MediaInfo | None:
-    """Запускает ffprobe. Никогда не бросает — при любой беде возвращает None."""
+    """Запускает ffprobe. Никогда не бросает — при любой беде возвращает None.
+
+    Исключение — отмена задачи (CancelledError): дочерний процесс в этом
+    случае убивается и дожидается, а отмена продолжает распространяться,
+    как и полагается.
+    """
     cmd = [
         "ffprobe", "-v", "error",
         "-show_streams", "-show_format",
@@ -105,15 +148,34 @@ async def probe_media(path: Path) -> MediaInfo | None:
         process = await asyncio.create_subprocess_exec(
             *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
-        try:
-            stdout, _ = await asyncio.wait_for(process.communicate(), timeout=FFPROBE_TIMEOUT)
-        except asyncio.TimeoutError:
-            process.kill()
-            await process.wait()
-            logger.warning("ffprobe timeout | path={}", path)
-            return None
+    except Exception as exc:
+        logger.warning("ffprobe failed to start | path={} error={}", path, exc)
+        return None
+
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=FFPROBE_TIMEOUT)
+    except asyncio.TimeoutError:
+        logger.warning("ffprobe timeout | path={}", path)
+        return None
     except Exception as exc:
         logger.warning("ffprobe failed | path={} error={}", path, exc)
         return None
+    finally:
+        # Таймаут или отмена задачи могли оставить процесс живым — не плодим
+        # зомби и не оставляем ffprobe висеть на большом файле.
+        if process.returncode is None:
+            process.kill()
+            await process.wait()
 
-    return parse_ffprobe_json(stdout.decode(errors="replace"))
+    if process.returncode != 0:
+        logger.debug(
+            "ffprobe exited non-zero | path={} code={} stderr={}",
+            path, process.returncode, stderr.decode(errors="replace")[:300],
+        )
+        return None
+
+    try:
+        return parse_ffprobe_json(stdout.decode(errors="replace"))
+    except Exception as exc:
+        logger.warning("ffprobe output could not be parsed | path={} error={}", path, exc)
+        return None
