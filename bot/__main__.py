@@ -15,6 +15,16 @@ from bot.services.cleanup import periodic_cleanup
 from bot.utils.log_guard import setup_logging
 
 
+async def run_polling(dp, bot) -> None:
+    """Запуск лонг-поллинга.
+
+    `drop_pending_updates=True` обязателен: Telegram держит очередь до 24
+    часов, и без сброса каждая ссылка, присланная во время простоя, качается
+    заново со списанием квоты, а ответ прилетает в давно забытый диалог.
+    """
+    await dp.start_polling(bot, drop_pending_updates=True)
+
+
 async def main() -> None:
     setup_logging()
 
@@ -64,7 +74,7 @@ async def main() -> None:
         pass
 
     logger.info("Bot started")
-    await dp.start_polling(bot)
+    await run_polling(dp, bot)
 
 
 if __name__ == "__main__":
