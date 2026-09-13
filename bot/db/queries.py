@@ -36,10 +36,30 @@ async def get_user_by_id(session: AsyncSession, user_id: int) -> User | None:
 
 
 async def get_user_by_username(session: AsyncSession, username: str) -> User | None:
+    """Регистронезависимый поиск по нику.
+
+    Telegram-ники регистронезависимы, а колонка — TEXT без NOCASE, поэтому
+    `@Ivan` при сохранённом `ivan` давал «Пользователь не найден».
+
+    Первая строка вместо `scalar_one_or_none()`: уникальный индекс закрывает
+    появление новых дубликатов, но старые могут остаться, а восстановление
+    БД из бэкапа способно вернуть их снова, и падать `MultipleResultsFound`
+    на платящем клиенте недопустимо. Из дубликатов берём того, кто писал
+    боту позже всех, — это текущий владелец ника.
+    """
+    # ВАЖНО: именно strip() ДО lstrip("@") — при входе вида "  @Ivan" лидирующий
+    # пробел иначе блокирует lstrip("@") (тот останавливается на первом же
+    # символе не из набора), и "@" остаётся приклеенным к needle.
+    needle = username.strip().lstrip("@").lower()
+    if not needle:
+        return None
     result = await session.execute(
-        select(User).where(User.username == username.lstrip("@"))
+        select(User)
+        .where(func.lower(User.username) == needle)
+        .order_by(User.updated_at.desc())
+        .limit(1)
     )
-    return result.scalar_one_or_none()
+    return result.scalars().first()
 
 
 def _as_utc(value: datetime | None) -> datetime | None:
