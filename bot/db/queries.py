@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import settings
-from bot.db.models import DownloadLog, User
+from bot.db.models import DownloadLog, SubscriptionGrant, User
 
 
 async def get_or_create_user(session: AsyncSession, tg_user) -> User:
@@ -41,6 +42,89 @@ async def get_user_by_username(session: AsyncSession, username: str) -> User | N
     return result.scalar_one_or_none()
 
 
+def _as_utc(value: datetime | None) -> datetime | None:
+    """SQLite отдаёт naive datetime. Всё, что туда записано, записано в UTC."""
+    if value is None:
+        return None
+    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+
+
+@dataclass(frozen=True)
+class GrantOutcome:
+    """Исход изменения подписки.
+
+    `applied` — изменение реально применено;
+    `user_found` — пользователь существует;
+    `duplicate` — такой `idempotency_key` уже применялся;
+    `subscription_until` — состояние ПОСЛЕ операции, tz-aware UTC.
+    """
+
+    applied: bool
+    user_found: bool
+    duplicate: bool
+    subscription_until: datetime | None
+
+
+async def apply_subscription_change(
+    session: AsyncSession,
+    *,
+    user_id: int,
+    admin_id: int,
+    days: int | None,
+    idempotency_key: str,
+) -> GrantOutcome:
+    """Единственная точка изменения подписки.
+
+    `days > 0` — продлить от `max(now, текущая дата)`, `days < 0` — сократить,
+    `days is None` — снять подписку полностью. Каждое применённое изменение
+    пишет строку в `subscription_grant`; повтор с тем же ключом ничего не
+    меняет и возвращает `duplicate=True`.
+    """
+    seen = await session.scalar(
+        select(SubscriptionGrant).where(SubscriptionGrant.idempotency_key == idempotency_key)
+    )
+    if seen is not None:
+        user_exists = await session.get(User, user_id) is not None
+        return GrantOutcome(
+            applied=False,
+            user_found=user_exists,
+            duplicate=True,
+            subscription_until=_as_utc(seen.subscription_until_after),
+        )
+
+    user = await session.get(User, user_id)
+    if user is None:
+        return GrantOutcome(
+            applied=False, user_found=False, duplicate=False, subscription_until=None
+        )
+
+    if days is None:
+        new_until = None
+    else:
+        now = datetime.now(timezone.utc)
+        existing = _as_utc(user.subscription_until)
+        base = max(now, existing) if existing else now
+        new_until = base + timedelta(days=days)
+
+    user.subscription_until = new_until
+    session.add(
+        SubscriptionGrant(
+            user_id=user_id,
+            admin_id=admin_id,
+            days=days,
+            idempotency_key=idempotency_key,
+            subscription_until_after=new_until,
+        )
+    )
+    await session.flush()
+    return GrantOutcome(
+        applied=True, user_found=True, duplicate=False, subscription_until=new_until
+    )
+
+
+# УСТАРЕЛО. Заменена на apply_subscription_change: не идемпотентна, не
+# журналируется, отмены не поддерживает (H-12). Удаляется в Task 37, после
+# того как пакет E перестанет её импортировать.
 async def update_subscription(session: AsyncSession, user_id: int, days: int) -> None:
     user = await session.get(User, user_id)
     if user is None:

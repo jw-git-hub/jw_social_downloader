@@ -33,3 +33,25 @@ class DownloadLog(Base):
     status: Mapped[str] = mapped_column(String(16))
     file_size_mb: Mapped[Optional[float]] = mapped_column(nullable=True)
     created_at: Mapped[datetime] = mapped_column(default=func.now())
+
+
+class SubscriptionGrant(Base):
+    """Журнал изменений подписки: одна строка на каждое применённое изменение.
+
+    `idempotency_key` уникален. Ключ генерирует UI при отрисовке карточки,
+    поэтому повторный клик по той же кнопке — в том числе по карточке,
+    оставшейся в истории чата админа с прошлого месяца, — даёт тот же ключ,
+    и изменение не применяется второй раз.
+
+    `days = NULL` означает снятие подписки, отрицательное — сокращение.
+    """
+
+    __tablename__ = "subscription_grant"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), index=True)
+    admin_id: Mapped[int] = mapped_column(BigInteger)
+    days: Mapped[Optional[int]] = mapped_column(nullable=True)
+    idempotency_key: Mapped[str] = mapped_column(String(64), unique=True)
+    subscription_until_after: Mapped[Optional[datetime]] = mapped_column(nullable=True)
+    created_at: Mapped[datetime] = mapped_column(default=func.now(), index=True)
