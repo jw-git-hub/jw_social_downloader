@@ -9,8 +9,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt \
-    && pip install --no-cache-dir --upgrade "yt-dlp[default,curl-cffi]" gallery-dl
+# Единственная установка зависимостей. Отдельной команды с апгрейдом пакетов
+# поверх пинов быть не должно: она кэшировалась вместе с этим слоем и молча
+# переустанавливала пакеты мимо requirements.txt. Теперь слой инвалидируется
+# правкой самого requirements.txt.
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Тестовые зависимости ставятся ДО копирования кода: иначе любая правка
 # исходников инвалидирует слой и каждый прогон тестов заново тянет pytest из сети.

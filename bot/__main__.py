@@ -12,10 +12,21 @@ from bot.db.engine import init_db
 from bot.handlers import admin_router, user_router
 from bot.middlewares.throttle import ThrottleMiddleware
 from bot.services.cleanup import periodic_cleanup
+from bot.utils.log_guard import setup_logging
+
+
+async def run_polling(dp, bot) -> None:
+    """Запуск лонг-поллинга.
+
+    `drop_pending_updates=True` обязателен: Telegram держит очередь до 24
+    часов, и без сброса каждая ссылка, присланная во время простоя, качается
+    заново со списанием квоты, а ответ прилетает в давно забытый диалог.
+    """
+    await dp.start_polling(bot, drop_pending_updates=True)
 
 
 async def main() -> None:
-    logger.add("data/bot.log", rotation="10 MB", retention="7 days", level="INFO")
+    setup_logging()
 
     await init_db()
 
@@ -32,7 +43,20 @@ async def main() -> None:
     dp.include_router(admin_router)
     dp.include_router(user_router)
 
+    def _log_task_death(task: asyncio.Task) -> None:
+        # Фоновая задача не должна завершаться вообще. Если завершилась —
+        # об этом надо узнать из лога, а не по отсутствию уборки.
+        if task.cancelled():
+            logger.info("Cleanup task cancelled")
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.opt(exception=exc).error("Cleanup task died")
+        else:
+            logger.error("Cleanup task exited unexpectedly")
+
     _cleanup_task = asyncio.create_task(periodic_cleanup())  # noqa: F841
+    _cleanup_task.add_done_callback(_log_task_death)
 
     await bot.set_my_commands([
         BotCommand(command="start", description="🏠 Главное меню"),
@@ -50,7 +74,7 @@ async def main() -> None:
         pass
 
     logger.info("Bot started")
-    await dp.start_polling(bot)
+    await run_polling(dp, bot)
 
 
 if __name__ == "__main__":
