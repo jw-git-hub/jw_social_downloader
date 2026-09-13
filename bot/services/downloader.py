@@ -235,6 +235,25 @@ def _cleanup_glob(directory: Path, prefix: str) -> None:
                 pass
 
 
+def _sized_files(paths: list[Path]) -> list[tuple[Path, int]]:
+    """Существующие непустые файлы вместе с размерами.
+
+    Между `_find_downloaded_files` и `.stat()` файл может исчезнуть — успевает
+    вклиниться фоновый подметальщик. Раньше `FileNotFoundError` улетал мимо
+    `try` загрузчика и мимо `try` хендлера прямо в диспетчер: статус-сообщение
+    висело вечно, в `download_log` не писалось ничего, файлы оставались на диске.
+    """
+    result: list[tuple[Path, int]] = []
+    for path in paths:
+        try:
+            size = path.stat().st_size
+        except OSError:
+            continue
+        if size > 0:
+            result.append((path, size))
+    return result
+
+
 async def _try_gallery_dl(url: str, filename: str) -> list[Path] | None:
     with _ephemeral_cookies() as cookies_path:
         cmd = [
@@ -279,11 +298,12 @@ async def _try_gallery_dl_fallback(url: str, filename: str) -> DownloadResult | 
     if not gd_files:
         return None
 
-    valid_gd = [f for f in gd_files if f.stat().st_size > 0]
-    if not valid_gd:
+    sized_gd = _sized_files(gd_files)
+    if not sized_gd:
         return None
 
-    total_size_mb = round(sum(f.stat().st_size for f in valid_gd) / (1024 * 1024), 2)
+    valid_gd = [path for path, _ in sized_gd]
+    total_size_mb = round(sum(size for _, size in sized_gd) / (1024 * 1024), 2)
     ext = valid_gd[0].suffix.lower()
     media_type = "image" if ext in IMAGE_EXTS else "video"
     logger.info("gallery-dl complete | files={} total_size={}MB", len(valid_gd), total_size_mb)
@@ -382,7 +402,8 @@ async def download_media(url: str, platform: str) -> DownloadResult:
             # Если файлы скачаны — это успех, даже если exit code != 0
             # (yt-dlp может вернуть code 1 из-за проблем с записью cookies, но файлы уже есть)
             if actual_files:
-                valid_files = [f for f in actual_files if f.stat().st_size > 0]
+                sized_files = _sized_files(actual_files)
+                valid_files = [path for path, _ in sized_files]
                 if not valid_files:
                     stderr_text = stderr.decode(errors="replace").strip()
                     stdout_text = stdout.decode(errors="replace").strip()
@@ -397,7 +418,7 @@ async def download_media(url: str, platform: str) -> DownloadResult:
 
                     return DownloadResult(success=False, error_message=_parse_error(full_output, platform))
 
-                total_size_mb = round(sum(f.stat().st_size for f in valid_files) / (1024 * 1024), 2)
+                total_size_mb = round(sum(size for _, size in sized_files) / (1024 * 1024), 2)
                 logger.info("Download complete | files={} total_size={}MB", len(valid_files), total_size_mb)
                 if process.returncode != 0:
                     stderr_text = stderr.decode(errors="replace").strip()
