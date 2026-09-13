@@ -33,7 +33,20 @@ async def main() -> None:
     dp.include_router(admin_router)
     dp.include_router(user_router)
 
+    def _log_task_death(task: asyncio.Task) -> None:
+        # Фоновая задача не должна завершаться вообще. Если завершилась —
+        # об этом надо узнать из лога, а не по отсутствию уборки.
+        if task.cancelled():
+            logger.info("Cleanup task cancelled")
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.opt(exception=exc).error("Cleanup task died")
+        else:
+            logger.error("Cleanup task exited unexpectedly")
+
     _cleanup_task = asyncio.create_task(periodic_cleanup())  # noqa: F841
+    _cleanup_task.add_done_callback(_log_task_death)
 
     await bot.set_my_commands([
         BotCommand(command="start", description="🏠 Главное меню"),
