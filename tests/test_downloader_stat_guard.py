@@ -25,14 +25,17 @@ def test_sized_files_does_not_raise_on_directory(tmp_path):
 
 async def test_gallery_fallback_returns_none_when_files_vanish(tmp_path, monkeypatch):
     """H-9: файл исчез между поиском и stat() — это не повод падать."""
+    from bot.services.downloader import GalleryDlRun
+
     ghost = tmp_path / "deadbeef_1.jpg"
 
     async def fake_gallery_dl(url, filename):
-        return [ghost]
+        return GalleryDlRun(files=[ghost], stderr="", returncode=0)
 
     monkeypatch.setattr(downloader, "_try_gallery_dl", fake_gallery_dl)
 
-    result = await downloader._try_gallery_dl_fallback("https://pin.it/abc", "deadbeef")
+    outputs: list[tuple[str, str]] = []
+    result = await downloader._try_gallery_dl_fallback("https://pin.it/abc", "deadbeef", outputs)
 
     assert result is None
 

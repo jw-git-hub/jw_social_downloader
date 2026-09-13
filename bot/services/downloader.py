@@ -4,10 +4,11 @@ import asyncio
 import contextlib
 import html
 import os
+import re
 import shutil
 import tempfile
-from collections.abc import Iterator
-from dataclasses import dataclass
+from collections.abc import Iterator, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 from uuid import uuid4
 
@@ -35,44 +36,147 @@ class DownloadResult:
     media_type: str | None = None
 
 
-def _parse_error(stderr: str, platform: str) -> str:
-    stderr_lower = stderr.lower()
-    logger.debug("Parsing error | platform={} stderr={}", platform, stderr[:500])
+# ── Классификация ошибок загрузки ────────────────────────────────────────
 
-    if "cookies" in stderr_lower or "session" in stderr_lower or "cookie" in stderr_lower:
-        return "🍪 Ошибка авторизации: cookies устарели. Обратитесь к админу."
+# Классифицируем только те строки, которые сами утилиты пометили как ошибку:
+# yt-dlp печатает «ERROR: ...», gallery-dl — «[extractor][error] ...».
+# Прогресс, предупреждения и эхо аргументов в классификацию не попадают —
+# именно из-за них раньше любой сбой объявлялся протуханием cookies.
+_ERROR_LINE_RE = re.compile(
+    r"(?:^|\s)(?:ERROR:|\[[^\]\s]+\]\[error\]|error:)",
+    re.IGNORECASE,
+)
 
-    if "login" in stderr_lower or "authentication" in stderr_lower:
-        if platform == "instagram":
-            return "🔐 Instagram: видео недоступно. Попробуй другую ссылку (Reels из публичных аккаунтов)."
-        return f"🔐 {platform.capitalize()}: требуется авторизация."
+# Порядок значим: специфичные правила стоят раньше общих. Например
+# «rate-limit reached» — это фирменная фраза Instagram про мёртвую сессию,
+# а не про троттлинг, поэтому dead_session идёт раньше rate_limit.
+_ERROR_RULES: tuple[tuple[str, re.Pattern[str], str], ...] = (
+    (
+        "bot_check",
+        re.compile(
+            r"confirm you(?:'|’)?re not a bot|confirm you are not a bot|are you a robot",
+            re.IGNORECASE,
+        ),
+        "🤖 Платформа просит подтвердить, что запрос не от робота. Попробуй позже.",
+    ),
+    (
+        "age_gate",
+        re.compile(
+            r"age[- ]restricted|age[_ ]gate|confirm your age|age[_ ]verification"
+            r"|inappropriate for some users",
+            re.IGNORECASE,
+        ),
+        "🔞 Видео с возрастным ограничением.",
+    ),
+    (
+        "dead_session",
+        re.compile(
+            r"http redirect to login page|login required|rate-limit reached"
+            r"|cookies are no longer valid|the provided cookies"
+            r"|session (?:has )?expired|not logged[ -]?in|please log ?in",
+            re.IGNORECASE,
+        ),
+        "🍪 Платформа не пускает без авторизации: сессия истекла. Обратитесь к админу.",
+    ),
+    (
+        "private",
+        re.compile(
+            r"\bprivate (?:video|post|account|profile|content)\b"
+            r"|(?:video|post|account|profile) is private",
+            re.IGNORECASE,
+        ),
+        "🔒 Это приватная публикация. Скачивание невозможно.",
+    ),
+    (
+        "not_found",
+        re.compile(
+            r"http error 404\b|\b404:? not found\b|video unavailable"
+            r"|no longer available|has been removed|does not exist"
+            r"|(?:post|page|content) (?:isn'?t|is not) available",
+            re.IGNORECASE,
+        ),
+        "🔍 Публикация не найдена. Возможно, она удалена или ссылка неверная.",
+    ),
+    (
+        "geo_block",
+        re.compile(
+            r"geo[- ]?(?:restrict|block)|not available (?:in|from) your (?:country|location|region)"
+            r"|blocked in your country",
+            re.IGNORECASE,
+        ),
+        "🌍 Видео недоступно в текущем регионе.",
+    ),
+    (
+        "rate_limit",
+        re.compile(r"http error 429\b|\btoo many requests\b|\brate[- ]limit", re.IGNORECASE),
+        "⏳ Слишком много запросов. Попробуй через минуту.",
+    ),
+    (
+        "auth_required",
+        re.compile(
+            r"http error 40[13]\b|authentication required|requires (?:a )?(?:login|account|subscription)",
+            re.IGNORECASE,
+        ),
+        "🔐 {platform}: требуется авторизация.",
+    ),
+    (
+        "no_formats",
+        re.compile(
+            r"requested format (?:is )?not available|no video formats found"
+            r"|no (?:suitable )?formats found|unsupported url",
+            re.IGNORECASE,
+        ),
+        "🔄 Формат видео не поддерживается. Попробуй другую ссылку.",
+    ),
+    (
+        "too_large",
+        re.compile(r"max-?filesize|file is larger than", re.IGNORECASE),
+        "📦 Файл слишком большой (больше {max_mb} МБ).",
+    ),
+)
 
-    if "not found" in stderr_lower or "404" in stderr_lower:
-        return "🔍 Видео не найдено. Возможно, оно удалено или ссылка неверная."
+# В фолбэке текст gallery-dl предпочтительнее: он на порядок человекочитаемее
+# внутренних трейсбеков yt-dlp.
+_SOURCE_PRIORITY = ("gallery-dl", "yt-dlp")
 
-    if "private" in stderr_lower:
-        return "🔒 Это приватное видео. Скачивание невозможно."
 
-    if "requested format" in stderr_lower or "no video formats" in stderr_lower:
-        return "🔄 Формат видео не поддерживается. Попробуй другую ссылку."
+def _error_surface(text: str) -> str:
+    """Оставляет из вывода утилиты только строки, помеченные как ошибка."""
+    lines = [ln.strip() for ln in text.splitlines() if _ERROR_LINE_RE.search(ln)]
+    return "\n".join(lines)
 
-    if "geo" in stderr_lower or "country" in stderr_lower:
-        return "🌍 Видео недоступно в текущем регионе."
 
-    if any(phrase in stderr_lower for phrase in ["age-restricted", "age_gate", "age gate", "confirm your age", "age verification", "age_verification"]):
-        return "🔞 Видео с возрастным ограничением."
+def _pick_fallback(outputs: Sequence[tuple[str, str]]) -> str:
+    for wanted in _SOURCE_PRIORITY:
+        for name, text in outputs:
+            if name != wanted:
+                continue
+            candidate = _error_surface(text) or text.strip()
+            if candidate:
+                return candidate
+    for _name, text in outputs:
+        if text.strip():
+            return text.strip()
+    return "утилита завершилась без сообщения об ошибке"
 
-    if "unsupported" in stderr_lower or "no video" in stderr_lower:
-        return "❌ Ссылка не содержит видео или не поддерживается."
 
-    if "max-filesize" in stderr_lower or "file is larger" in stderr_lower:
-        return f"📦 Файл слишком большой (больше {settings.MAX_FILE_SIZE_MB} МБ)."
+def _parse_error(outputs: Sequence[tuple[str, str]], platform: str) -> str:
+    """Человеческое сообщение об ошибке по выводам всех запущенных утилит.
 
-    if "rate" in stderr_lower or "too many" in stderr_lower:
-        return "⏳ Слишком много запросов. Попробуй через минуту."
+    `outputs` — пары («yt-dlp» | «gallery-dl», stderr) в порядке запуска.
+    """
+    haystack = "\n".join(s for s in (_error_surface(t) for _n, t in outputs) if s)
+    logger.debug("Parsing error | platform={} surface={}", platform, haystack[:500])
 
-    short_err = stderr[:200] if len(stderr) > 200 else stderr
-    # Экранируем stderr: сообщение уходит с parse_mode=HTML, а сырой вывод yt-dlp
+    for _name, pattern, template in _ERROR_RULES:
+        if pattern.search(haystack):
+            return template.format(
+                platform=platform.capitalize(),
+                max_mb=settings.MAX_FILE_SIZE_MB,
+            )
+
+    short_err = _pick_fallback(outputs)[:200]
+    # Экранируем: сообщение уходит с parse_mode=HTML, а сырой вывод утилит
     # может содержать <, >, & и ломать разметку.
     return f"❌ Ошибка загрузки:\n<code>{html.escape(short_err)}</code>"
 
@@ -211,7 +315,6 @@ def _build_command(url: str, platform: str, output_path: Path, cookies_path: Pat
 
 
 def _find_downloaded_files(directory: Path, prefix: str) -> list[Path]:
-    import re
     result = []
     for f in directory.iterdir():
         if f.is_file() and f.name.startswith(prefix):
@@ -254,7 +357,14 @@ def _sized_files(paths: list[Path]) -> list[tuple[Path, int]]:
     return result
 
 
-async def _try_gallery_dl(url: str, filename: str) -> list[Path] | None:
+@dataclass
+class GalleryDlRun:
+    files: list[Path] = field(default_factory=list)
+    stderr: str = ""
+    returncode: int | None = None
+
+
+async def _try_gallery_dl(url: str, filename: str) -> GalleryDlRun:
     with _ephemeral_cookies() as cookies_path:
         cmd = [
             "gallery-dl",
@@ -272,33 +382,48 @@ async def _try_gallery_dl(url: str, filename: str) -> list[Path] | None:
                 *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             )
             try:
-                stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=settings.DOWNLOAD_TIMEOUT)
+                _stdout, stderr = await asyncio.wait_for(
+                    process.communicate(), timeout=settings.DOWNLOAD_TIMEOUT
+                )
             except asyncio.TimeoutError:
                 logger.warning("gallery-dl timeout | url={}", url)
                 process.kill()
                 await process.wait()
-                return None
+                return GalleryDlRun(stderr="gallery-dl timeout")
 
+            stderr_text = stderr.decode(errors="replace").strip()
             if process.returncode != 0:
-                stderr_text = stderr.decode(errors="replace").strip()
-                logger.warning("gallery-dl failed | code={} stderr={}", process.returncode, stderr_text[:300])
-                return None
+                logger.warning(
+                    "gallery-dl failed | code={} stderr={}",
+                    process.returncode, stderr_text[:300],
+                )
+                return GalleryDlRun(stderr=stderr_text, returncode=process.returncode)
 
-            files = _find_downloaded_files(DOWNLOAD_DIR, filename)
-            if files:
-                return files
-            return None
+            return GalleryDlRun(
+                files=_find_downloaded_files(DOWNLOAD_DIR, filename),
+                stderr=stderr_text,
+                returncode=process.returncode,
+            )
         except Exception as exc:
             logger.exception("gallery-dl error: {}", exc)
-            return None
+            return GalleryDlRun(stderr=str(exc))
 
 
-async def _try_gallery_dl_fallback(url: str, filename: str) -> DownloadResult | None:
-    gd_files = await _try_gallery_dl(url, filename)
-    if not gd_files:
+async def _try_gallery_dl_fallback(
+    url: str, filename: str, outputs: list[tuple[str, str]]
+) -> DownloadResult | None:
+    run = await _try_gallery_dl(url, filename)
+    # stderr gallery-dl копим ВСЕГДА — даже на успехе, чтобы при последующем
+    # провале другой ветки его текст не пропал.
+    if run.stderr:
+        outputs.append(("gallery-dl", run.stderr))
+    if not run.files:
         return None
 
-    sized_gd = _sized_files(gd_files)
+    # _sized_files, а не голый .stat(): файл может исчезнуть между поиском и
+    # проверкой размера, и FileNotFoundError отсюда улетает мимо всех try
+    # прямо в диспетчер (H-9, закрыто Task 4 — не откатывать).
+    sized_gd = _sized_files(run.files)
     if not sized_gd:
         return None
 
@@ -316,19 +441,21 @@ async def _try_gallery_dl_fallback(url: str, filename: str) -> DownloadResult | 
             success=True,
             media_type=media_type,
         )
-    else:
-        return DownloadResult(
-            file_path=str(valid_gd[0]),
-            file_size_mb=total_size_mb,
-            success=True,
-            media_type=media_type,
-        )
+    return DownloadResult(
+        file_path=str(valid_gd[0]),
+        file_size_mb=total_size_mb,
+        success=True,
+        media_type=media_type,
+    )
 
 
 async def download_media(url: str, platform: str) -> DownloadResult:
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
     filename = uuid4().hex
+    # Выводы всех запущенных утилит в порядке запуска — на них строится
+    # сообщение об ошибке, если ни одна ветка не дала файлов.
+    outputs: list[tuple[str, str]] = []
     output_path = DOWNLOAD_DIR / (filename + ".mp4")
 
     # Приоритетный gallery-dl: часть URL yt-dlp извлекает некорректно и теряет медиа —
@@ -345,7 +472,7 @@ async def download_media(url: str, platform: str) -> DownloadResult:
         or (platform == "tiktok" and "/photo/" in url_lower)
     )
     if gallery_first:
-        gd_result = await _try_gallery_dl_fallback(url, filename)
+        gd_result = await _try_gallery_dl_fallback(url, filename, outputs)
         if gd_result:
             return gd_result
         logger.info("gallery-dl primary returned nothing, falling back to yt-dlp | platform={} url={}", platform, url)
@@ -411,12 +538,13 @@ async def download_media(url: str, platform: str) -> DownloadResult:
                     logger.error("yt-dlp produced zero-size files | code={}", process.returncode)
                     _cleanup_glob(DOWNLOAD_DIR, filename)
 
+                    outputs.append(("yt-dlp", full_output))
                     if platform in GALLERY_DL_FALLBACK_PLATFORMS:
-                        gd_result = await _try_gallery_dl_fallback(url, filename)
+                        gd_result = await _try_gallery_dl_fallback(url, filename, outputs)
                         if gd_result:
                             return gd_result
 
-                    return DownloadResult(success=False, error_message=_parse_error(full_output, platform))
+                    return DownloadResult(success=False, error_message=_parse_error(outputs, platform))
 
                 total_size_mb = round(sum(size for _, size in sized_files) / (1024 * 1024), 2)
                 logger.info("Download complete | files={} total_size={}MB", len(valid_files), total_size_mb)
@@ -449,13 +577,14 @@ async def download_media(url: str, platform: str) -> DownloadResult:
             full_output = stderr_text or stdout_text
             logger.error("yt-dlp failed | code={} stderr={}", process.returncode, full_output)
 
+            outputs.append(("yt-dlp", full_output))
             if platform in GALLERY_DL_FALLBACK_PLATFORMS:
-                gd_result = await _try_gallery_dl_fallback(url, filename)
+                gd_result = await _try_gallery_dl_fallback(url, filename, outputs)
                 if gd_result:
                     return gd_result
 
             _cleanup_glob(DOWNLOAD_DIR, filename)
-            return DownloadResult(success=False, error_message=_parse_error(full_output, platform))
+            return DownloadResult(success=False, error_message=_parse_error(outputs, platform))
 
         except Exception as exc:
             logger.exception("Unexpected download error: {}", exc)
