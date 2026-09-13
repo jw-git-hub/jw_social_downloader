@@ -19,6 +19,10 @@ from bot.config import settings
 DOWNLOAD_DIR = Path("/tmp/jw_downloads")
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".gif"}
 GALLERY_DL_FALLBACK_PLATFORMS = {"instagram", "pinterest", "tiktok"}
+# Потолок числа элементов, которые gallery-dl вытянет за один запрос.
+# Без него один запрос к доске Pinterest (1723 айтема в живом тесте)
+# стоит пользователю одну единицу квоты.
+GALLERY_DL_MAX_ITEMS = 10
 # TikTok периодически отдаёт транзиторный WAF-челлендж (JS rehydration / HTTP 403):
 # видео доступно, но конкретная попытка срывается. Делаем один мягкий ретрай.
 TIKTOK_MAX_ATTEMPTS = 2
@@ -364,16 +368,33 @@ class GalleryDlRun:
     returncode: int | None = None
 
 
+def _build_gallery_dl_cmd(url: str, prefix: str, cookies_path: Path | None) -> list[str]:
+    """Командная строка gallery-dl. Вынесена отдельно, чтобы её можно было
+    проверить тестом без сети.
+
+    `prefix` — наш uuid4-префикс. `{filename}` в шаблоне — это поле МЕТАДАННЫХ
+    gallery-dl (оригинальное имя файла у источника), а не наша переменная:
+    двойные фигурные скобки в f-строке дают литеральные одинарные. Именно оно
+    делает имя уникальным на элемент — без него все пины доски разрешались в
+    одно и то же имя и 9 из 12 пропускались как «уже существует».
+    `{filename|num}` — синтаксис альтернатив gallery-dl: если экстрактор не
+    проставил `filename`, подставится `num`.
+    """
+    cmd = [
+        "gallery-dl",
+        "-D", str(DOWNLOAD_DIR),
+        "-f", f"{prefix}_{{num}}_{{filename|num}}.{{extension}}",
+        "--range", f"1-{GALLERY_DL_MAX_ITEMS}",
+    ]
+    if cookies_path is not None:
+        cmd.extend(["--cookies", str(cookies_path)])
+    cmd.append(url)
+    return cmd
+
+
 async def _try_gallery_dl(url: str, filename: str) -> GalleryDlRun:
     with _ephemeral_cookies() as cookies_path:
-        cmd = [
-            "gallery-dl",
-            "-D", str(DOWNLOAD_DIR),
-            "-f", f"{filename}_{{num}}.{{extension}}",
-        ]
-        if cookies_path is not None:
-            cmd.extend(["--cookies", str(cookies_path)])
-        cmd.append(url)
+        cmd = _build_gallery_dl_cmd(url, filename, cookies_path)
 
         logger.info("Falling back to gallery-dl | url={}", url)
 
@@ -387,22 +408,40 @@ async def _try_gallery_dl(url: str, filename: str) -> GalleryDlRun:
                 )
             except asyncio.TimeoutError:
                 logger.warning("gallery-dl timeout | url={}", url)
-                process.kill()
+                # Гонка asyncio.wait_for: процесс может успеть завершиться
+                # сам между истечением таймаута и этим вызовом — kill() на
+                # уже мёртвом процессе бросает ProcessLookupError, из-за
+                # которого _cleanup_glob ниже не выполнялся и обрезки
+                # оставались на диске (поймано тестом на детерминированной
+                # версии этой же гонки).
+                with contextlib.suppress(ProcessLookupError):
+                    process.kill()
                 await process.wait()
+                # Обрезки после таймаута раньше оставались в tmpfs до
+                # подметальщика и могли уйти пользователю как готовое медиа.
+                _cleanup_glob(DOWNLOAD_DIR, filename)
                 return GalleryDlRun(stderr="gallery-dl timeout")
 
             stderr_text = stderr.decode(errors="replace").strip()
+            files = _find_downloaded_files(DOWNLOAD_DIR, filename)
+
             if process.returncode != 0:
-                logger.warning(
-                    "gallery-dl failed | code={} stderr={}",
-                    process.returncode, stderr_text[:300],
-                )
-                return GalleryDlRun(stderr=stderr_text, returncode=process.returncode)
+                if files:
+                    # Частичный сбой: часть элементов доски недоступна, но
+                    # остальные уже на диске. Выбрасывать их — терять работу,
+                    # за которую с пользователя уже списана квота.
+                    logger.warning(
+                        "gallery-dl exited with code {} but files exist | files={} stderr={}",
+                        process.returncode, len(files), stderr_text[:300],
+                    )
+                else:
+                    logger.warning(
+                        "gallery-dl failed | code={} stderr={}",
+                        process.returncode, stderr_text[:300],
+                    )
 
             return GalleryDlRun(
-                files=_find_downloaded_files(DOWNLOAD_DIR, filename),
-                stderr=stderr_text,
-                returncode=process.returncode,
+                files=files, stderr=stderr_text, returncode=process.returncode
             )
         except Exception as exc:
             logger.exception("gallery-dl error: {}", exc)
