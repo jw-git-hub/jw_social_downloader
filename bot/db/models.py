@@ -73,39 +73,31 @@ class SubscriptionGrant(Base):
 # Живёт здесь, а не в engine.py, чтобы скрипт миграции мог импортировать эти
 # строки, не поднимая настройки и не создавая движок.
 #
-# `ix_users_username_lower` — индекс по выражению `lower(username)`, ОТДЕЛЬНО
-# от уникального NOCASE-индекса ниже. Не дублирование: `get_user_by_username`
-# в queries.py ищет через `func.lower(User.username) == needle`, а
-# `EXPLAIN QUERY PLAN` показывает, что `username COLLATE NOCASE`-индекс для
-# ЭТОГО конкретного запроса не используется планировщиком (разные формы
-# выражения — совпадение по коллации не совпадение по функции) — без этого
-# индекса поиск по нику остаётся полным сканированием, даже после того как
-# уникальный индекс ниже создан. Без `WHERE username IS NOT NULL`: с ним
-# планировщик на параметризованном `lower(username) = ?` индекс не берёт
-# (проверено `EXPLAIN QUERY PLAN` — с частичным индексом снова SCAN), в
-# отличие от уникального индекса, где `WHERE` присутствует ради значения
-# (разрешить сколько угодно NULL), а не ради использования планировщиком.
+# `ix_users_username_lower` — индекс по выражению `lower(username)`.
+# `get_user_by_username` в queries.py ищет через `func.lower(User.username)
+# == needle`, а обычный индекс по колонке (в т.ч. с `COLLATE NOCASE`) для
+# ТАКОЙ формы запроса планировщиком не используется (разные выражения —
+# проверено `EXPLAIN QUERY PLAN`, см. tests/test_schema_migration.py) — без
+# индекса именно по выражению поиск по нику остаётся полным сканированием
+# таблицы. Без `WHERE username IS NOT NULL`: с ним планировщик на
+# параметризованном `lower(username) = ?` индекс не берёт (тоже проверено
+# `EXPLAIN QUERY PLAN` — с частичным индексом снова SCAN).
+#
+# Уникальности на `username` сознательно НЕТ (была в первой версии этой
+# ревизии, снята по ревью — см. git-историю и task-21-report.md). Ник в
+# Telegram — изменяемый и переиспользуемый внешний идентификатор: человек
+# переименовался или перестал писать боту, и тот же ник позже достался
+# кому-то другому — это легитимное состояние данных (несколько строк
+# `users`, когда-то друг за другом носивших один ник), а не порча. Уникальный
+# индекс ловил это как `IntegrityError` прямо в `get_or_create_user` —
+# необработанного нигде в проекте — и бот молча переставал отвечать
+# конкретному человеку навсегда. `get_user_by_username` дубликаты уже
+# переживает сам (берёт строку с самым свежим `updated_at`), это и есть
+# правильное место для устойчивости к переиспользованным никам — не
+# ограничение схемы.
 EXTRA_INDEX_DDL: tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS ix_download_log_created_at ON download_log (created_at)",
     "CREATE INDEX IF NOT EXISTS ix_download_log_user_id ON download_log (user_id)",
     "CREATE INDEX IF NOT EXISTS ix_users_subscription_until ON users (subscription_until)",
     "CREATE INDEX IF NOT EXISTS ix_users_username_lower ON users (lower(username))",
-)
-
-# Уникальность ника — отдельно: на существующей базе она может не примениться
-# из-за исторических дубликатов, и падать на старте из-за этого нельзя.
-# Частичный индекс: NULL-ников может быть сколько угодно.
-#
-# `COLLATE NOCASE` на самой колонке (а не уникальный индекс по
-# `lower(username)`, как `ix_users_username_lower` выше, но UNIQUE) — для
-# УНИКАЛЬНОСТИ это ровно то же множество конфликтов, но коллация — общее
-# свойство сравнения колонки, а не индекс под одну конкретную форму запроса:
-# работает и в `ORDER BY`/`LIKE`/прямом сравнении без функции-обёртки, а не
-# только там, где кто-то явно написал `lower(username)`. Ников в Telegram вне
-# ASCII не бывает (буквы, цифры, `_`), поэтому ASCII-only `NOCASE` SQLite не
-# теряет дубликаты, которые ловит питоновский `str.lower()` (Unicode-aware) в
-# queries.py.
-USERNAME_UNIQUE_DDL: str = (
-    "CREATE UNIQUE INDEX IF NOT EXISTS ix_users_username_nocase "
-    "ON users (username COLLATE NOCASE) WHERE username IS NOT NULL"
 )

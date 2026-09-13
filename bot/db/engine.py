@@ -5,7 +5,7 @@ from sqlalchemy import delete, event, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from bot.config import settings
-from bot.db.models import EXTRA_INDEX_DDL, USERNAME_UNIQUE_DDL, Base, DownloadLog
+from bot.db.models import EXTRA_INDEX_DDL, Base, DownloadLog
 
 # Журнал загрузок хранит полные URL с приватными пер-шаринговыми токенами
 # (`?stkn=`, `?igsh=`). Порог заведомо больше самого длинного окна статистики
@@ -90,17 +90,5 @@ async def init_db() -> None:
         await conn.run_sync(Base.metadata.create_all)
         for statement in EXTRA_INDEX_DDL:
             await conn.execute(text(statement))
-
-    # Отдельной транзакцией: неудача здесь не должна откатывать индексы выше
-    # и не должна ронять старт бота.
-    try:
-        async with async_engine.begin() as conn:
-            await conn.execute(text(USERNAME_UNIQUE_DDL))
-    except Exception as exc:
-        logger.error(
-            "Уникальный индекс по users.username не создан — в базе есть дубликаты ников. "
-            "Запустить scripts/migrate_20260913.py. ({})",
-            exc,
-        )
 
     await _purge_old_download_logs()

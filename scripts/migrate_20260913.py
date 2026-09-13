@@ -1,46 +1,65 @@
 #!/usr/bin/env python3
-"""Разовая миграция под ревизию 2026-09-12.
+"""Разовая миграция под ревизию 2026-09-12 (фикс-раунд 1 от 2026-09-13).
 
-Делает три вещи над УЖЕ существующей боевой БД (`create_all` их не делает —
-для существующей таблицы он пропускает её целиком вместе с индексами):
+Схема меняется ВСЕГДА, при каждом запуске, без каких-либо флагов: заводит
+недостающие индексы (`EXTRA_INDEX_DDL`) на уже существующей боевой БД —
+`create_all` их не делает, для существующей таблицы он пропускает её
+целиком вместе с индексами, а `ALTER` не делает вовсе. Это безопасно всегда
+(`CREATE INDEX IF NOT EXISTS`, чистое добавление, данные не трогает).
 
-1. Заводит недостающие индексы (`EXTRA_INDEX_DDL`) и пытается создать
-   уникальный индекс по `users.username` без учёта регистра
-   (`USERNAME_UNIQUE_DDL`).
-2. Обнаруживает дубликаты ников (без учёта регистра — Telegram-ники
-   регистронезависимы) и, только по явному флагу `--fix-duplicates`, снимает
-   их через `dedupe_usernames`. Без флага скрипт лишь СООБЩАЕТ о конфликтах
-   и ничего не меняет: какой из дублей настоящий — решение владельца, а не
-   эвристики скрипта, и падать посередине миграции из-за исторических
-   данных недопустимо.
-3. Считает, сколько строк `download_log` старше `DOWNLOAD_LOG_RETENTION_DAYS`
-   (приватные пер-шаринговые токены в URL не должны храниться вечно), и,
-   только по явному флагу `--purge-logs`, удаляет их. Без флага — только
-   подсчёт.
+Флаг ниже управляет ТОЛЬКО изменением ДАННЫХ:
 
-Оба флага по отдельности: пометить дубликаты можно без удаления старых
-записей журнала, и наоборот.
+- `--purge-logs` — удалить строки `download_log` старше
+  `DOWNLOAD_LOG_RETENTION_DAYS` (приватные пер-шаринговые токены в URL не
+  должны храниться вечно). Без флага — только подсчёт, этот скрипт ничего
+  не удаляет. ВАЖНО: это не убирает автоматический ретеншен в
+  `bot/db/engine.py::init_db` — он безусловен и сработает сам на ближайшем
+  рестарте бота, без бэкапа и без предупреждения, если строки уже старше
+  порога, независимо от того, передан этот флаг здесь или нет.
 
-Перед ЛЮБЫМ изменением данных скрипт сам делает бэкап файла БД рядом с
-оригиналом (через `sqlite3.Connection.backup` — корректно и для WAL, читает
-согласованный снимок средствами самого SQLite) и проверяет, что бэкап
-реально читается. Это обязательный шаг самого скрипта, а не пункт инструкции
-поверх него, который легко забыть выполнить перед прогоном.
+Раньше в этой же ревизии была ещё и уникальность `users.username` без учёта
+регистра плюс снятие дублирующихся ников (`--fix-duplicates`,
+`dedupe_usernames`). **Убрано целиком по итогам ревью** (Critical):
+ревьюер воспроизвёл на боевой схеме, что `get_or_create_user` роняет
+`IntegrityError: UNIQUE constraint failed: users.username`, когда новый
+пользователь занимает освободившийся ник или существующий переименовывается
+в уже когда-то использованный, — необработанного `IntegrityError` в проекте
+нет ни одного, и бот молча переставал отвечать конкретному человеку
+навсегда. Причина глубже, чем недостающий `try/except`: ник в Telegram —
+изменяемый и переиспользуемый внешний идентификатор, и несколько строк
+`users`, когда-либо друг за другом носивших один и тот же ник, — легитимное
+состояние данных, а не порча. `get_user_by_username`
+(`bot/db/queries.py`) дубликаты уже переживает сам — берёт строку с самым
+свежим `updated_at`; индекс по выражению `lower(username)`
+(`ix_users_username_lower` в `EXTRA_INDEX_DDL`) даёт этому поиску ту же
+скорость, ради которой всё затевалось, не вводя новый отказ. Подробности —
+`task-21-report.md`.
+
+Перед ЛЮБЫМ изменением данных скрипт сам делает бэкап файла БД (через
+`sqlite3.Connection.backup` — корректный снимок средствами самой СУБД,
+безопасно и при активном WAL) и проверяет, что бэкап реально читается.
+ВАЖНО: по умолчанию бэкап ложится РЯДОМ с оригиналом — если оригинал внутри
+docker-тома, бэкап окажется в ТОМ ЖЕ томе и не защитит от потери самого
+тома/диска (`docker volume rm`, `docker compose down -v`, смерть диска).
+Передайте `--backup-dir` с каталогом, смонтированным отдельно (например, с
+хоста), для реальной защиты — скрипт прямо скажет в выводе, куда бэкап лёг.
 
 Останавливать бота не требуется: SQLite в режиме WAL, `busy_timeout` — 30
-секунд, конкурентные операции бота ждут снятия блокировки вместо мгновенной
-ошибки.
+секунд и на рабочем соединении, и на бэкапе, конкурентные операции бота
+ждут снятия блокировки вместо мгновенной ошибки.
 
     docker build --target test -t jw_downloader:test .
 
     # Сначала — на КОПИИ боевой БД, не на самом томе.
-    docker run --rm -v /path/to/copy:/work jw_downloader:test \\
-        python scripts/migrate_20260913.py --database /work/bot.db
+    docker run --rm -v /path/to/copy:/work -v /path/to/host/backups:/backup \\
+        jw_downloader:test python scripts/migrate_20260913.py \\
+        --database /work/bot.db --backup-dir /backup
 
-    # После проверки копии и только по решению владельца — на боевом томе:
-    docker run --rm -v jw_downloader_bot_data:/app/data jw_downloader:test \\
-        python scripts/migrate_20260913.py --database /app/data/bot.db \\
-        --fix-duplicates --purge-logs
+    # После проверки копии и только по решению владельца — на боевом томе,
+    # с бэкапом на ОТДЕЛЬНО смонтированном каталоге хоста:
+    docker run --rm -v jw_downloader_bot_data:/app/data -v /host/backups:/backup \\
+        jw_downloader:test python scripts/migrate_20260913.py \\
+        --database /app/data/bot.db --backup-dir /backup --purge-logs
 """
 from __future__ import annotations
 
@@ -52,7 +71,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from bot.db.models import EXTRA_INDEX_DDL, USERNAME_UNIQUE_DDL  # noqa: E402
+from bot.db.models import EXTRA_INDEX_DDL  # noqa: E402
 
 # Совпадает с bot.db.engine.DOWNLOAD_LOG_RETENTION_DAYS. НЕ импортируется
 # оттуда: bot.db.engine на уровне модуля поднимает bot.config.settings
@@ -64,25 +83,34 @@ from bot.db.models import EXTRA_INDEX_DDL, USERNAME_UNIQUE_DDL  # noqa: E402
 DOWNLOAD_LOG_RETENTION_DAYS = 180
 
 
-def backup_database(db_path: Path) -> Path:
-    """Бэкап файла БД рядом с оригиналом, безопасный для WAL.
+def backup_database(db_path: Path, backup_dir: Path | None = None) -> Path:
+    """Бэкап файла БД, безопасный для WAL. Обязательный шаг САМОГО скрипта.
 
-    Обязательный шаг САМОГО скрипта (не инструкции поверх него): выполняется
-    до любого изменения данных, при любых флагах и даже если в итоге ничего
-    менять не пришлось. `sqlite3.Connection.backup` — Online Backup API
-    SQLite: читает согласованный снимок через саму СУБД, а не копированием
-    файлов (`bot.db`/`bot.db-wal`/`bot.db-shm` по отдельности не атомарны
-    при живом писателе).
+    По умолчанию (`backup_dir=None`) ложится рядом с оригиналом — если
+    оригинал внутри docker-тома, бэкап окажется в ТОМ ЖЕ томе и не защитит
+    от потери самого тома/диска. `backup_dir` — каталог, смонтированный
+    отдельно (например, с хоста), даёт реальную защиту; вызывающий обязан
+    предупредить об этом в выводе, если `backup_dir` не передан (это делает
+    `main()`, не эта функция — она только копирует).
+
+    `sqlite3.Connection.backup` — Online Backup API SQLite: читает
+    согласованный снимок через саму СУБД, а не копированием файлов
+    (`bot.db`/`bot.db-wal`/`bot.db-shm` по отдельности не атомарны при живом
+    писателе). `timeout=30` на обоих соединениях — как на рабочем
+    соединении ниже, чтобы бэкап не спотыкался о блокировку на дефолтных 5
+    секундах sqlite3, когда рабочее соединение ждёт все 30.
 
     После копирования бэкап открывается и проверяется реальным запросом —
     «файл скопировался» не значит «из него можно восстановиться».
     """
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    backup_path = db_path.with_name(f"{db_path.name}.bak-{timestamp}")
+    directory = backup_dir if backup_dir is not None else db_path.parent
+    directory.mkdir(parents=True, exist_ok=True)
+    backup_path = directory / f"{db_path.name}.bak-{timestamp}"
 
-    source = sqlite3.connect(db_path)
+    source = sqlite3.connect(db_path, timeout=30)
     try:
-        dest = sqlite3.connect(backup_path)
+        dest = sqlite3.connect(backup_path, timeout=30)
         try:
             source.backup(dest)
         finally:
@@ -90,7 +118,7 @@ def backup_database(db_path: Path) -> Path:
     finally:
         source.close()
 
-    check = sqlite3.connect(backup_path)
+    check = sqlite3.connect(backup_path, timeout=30)
     try:
         check.execute("SELECT COUNT(*) FROM users").fetchone()
     except sqlite3.Error as exc:
@@ -99,42 +127,6 @@ def backup_database(db_path: Path) -> Path:
         check.close()
 
     return backup_path
-
-
-def _group_usernames_case_insensitively(
-    conn: sqlite3.Connection,
-) -> dict[str, list[tuple[int, str, str]]]:
-    """Только КОНФЛИКТУЮЩИЕ группы (2+ пользователя на один ник без учёта
-    регистра). Ничего не меняет — чистое обнаружение, чтобы `main()` мог
-    сначала честно сообщить о находках и только потом (по флагу) действовать.
-    """
-    rows = conn.execute(
-        "SELECT id, username, updated_at FROM users WHERE username IS NOT NULL AND username <> ''"
-    ).fetchall()
-    groups: dict[str, list[tuple[int, str, str]]] = {}
-    for user_id, username, updated_at in rows:
-        groups.setdefault(username.lower(), []).append((user_id, username, updated_at or ""))
-    return {key: members for key, members in groups.items() if len(members) > 1}
-
-
-def dedupe_usernames(conn: sqlite3.Connection) -> list[tuple[int, str]]:
-    """Обнуляет ник у всех строк группы, кроме самой свежей.
-
-    Возвращает список `(user_id, снятый ник)` в порядке возрастания id.
-    Мутирует БД (через `conn`, коммитит вызывающий) — вызывать только когда
-    решение снять дубликаты уже принято (см. флаг `--fix-duplicates` в
-    `main()`), не как часть обнаружения.
-    """
-    cleared: list[tuple[int, str]] = []
-    for members in _group_usernames_case_insensitively(conn).values():
-        # Позже обновлялся — тот и оставляет ник за собой.
-        ordered = sorted(members, key=lambda m: (m[2], m[0]), reverse=True)
-        for user_id, username, _ in ordered[1:]:
-            conn.execute("UPDATE users SET username = NULL WHERE id = ?", (user_id,))
-            cleared.append((user_id, username))
-
-    cleared.sort()
-    return cleared
 
 
 def _retention_cutoff() -> str:
@@ -147,16 +139,22 @@ def _retention_cutoff() -> str:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Миграция схемы под ревизию 2026-09-12.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=(
+            "Миграция схемы под ревизию 2026-09-12. Индексы заводятся ВСЕГДА, "
+            "при каждом запуске, без флагов — это безопасно (IF NOT EXISTS, "
+            "данные не трогает). Флаг ниже управляет только изменением ДАННЫХ."
+        ),
     )
     parser.add_argument("--database", required=True, type=Path, help="путь к bot.db")
     parser.add_argument(
-        "--fix-duplicates",
-        action="store_true",
+        "--backup-dir",
+        type=Path,
+        default=None,
         help=(
-            "снять дублирующиеся ники (dedupe_usernames) и создать уникальный индекс. "
-            "Без флага — только отчёт о конфликтах, БД не меняется."
+            "куда положить бэкап перед миграцией. По умолчанию — рядом с "
+            "--database (тот же каталог/docker-том, что и оригинал: НЕ "
+            "защищает от потери самого тома/диска). Укажите каталог, "
+            "смонтированный отдельно (например, с хоста), для реальной защиты."
         ),
     )
     parser.add_argument(
@@ -164,7 +162,9 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help=(
             f"удалить строки download_log старше {DOWNLOAD_LOG_RETENTION_DAYS} дней. "
-            "Без флага — только подсчёт, ничего не удаляется."
+            "Без флага — только подсчёт, этот скрипт ничего не удаляет (но "
+            "автоматический ретеншен бота при старте всё равно удалит их сам, "
+            "см. предупреждение в выводе)."
         ),
     )
     args = parser.parse_args(argv)
@@ -173,71 +173,51 @@ def main(argv: list[str] | None = None) -> int:
         print(f"файла нет: {args.database}")
         return 1
 
-    backup_path = backup_database(args.database)
-    print(f"бэкап создан и проверен: {backup_path}")
-
-    exit_code = 0
-    conn = sqlite3.connect(args.database, timeout=30)
     try:
-        conn.execute("PRAGMA busy_timeout = 30000")
-
-        # --- шаг 1: конфликтующие ники ---------------------------------
-        conflicts = _group_usernames_case_insensitively(conn)
-        if conflicts:
-            print(f"конфликтующих ников (без учёта регистра): {len(conflicts)}")
-            for key, members in sorted(conflicts.items()):
-                print(f"  {key!r}: {members}")
-        else:
-            print("конфликтующих ников не найдено")
-
-        if conflicts and args.fix_duplicates:
-            cleared = dedupe_usernames(conn)
-            conn.commit()
-            for user_id, username in cleared:
-                print(f"снят дублирующийся ник: id={user_id} username={username}")
-            print(f"снято дублирующихся ников: {len(cleared)}")
-        elif conflicts:
+        backup_path = backup_database(args.database, args.backup_dir)
+        print(f"бэкап создан и проверен: {backup_path}")
+        if args.backup_dir is None:
             print(
-                "дубликаты НЕ тронуты (нет флага --fix-duplicates) — "
-                "решение, что с ними делать, за владельцем."
+                "ВНИМАНИЕ: бэкап лёг РЯДОМ с оригиналом, в том же каталоге/томе "
+                "— не защищает от потери самого тома/диска (docker volume rm, "
+                "docker compose down -v, смерть диска). Передайте --backup-dir "
+                "с отдельно смонтированным каталогом для реальной защиты."
             )
 
-        # --- шаг 2: обычные индексы (безопасны всегда, IF NOT EXISTS) --
-        for statement in EXTRA_INDEX_DDL:
-            conn.execute(statement)
-        conn.commit()
-        print("обычные индексы созданы")
+        conn = sqlite3.connect(args.database, timeout=30)
+        try:
+            conn.execute("PRAGMA busy_timeout = 30000")
 
-        # --- шаг 3: уникальный индекс по username -----------------------
-        if _group_usernames_case_insensitively(conn):
-            print(
-                "уникальный индекс по users.username НЕ создан — в базе остаются "
-                "конфликтующие ники. Запустить скрипт повторно с --fix-duplicates "
-                "после решения владельца, что делать с дублями."
-            )
-            exit_code = 3
-        else:
-            conn.execute(USERNAME_UNIQUE_DDL)
+            for statement in EXTRA_INDEX_DDL:
+                conn.execute(statement)
             conn.commit()
-            print("уникальный индекс по users.username создан")
+            print("индексы созданы (это всегда, схема меняется при каждом запуске)")
 
-        # --- шаг 4: ретеншен download_log --------------------------------
-        cutoff = _retention_cutoff()
-        old_count = conn.execute(
-            "SELECT COUNT(*) FROM download_log WHERE created_at < ?", (cutoff,)
-        ).fetchone()[0]
-        print(f"строк download_log старше {DOWNLOAD_LOG_RETENTION_DAYS} дней: {old_count}")
+            cutoff = _retention_cutoff()
+            old_count = conn.execute(
+                "SELECT COUNT(*) FROM download_log WHERE created_at < ?", (cutoff,)
+            ).fetchone()[0]
+            print(f"строк download_log старше {DOWNLOAD_LOG_RETENTION_DAYS} дней: {old_count}")
 
-        if old_count and args.purge_logs:
-            conn.execute("DELETE FROM download_log WHERE created_at < ?", (cutoff,))
-            conn.commit()
-            print(f"удалено строк download_log: {old_count}")
-        elif old_count:
-            print("строки НЕ удалены (нет флага --purge-logs) — это только подсчёт")
-    finally:
-        conn.close()
+            if old_count and args.purge_logs:
+                cursor = conn.execute("DELETE FROM download_log WHERE created_at < ?", (cutoff,))
+                conn.commit()
+                print(f"удалено строк download_log: {cursor.rowcount}")
+            elif old_count:
+                print(
+                    "строки НЕ удалены этим скриптом (нет флага --purge-logs) — "
+                    "это только подсчёт. Это НЕ значит, что они в безопасности: "
+                    "ретеншен в bot/db/engine.py::init_db безусловен и удалит их "
+                    "сам на ближайшем рестарте бота — без бэкапа и без "
+                    "предупреждения, раз они уже старше порога."
+                )
+        finally:
+            conn.close()
+    except (sqlite3.Error, OSError, RuntimeError) as exc:
+        print(f"миграция прервана ошибкой: {exc}")
+        return 2
 
-    return exit_code
+    return 0
 
 
 if __name__ == "__main__":

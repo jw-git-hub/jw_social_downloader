@@ -56,13 +56,21 @@ async def db_session(tmp_path):
     Собственный движок, а не `bot.db.engine.async_session`: тот создаётся на
     импорте из `settings.DATABASE_URL` и указывает на рабочую базу.
     """
+    from sqlalchemy import text
     from sqlalchemy.ext.asyncio import async_sessionmaker
 
-    from bot.db.models import Base
+    from bot.db.models import EXTRA_INDEX_DDL, Base
 
     engine = _prod_like_sqlite_engine(tmp_path / "test.db")
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # `create_all` не заводит EXTRA_INDEX_DDL (это же верно и в проде —
+        # весь смысл отдельного DDL в том, что create_all его не делает).
+        # Без этой строки тестовая схема структурно расходилась с боевой:
+        # ни один новый индекс в тестах не создавался, только то, что есть
+        # в metadata моделей — задачи 21 (фикс-раунд 1).
+        for statement in EXTRA_INDEX_DDL:
+            await conn.execute(text(statement))
 
     maker = async_sessionmaker(engine, expire_on_commit=False)
     async with maker() as session:

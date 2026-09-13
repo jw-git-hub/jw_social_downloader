@@ -3,9 +3,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-import pytest
-
-from bot.db.models import EXTRA_INDEX_DDL, USERNAME_UNIQUE_DDL
+from bot.db.models import EXTRA_INDEX_DDL
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -57,54 +55,8 @@ def test_extra_ddl_is_idempotent(tmp_path):
     names = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")}
     assert "ix_download_log_created_at" in names
     assert "ix_download_log_user_id" in names
-
-
-def test_unique_index_refuses_duplicates_after_migration(tmp_path):
-    conn = _legacy_db(tmp_path / "bot.db")
-    conn.executescript(
-        """
-        INSERT INTO users VALUES (1000000001,'foo','A',3,NULL,0,0,'2025-01-01','2025-01-01');
-        INSERT INTO users VALUES (1000000002,'Foo','B',3,NULL,0,0,'2025-01-01','2026-09-01');
-        INSERT INTO users VALUES (1000000003,NULL,'C',3,NULL,0,0,'2025-01-01','2025-01-01');
-        """
-    )
-    conn.commit()
-
-    # До миграции уникальный индекс создать нельзя — это и есть повод для скрипта.
-    with pytest.raises(sqlite3.IntegrityError):
-        conn.execute(USERNAME_UNIQUE_DDL)
-
-    migration = _load_migration()
-    cleared = migration.dedupe_usernames(conn)
-    conn.commit()
-
-    assert cleared == [(1000000001, "foo")]
-    conn.execute(USERNAME_UNIQUE_DDL)  # теперь проходит
-
-    # У более свежей строки ник сохранён, у старой снят, NULL не тронут.
-    rows = dict(conn.execute("SELECT id, username FROM users"))
-    assert rows == {1000000001: None, 1000000002: "Foo", 1000000003: None}
-
-
-def test_unique_index_allows_many_nulls(tmp_path):
-    conn = _legacy_db(tmp_path / "bot.db")
-    conn.execute(USERNAME_UNIQUE_DDL)
-    conn.executescript(
-        """
-        INSERT INTO users VALUES (1000000001,NULL,'A',3,NULL,0,0,'2025-01-01','2025-01-01');
-        INSERT INTO users VALUES (1000000002,NULL,'B',3,NULL,0,0,'2025-01-01','2025-01-01');
-        """
-    )
-    conn.commit()
-    assert conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 2
-
-
-def test_unique_index_is_case_insensitive(tmp_path):
-    conn = _legacy_db(tmp_path / "bot.db")
-    conn.execute(USERNAME_UNIQUE_DDL)
-    conn.execute("INSERT INTO users VALUES (1000000001,'foo','A',3,NULL,0,0,'2025-01-01','2025-01-01')")
-    with pytest.raises(sqlite3.IntegrityError):
-        conn.execute("INSERT INTO users VALUES (1000000002,'FOO','B',3,NULL,0,0,'2025-01-01','2025-01-01')")
+    assert "ix_users_subscription_until" in names
+    assert "ix_users_username_lower" in names
 
 
 async def test_foreign_keys_pragma_is_on(db_session):
@@ -115,30 +67,21 @@ async def test_foreign_keys_pragma_is_on(db_session):
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# Дополнительные проверки поверх плана задачи (решения контроллера):
-#
-# 1) "индекс создан" != "индекс используется планировщиком" — тесты выше
-#    (test_extra_ddl_is_idempotent) проверяют только наличие имени в
-#    sqlite_master. Ниже — EXPLAIN QUERY PLAN на РЕАЛЬНЫХ формах запросов
-#    из bot/db/queries.py, включая находку: func.lower(User.username) не
-#    использует COLLATE NOCASE-индекс, понадобился отдельный индекс по
-#    выражению lower(username) (см. models.py).
-# 2) Семантика PRAGMA foreign_keys=ON на существующих данных (решение 5).
-# 3) Безопасное по умолчанию поведение scripts/migrate_20260913.py:
-#    обязательный бэкап, дубликаты и ретеншен не трогаются без явных флагов
-#    (решения 2-4).
+# Фикс-раунд 1 (ревью, 2026-09-13): уникальность users.username снята
+# целиком (Critical — get_or_create_user ронял необработанный IntegrityError
+# на легитимном переиспользовании ника). Тесты на USERNAME_UNIQUE_DDL и
+# dedupe_usernames удалены вместе с самим кодом — их предмет больше не
+# существует. Подробности выбора — bot/db/models.py и task-21-report.md.
+# Ниже — то, что осталось актуальным, плюс новые проверки по итогам ревью.
 # ─────────────────────────────────────────────────────────────────────────
 
 
 def test_username_lower_index_is_used_by_the_real_lookup_query(tmp_path):
     """ix_users_username_lower должен реально выбираться планировщиком под
     ТОТ ЖЕ запрос, что делает get_user_by_username (`func.lower(User.username)
-    == needle`, с ORDER BY/LIMIT). Уникальный NOCASE-индекс (USERNAME_UNIQUE_DDL)
-    для этой формы запроса не подходит: `COLLATE NOCASE` и `lower(...)` —
-    разные выражения, планировщик их не отождествляет (проверено отдельно
-    через EXPLAIN QUERY PLAN на голом sqlite3 при разработке этой задачи).
-    Без этого индекса поиск по нику остаётся полным сканированием даже
-    после того, как уникальный индекс создан.
+    == needle`, с ORDER BY/LIMIT) — иначе "индекс создан" ничего не значит.
+    Это теперь единственный механизм, дающий поиску по нику скорость: после
+    фикс-раунда 1 уникального индекса больше нет.
     """
     db_path = tmp_path / "bot.db"
     conn = _legacy_db(db_path)
@@ -152,7 +95,6 @@ def test_username_lower_index_is_used_by_the_real_lookup_query(tmp_path):
     conn.commit()
     for statement in EXTRA_INDEX_DDL:
         conn.execute(statement)
-    conn.execute(USERNAME_UNIQUE_DDL)
     conn.commit()
     conn.execute("ANALYZE")
 
@@ -176,10 +118,10 @@ def test_download_log_indexes_are_used_by_planner(tmp_path):
     по пользователю, а не только присутствовать в sqlite_master.
     """
     # 30 разных пользователей по 10 строк лога каждому: `user_id = ?` должен
-    # быть избирательным (1/30 таблицы). Изначальная версия этого теста
-    # держала все 300 строк на ОДНОМ user_id — планировщик КОРРЕКТНО выбирал
-    # SCAN (индекс без пользы, когда предикат не отсеивает почти ничего), и
-    # тест на самом деле проверял не то, что заявлял.
+    # быть избирательным (1/30 таблицы). Версия теста на ОДНОМ user_id для
+    # всех 300 строк держала планировщик перед ВЕРНЫМ выбором SCAN (индекс
+    # без пользы, когда предикат не отсеивает почти ничего) — такой тест
+    # проверял не то, что заявлял.
     db_path = tmp_path / "bot.db"
     conn = _legacy_db(db_path)
     conn.executescript(
@@ -224,6 +166,8 @@ def test_foreign_keys_pragma_blocks_new_orphans_but_ignores_existing(tmp_path):
     включения уже нельзя. На копии боевой БД (см. отчёт задачи) сирот на
     момент ревизии нет, так что сценарий воспроизведён синтетически.
     """
+    import pytest
+
     from bot.db.engine import apply_sqlite_pragmas
 
     db_path = tmp_path / "bot.db"
@@ -255,6 +199,23 @@ def test_foreign_keys_pragma_blocks_new_orphans_but_ignores_existing(tmp_path):
             "'instagram','ok',1.0,'2025-01-01 00:00:00')"
         )
     conn2.close()
+
+
+async def test_db_session_fixture_has_the_extra_indexes(db_session):
+    """Ревью фикс-раунда 1: тестовая схема (`db_session`) должна структурно
+    совпадать с тем, что заводит EXTRA_INDEX_DDL в проде — раньше фикстура
+    создавала только то, что есть в metadata моделей, и весь сьют тестировал
+    ДРУГУЮ схему, чем прод (ни один новый индекс не был виден тестам)."""
+    from sqlalchemy import text
+
+    rows = (
+        await db_session.execute(text("SELECT name FROM sqlite_master WHERE type='index'"))
+    ).fetchall()
+    names = {row[0] for row in rows}
+    assert "ix_users_username_lower" in names
+    assert "ix_download_log_created_at" in names
+    assert "ix_download_log_user_id" in names
+    assert "ix_users_subscription_until" in names
 
 
 def test_retention_days_constant_matches_engine():
@@ -311,15 +272,59 @@ def test_main_backs_up_database_before_touching_data(tmp_path):
     check.close()
 
 
-def test_main_default_run_does_not_mutate_duplicates_or_purge_logs(tmp_path):
-    """Решение 2 и 3: без явных флагов скрипт только показывает находки,
-    ничего не удаляет и не переименовывает."""
+def test_main_backup_dir_flag_writes_backup_outside_db_directory(tmp_path, capsys):
+    """Важно 3 (фикс-раунд 1): бэкап рядом с оригиналом не защищает от
+    потери самого тома. --backup-dir кладёт бэкап в отдельный каталог,
+    который скрипт создаёт сам, если его ещё нет (смонтированный с хоста
+    каталог может не существовать заранее), и предупреждение про том в этом
+    случае не показывается (оно только для дефолтного расположения)."""
+    db_dir = tmp_path / "volume"
+    db_dir.mkdir()
+    db_path = db_dir / "bot.db"
+    conn = _legacy_db(db_path)
+    conn.execute("INSERT INTO users VALUES (1,'ivan','A',3,NULL,0,0,'2025-01-01','2025-01-01')")
+    conn.commit()
+    conn.close()
+
+    backup_dir = tmp_path / "host-backups"  # намеренно ещё не существует
+    migration = _load_migration()
+    rc = migration.main(["--database", str(db_path), "--backup-dir", str(backup_dir)])
+    assert rc == 0
+
+    backups = sorted(backup_dir.glob("bot.db.bak-*"))
+    assert len(backups) == 1
+    assert sorted(db_dir.glob("bot.db.bak-*")) == []  # в каталоге БД бэкапа нет
+
+    out = capsys.readouterr().out
+    assert "ВНИМАНИЕ" not in out
+
+
+def test_main_warns_when_backup_dir_not_given(tmp_path, capsys):
+    """Без --backup-dir бэкап ложится в тот же том, что и оригинал — скрипт
+    обязан сказать об этом прямым текстом, а не молчать (Важно 3)."""
+    db_path = tmp_path / "bot.db"
+    conn = _legacy_db(db_path)
+    conn.execute("INSERT INTO users VALUES (1,'ivan','A',3,NULL,0,0,'2025-01-01','2025-01-01')")
+    conn.commit()
+    conn.close()
+
+    migration = _load_migration()
+    migration.main(["--database", str(db_path)])
+
+    out = capsys.readouterr().out
+    assert "ВНИМАНИЕ" in out
+    assert "том" in out
+
+
+def test_main_default_run_creates_schema_but_does_not_purge_logs(tmp_path):
+    """Важно 4 (фикс-раунд 1): схема (индексы) меняется ВСЕГДА, без флагов —
+    это безопасно (IF NOT EXISTS). Флаг --purge-logs управляет ТОЛЬКО
+    данными: без него старые строки download_log не трогаются."""
     db_path = tmp_path / "bot.db"
     conn = _legacy_db(db_path)
     conn.executescript(
         """
         INSERT INTO users VALUES (1,'foo','A',3,NULL,0,0,'2025-01-01','2025-01-01');
-        INSERT INTO users VALUES (2,'Foo','B',3,NULL,0,0,'2025-01-01','2026-09-01');
         INSERT INTO download_log VALUES (1,1,'https://example.com/old','instagram','ok',1.0,'2020-01-01 00:00:00');
         """
     )
@@ -328,39 +333,13 @@ def test_main_default_run_does_not_mutate_duplicates_or_purge_logs(tmp_path):
 
     migration = _load_migration()
     rc = migration.main(["--database", str(db_path)])
-    assert rc == 3  # незакрытые дубликаты -> уникальный индекс не создан
-
-    check = sqlite3.connect(db_path)
-    rows = dict(check.execute("SELECT id, username FROM users"))
-    assert rows == {1: "foo", 2: "Foo"}  # дубликаты не тронуты
-    assert check.execute("SELECT COUNT(*) FROM download_log").fetchone()[0] == 1  # лог не тронут
-    names = {row[0] for row in check.execute("SELECT name FROM sqlite_master WHERE type='index'")}
-    assert "ix_users_username_nocase" not in names  # не создан из-за дублей
-    assert "ix_download_log_created_at" in names  # обычные индексы безопасны всегда
-    check.close()
-
-
-def test_main_fix_duplicates_flag_applies_dedupe_and_creates_unique_index(tmp_path):
-    db_path = tmp_path / "bot.db"
-    conn = _legacy_db(db_path)
-    conn.executescript(
-        """
-        INSERT INTO users VALUES (1,'foo','A',3,NULL,0,0,'2025-01-01','2025-01-01');
-        INSERT INTO users VALUES (2,'Foo','B',3,NULL,0,0,'2025-01-01','2026-09-01');
-        """
-    )
-    conn.commit()
-    conn.close()
-
-    migration = _load_migration()
-    rc = migration.main(["--database", str(db_path), "--fix-duplicates"])
     assert rc == 0
 
     check = sqlite3.connect(db_path)
-    rows = dict(check.execute("SELECT id, username FROM users"))
-    assert rows == {1: None, 2: "Foo"}
     names = {row[0] for row in check.execute("SELECT name FROM sqlite_master WHERE type='index'")}
-    assert "ix_users_username_nocase" in names
+    assert "ix_download_log_created_at" in names
+    assert "ix_users_username_lower" in names
+    assert check.execute("SELECT COUNT(*) FROM download_log").fetchone()[0] == 1  # лог не тронут
     check.close()
 
 
@@ -387,3 +366,43 @@ def test_main_purge_logs_flag_deletes_old_rows_only_with_flag(tmp_path):
     remaining = [row[0] for row in check.execute("SELECT id FROM download_log ORDER BY id")]
     assert remaining == [2]
     check.close()
+
+
+def test_main_warns_engine_will_purge_anyway_without_flag(tmp_path, capsys):
+    """Minor 7 (фикс-раунд 1): владелец может сознательно не дать
+    --purge-logs, но автоматический ретеншен в init_db безусловен и удалит
+    эти же строки сам на ближайшем рестарте бота — без бэкапа и без
+    предупреждения. Скрипт обязан сказать об этом прямо, а не создавать
+    ложное чувство «раз я не удалил — значит, в безопасности»."""
+    db_path = tmp_path / "bot.db"
+    conn = _legacy_db(db_path)
+    conn.executescript(
+        """
+        INSERT INTO users VALUES (1,'ivan','A',3,NULL,0,0,'2025-01-01','2025-01-01');
+        INSERT INTO download_log VALUES (1,1,'https://example.com/old','instagram','ok',1.0,'2020-01-01 00:00:00');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    migration = _load_migration()
+    migration.main(["--database", str(db_path)])
+
+    out = capsys.readouterr().out
+    assert "init_db" in out
+    assert "рестарте" in out
+
+
+def test_main_reports_human_readable_error_for_invalid_database_file(tmp_path, capsys):
+    """Minor (фикс-раунд 1): main() не должен ронять голый traceback на
+    ошибках SQLite/ОС — человекочитаемое сообщение и отдельный код возврата
+    (не 0, не путается с «дубликаты найдены», которого больше не существует)."""
+    bad_path = tmp_path / "bot.db"
+    bad_path.write_text("это не sqlite файл, а обычный текст" * 5)
+
+    migration = _load_migration()
+    rc = migration.main(["--database", str(bad_path)])
+
+    assert rc == 2
+    out = capsys.readouterr().out
+    assert "миграция прервана ошибкой" in out
