@@ -12,10 +12,11 @@ from bot.db.engine import init_db
 from bot.handlers import admin_router, user_router
 from bot.middlewares.throttle import ThrottleMiddleware
 from bot.services.cleanup import periodic_cleanup
+from bot.utils.log_guard import setup_logging
 
 
 async def main() -> None:
-    logger.add("data/bot.log", rotation="10 MB", retention="7 days", level="INFO")
+    setup_logging()
 
     await init_db()
 
