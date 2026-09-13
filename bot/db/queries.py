@@ -63,11 +63,50 @@ async def toggle_ban(session: AsyncSession, user_id: int) -> bool:
     return user.is_banned
 
 
+# УСТАРЕЛО. Заменена на reserve_free_download: списание после доставки давало
+# пользователю от трёх до семи скачиваний при одном оставшемся (C-1).
+# Удаляется в Task 37, после того как пакет D перестанет её импортировать.
 async def decrement_free_downloads(session: AsyncSession, user_id: int) -> None:
     await session.execute(
         update(User)
         .where(User.id == user_id, User.free_downloads_left > 0)
         .values(free_downloads_left=User.free_downloads_left - 1)
+    )
+    await session.flush()
+
+
+async def reserve_free_download(session: AsyncSession, user_id: int) -> bool:
+    """Атомарно занимает одну бесплатную единицу. `True` — заняли.
+
+    Условие `free_downloads_left > 0` проверяет СУБД в том же операторе,
+    который декрементирует, поэтому окна между «проверили остаток» и
+    «списали» больше нет: параллельные загрузки одного пользователя не
+    могут занять одну и ту же единицу дважды.
+
+    Успех определяется по `rowcount == 1`. Раньше `rowcount` не проверялся
+    нигде в репозитории, и «не списалось» было неотличимо от «списалось».
+    """
+    result = await session.execute(
+        update(User)
+        .where(User.id == user_id, User.free_downloads_left > 0)
+        .values(free_downloads_left=User.free_downloads_left - 1)
+    )
+    await session.flush()
+    return result.rowcount == 1
+
+
+async def refund_free_download(session: AsyncSession, user_id: int) -> None:
+    """Возвращает ровно одну ранее зарезервированную единицу.
+
+    Вызывающий обязан звать это не более одного раза на одно успешное
+    резервирование: верхнего ограничителя здесь нет сознательно — админ
+    может выдать пользователю больше единиц, чем FREE_DOWNLOADS, и упирать
+    возврат в эту константу означало бы молча отнимать выданное.
+    """
+    await session.execute(
+        update(User)
+        .where(User.id == user_id)
+        .values(free_downloads_left=User.free_downloads_left + 1)
     )
     await session.flush()
 
