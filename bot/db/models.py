@@ -44,6 +44,15 @@ class SubscriptionGrant(Base):
     и изменение не применяется второй раз.
 
     `days = NULL` означает снятие подписки, отрицательное — сокращение.
+
+    `subscription_until_before`/`subscription_until_after` — состояние ДО
+    и ПОСЛЕ операции. Строка самодостаточна для восстановления истории:
+    не требует пересчёта по цепочке предыдущих строк, которая рвётся при
+    любой правке `subscription_until` в обход `apply_subscription_change`
+    (ревью фикс-раунда 1: журнал отвечал на «кому/когда/кем/сколько», но
+    не на «с какого состояния» и «за что»). `reason` — произвольная
+    привязка к платежу/причине, может быть `NULL`, если вызывающий её не
+    передал.
     """
 
     __tablename__ = "subscription_grant"
@@ -53,5 +62,7 @@ class SubscriptionGrant(Base):
     admin_id: Mapped[int] = mapped_column(BigInteger)
     days: Mapped[Optional[int]] = mapped_column(nullable=True)
     idempotency_key: Mapped[str] = mapped_column(String(64), unique=True)
+    reason: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    subscription_until_before: Mapped[Optional[datetime]] = mapped_column(nullable=True)
     subscription_until_after: Mapped[Optional[datetime]] = mapped_column(nullable=True)
     created_at: Mapped[datetime] = mapped_column(default=func.now(), index=True)

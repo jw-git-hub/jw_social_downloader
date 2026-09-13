@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import func, select, update
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import settings
@@ -92,50 +93,112 @@ async def apply_subscription_change(
     admin_id: int,
     days: int | None,
     idempotency_key: str,
+    reason: str | None = None,
 ) -> GrantOutcome:
     """Единственная точка изменения подписки.
 
-    `days > 0` — продлить от `max(now, текущая дата)`, `days < 0` — сократить,
-    `days is None` — снять подписку полностью. Каждое применённое изменение
-    пишет строку в `subscription_grant`; повтор с тем же ключом ничего не
-    меняет и возвращает `duplicate=True`.
-    """
-    seen = await session.scalar(
-        select(SubscriptionGrant).where(SubscriptionGrant.idempotency_key == idempotency_key)
-    )
-    if seen is not None:
-        user_exists = await session.get(User, user_id) is not None
-        return GrantOutcome(
-            applied=False,
-            user_found=user_exists,
-            duplicate=True,
-            subscription_until=_as_utc(seen.subscription_until_after),
-        )
+    `days > 0` — продлить от `max(now, текущая дата)`, `days < 0` —
+    сократить, `days is None` — снять подписку полностью (`NULL`, а не
+    дата в прошлом). Отрицательный `days` МОЖЕТ увести
+    `subscription_until` в прошлое, если `|days|` больше остатка, — это
+    НЕ то же самое, что снятие: код, который проверяет
+    `subscription_until is None`/truthiness вместо сравнения с `now`,
+    увидит разницу. `days=0` не отвергается: журналируется как обычное
+    изменение и может «оживить» истёкшую подписку до `now` (база —
+    `max(now, existing)` + 0 дней). Отсекать `0`/отрицательные значения —
+    дело вызывающего (рендер карточки в пакете E), не этого примитива.
 
+    Каждое ПРИМЕНЁННОЕ изменение — включая снятие (`days is None`) —
+    пишет одну строку в `subscription_grant`, с состоянием ДО и ПОСЛЕ
+    (`subscription_until_before`/`_after`) и опциональным `reason`. На
+    несуществующего пользователя НЕ журналируется вовсе, и
+    `idempotency_key` не считается использованным: повтор с тем же
+    ключом, когда пользователь появится, пройдёт как первое настоящее
+    применение, а не как дубль.
+
+    Идемпотентность — одна условная вставка (`INSERT ... ON CONFLICT
+    (idempotency_key) DO NOTHING`) и вердикт по `rowcount`, тот же приём,
+    что у `reserve_free_download` в этом же файле. Это принципиально, а
+    не «на всякий случай»: у aiogram 3.31 `Dispatcher` нет
+    `tasks_concurrency_limit`, а `ThrottleMiddleware` висит только на
+    `dp.message` — `dp.callback_query` ничем не троттлится, поэтому
+    конкурентный двойной клик по кнопке (два перекрывающихся вызова, не
+    последовательных) — основной путь, не край. Связка «`SELECT`, потом
+    решить, потом писать» на такой гонке либо задваивает журнал, либо
+    роняет проигравшего в сырой `IntegrityError` без указания, какое
+    ограничение упало (см. `test_concurrent_same_key_calls_yield_one_winner`
+    и её красный вариант без `on_conflict_do_nothing` — заведомо
+    подтверждено). Здесь проигравший получает штатный `duplicate=True`.
+
+    Обязанности вызывающего (примитив НЕ проверяет ничего из списка):
+
+    1. `idempotency_key` генерировать заново на каждое логическое
+       действие (например, на каждый рендер карточки в UI), а НЕ
+       детерминированно из `(user_id, days)` — иначе законный повторный
+       грант той же длительности неделю спустя будет ошибочно
+       задедуплен как повтор той же кнопки.
+    2. При `duplicate=True` функция НЕ сверяет переданный `user_id` с
+       тем, что был сохранён в исходном гранте по этому ключу — коллизия
+       ключей между разными пользователями (не должна возникать при
+       генерации ключа в UI на рендере конкретной карточки, но примитивом
+       не перехватывается) вернёт `subscription_until` ПЕРВОГО
+       пользователя, а не переданного.
+    3. `admin_id` передаётся как есть и не проверяется против
+       `settings.ADMIN_ID` или какого-либо списка администраторов.
+    4. Вызывать строго внутри транзакции, которую вызывающий сам
+       коммитит (`async with session.begin(): ...`, как в тестах этого
+       модуля). `flush()` внутри функции делает запись видимой в ТЕКУЩЕЙ
+       транзакции, но не коммитит её: `async with async_session() as
+       session:` без `session.begin()` уходит в неявную транзакцию,
+       которая молча откатится при закрытии сессии — `GrantOutcome`
+       при этом всё равно вернёт `applied=True`, а в БД не останется
+       ничего.
+    """
     user = await session.get(User, user_id)
     if user is None:
         return GrantOutcome(
             applied=False, user_found=False, duplicate=False, subscription_until=None
         )
 
+    subscription_before = _as_utc(user.subscription_until)
     if days is None:
         new_until = None
     else:
         now = datetime.now(timezone.utc)
-        existing = _as_utc(user.subscription_until)
-        base = max(now, existing) if existing else now
+        base = max(now, subscription_before) if subscription_before else now
         new_until = base + timedelta(days=days)
 
-    user.subscription_until = new_until
-    session.add(
-        SubscriptionGrant(
+    insert_stmt = (
+        sqlite_insert(SubscriptionGrant.__table__)
+        .values(
             user_id=user_id,
             admin_id=admin_id,
             days=days,
             idempotency_key=idempotency_key,
+            reason=reason,
+            subscription_until_before=subscription_before,
             subscription_until_after=new_until,
         )
+        .on_conflict_do_nothing(index_elements=["idempotency_key"])
     )
+    result = await session.execute(insert_stmt)
+    if result.rowcount == 0:
+        # rowcount == 0 значит: строку с этим ключом только что создал
+        # либо наш же предыдущий (последовательный повтор), либо
+        # параллельный вызов, выигравший гонку прямо сейчас (см.
+        # докстринг выше). Различать эти два случая незачем — в обоих
+        # состояние пользователя менять нельзя, ответ один и тот же.
+        seen = await session.scalar(
+            select(SubscriptionGrant).where(SubscriptionGrant.idempotency_key == idempotency_key)
+        )
+        return GrantOutcome(
+            applied=False,
+            user_found=True,
+            duplicate=True,
+            subscription_until=_as_utc(seen.subscription_until_after) if seen else None,
+        )
+
+    user.subscription_until = new_until
     await session.flush()
     return GrantOutcome(
         applied=True, user_found=True, duplicate=False, subscription_until=new_until
