@@ -1,7 +1,11 @@
-aiogram>=3.4,<4.0
+# Версии пинуются точно: этот файл — единственный источник правды о версиях
+# и одновременно cache-buster для слоя `pip install` в Dockerfile.
+aiogram==3.31.0
 SQLAlchemy[asyncio]>=2.0,<3.0
 aiosqlite>=0.20
-yt-dlp>=2026.8.19
 pydantic-settings>=2.0
 loguru>=0.7
-gallery-dl>=1.32.9
+# Extras обязательны: curl-cffi нужен для TikTok и Instagram.
+yt-dlp[default,curl-cffi]==2026.8.19
+# 1.32.11 чинит падение TikTok `_generate_headers`, 1.32.12 — Instagram posts/reels.
+gallery-dl==1.32.12
