@@ -16,17 +16,25 @@ def anyio_backend():
 
 def _prod_like_sqlite_engine(db_path):
     """Движок SQLite с той же конфигурацией блокировок, что и боевой
-    `bot/db/engine.py`: `connect_args={"timeout": 30}` + `PRAGMA
-    journal_mode=WAL` + `synchronous=NORMAL`.
+    `bot/db/engine.py`: `connect_args={"timeout": 30}` + PRAGMA из
+    `apply_sqlite_pragmas` (WAL, `synchronous=NORMAL`, `foreign_keys=ON`).
 
     Тест на гонку поверх движка БЕЗ этих настроек проверяет другую
     семантику блокировок, чем прод, и ничего не доказывает про боевой код
     — поэтому это не инлайн в фикстуре, а отдельная фабрика: `db_session`
     берёт из неё одно соединение, тесты на гонку (`test_quota_queries.py`)
     — несколько независимых, указывающих на один и тот же файл.
+
+    PRAGMA берутся из `bot.db.engine.apply_sqlite_pragmas`, а не
+    продублированы здесь: иначе фикстура и боевой код могли бы разойтись
+    молча (например, кто-то включит `foreign_keys` в одном месте и забудет
+    про другое) — `test_foreign_keys_pragma_is_on` проверяет ровно этот
+    боевой листенер, а не копию его логики.
     """
     from sqlalchemy import event
     from sqlalchemy.ext.asyncio import create_async_engine
+
+    from bot.db.engine import apply_sqlite_pragmas
 
     engine = create_async_engine(
         f"sqlite+aiosqlite:///{db_path}",
@@ -35,10 +43,7 @@ def _prod_like_sqlite_engine(db_path):
 
     @event.listens_for(engine.sync_engine, "connect")
     def _set_sqlite_pragma(dbapi_conn, _):
-        cur = dbapi_conn.cursor()
-        cur.execute("PRAGMA journal_mode=WAL")
-        cur.execute("PRAGMA synchronous=NORMAL")
-        cur.close()
+        apply_sqlite_pragmas(dbapi_conn)
 
     return engine
 
