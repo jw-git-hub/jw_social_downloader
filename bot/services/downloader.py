@@ -15,14 +15,20 @@ from uuid import uuid4
 from loguru import logger
 
 from bot.config import settings
+from bot.utils.log_guard import mask_secrets
 
 DOWNLOAD_DIR = Path("/tmp/jw_downloads")
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".gif"}
 GALLERY_DL_FALLBACK_PLATFORMS = {"instagram", "pinterest", "tiktok"}
-# Потолок числа элементов, которые gallery-dl вытянет за один запрос.
-# Без него один запрос к доске Pinterest (1723 айтема в живом тесте)
-# стоит пользователю одну единицу квоты.
+# Потолок числа элементов на ОДНУ единицу квоты. Только доска/профиль/поиск
+# Pinterest не ограничены платформой — 1723 элемента в живом тесте. Одиночный
+# пин Pinterest, карусель Instagram (/p/, нативно ≤20) и слайдшоу TikTok
+# (/photo/) так разрастись не могут — им дан отдельный, более высокий
+# потолок (см. `_gallery_dl_item_limit`): фикс-раунд 1 нашёл, что общий
+# низкий потолок на ВСЕ запуски молча обрезал карусели, которые раньше
+# приезжали целиком, — чиним H-6 и тут же создаём новую регрессию.
 GALLERY_DL_MAX_ITEMS = 10
+GALLERY_DL_CAROUSEL_MAX_ITEMS = 20
 # TikTok периодически отдаёт транзиторный WAF-челлендж (JS rehydration / HTTP 403):
 # видео доступно, но конкретная попытка срывается. Делаем один мягкий ретрай.
 TIKTOK_MAX_ATTEMPTS = 2
@@ -38,6 +44,16 @@ class DownloadResult:
     success: bool = False
     error_message: str | None = None
     media_type: str | None = None
+    # Точное «N из M» из gallery-dl недостижимо (stderr не даёт надёжного
+    # счётчика элементов доски) — но этих двух флагов достаточно, чтобы
+    # следующий пакет решил, что сказать пользователю и списывать ли квоту:
+    # partial — часть элементов не скачалась (ненулевой код при непустом
+    # результате); truncated — результат уткнулся в потолок --range, за
+    # пределом могли остаться ещё элементы. Проставляются только на
+    # gallery-dl-пути (см. `_try_gallery_dl_fallback`); на yt-dlp — всегда
+    # False, поведение не менялось.
+    partial: bool = False
+    truncated: bool = False
 
 
 # ── Классификация ошибок загрузки ────────────────────────────────────────
@@ -46,8 +62,28 @@ class DownloadResult:
 # yt-dlp печатает «ERROR: ...», gallery-dl — «[extractor][error] ...».
 # Прогресс, предупреждения и эхо аргументов в классификацию не попадают —
 # именно из-за них раньше любой сбой объявлялся протуханием cookies.
+#
+# Исключение — обрыв по размеру файла: yt-dlp печатает его через to_screen
+# («[download] File is larger than max-filesize (…). Aborting.»), БЕЗ
+# маркера ERROR:, и без этой альтернативы строка отфильтровывалась начисто —
+# правило too_large ниже никогда не получало шанса сработать (находка
+# ревью фикс-раунда 1).
 _ERROR_LINE_RE = re.compile(
-    r"(?:^|\s)(?:ERROR:|\[[^\]\s]+\]\[error\]|error:)",
+    r"(?:^|\s)(?:ERROR:|\[[^\]\s]+\]\[error\]|error:)"
+    r"|file is larger than max-?filesize",
+    re.IGNORECASE,
+)
+
+# Для ПОКАЗА пользователю (в отличие от классификации выше) хотим больше
+# контекста: `[warning]`-строка непосредственно перед `[error]` часто
+# называет настоящую причину (DNS-сбой, HTTP-код), а сам `[error]` — только
+# сухое следствие («API request failed»). Классификацию этим же фильтром
+# сознательно не расширяем — `[warning]` слишком шумный источник для правил
+# и вернул бы ровно тот риск ложных срабатываний, ради которого затевалась
+# вся задача; для сырого текста в `<code>` это не риск, а польза.
+_DISPLAY_LINE_RE = re.compile(
+    r"(?:^|\s)(?:ERROR:|\[[^\]\s]+\]\[(?:error|warning)\]|error:)"
+    r"|file is larger than max-?filesize",
     re.IGNORECASE,
 )
 
@@ -92,6 +128,26 @@ _ERROR_RULES: tuple[tuple[str, re.Pattern[str], str], ...] = (
         "🔒 Это приватная публикация. Скачивание невозможно.",
     ),
     (
+        # Раньше стояло ПОСЛЕ not_found — «Video unavailable… blocked in
+        # your country» ловилось словом «unavailable» как not_found раньше,
+        # чем как гео-блок (находка ревью: специфичное правило обязано идти
+        # раньше общего — тот самый принцип, который декларирует эта
+        # задача). geo_block теперь стоит раньше.
+        "geo_block",
+        re.compile(
+            r"geo[- ]?(?:restrict|block)"
+            # Живой текст yt-dlp: «The uploader has NOT MADE this video
+            # AVAILABLE IN YOUR country» — «not» и «available in your»
+            # разделены несколькими словами, поэтому раньше не матчилось
+            # вообще никак (было `not available (?:in|from) your ...` —
+            # требовал их встык). Разрешаем разрыв в пределах предложения.
+            r"|not\b[^.]{0,60}available (?:in|from) your (?:country|location|region)"
+            r"|blocked in your (?:country|location|region)",
+            re.IGNORECASE,
+        ),
+        "🌍 Видео недоступно в текущем регионе.",
+    ),
+    (
         "not_found",
         re.compile(
             r"http error 404\b|\b404:? not found\b|video unavailable"
@@ -100,15 +156,6 @@ _ERROR_RULES: tuple[tuple[str, re.Pattern[str], str], ...] = (
             re.IGNORECASE,
         ),
         "🔍 Публикация не найдена. Возможно, она удалена или ссылка неверная.",
-    ),
-    (
-        "geo_block",
-        re.compile(
-            r"geo[- ]?(?:restrict|block)|not available (?:in|from) your (?:country|location|region)"
-            r"|blocked in your country",
-            re.IGNORECASE,
-        ),
-        "🌍 Видео недоступно в текущем регионе.",
     ),
     (
         "rate_limit",
@@ -145,9 +192,34 @@ _SOURCE_PRIORITY = ("gallery-dl", "yt-dlp")
 
 
 def _error_surface(text: str) -> str:
-    """Оставляет из вывода утилиты только строки, помеченные как ошибка."""
+    """Оставляет из вывода утилиты только строки, помеченные как ошибка.
+
+    Только для КЛАССИФИКАЦИИ (`_parse_error`) — намеренно строгий фильтр.
+    Для показа пользователю см. `_display_surface`.
+    """
     lines = [ln.strip() for ln in text.splitlines() if _ERROR_LINE_RE.search(ln)]
     return "\n".join(lines)
+
+
+def _display_surface(text: str) -> str:
+    """Как `_error_surface`, но для показа пользователю: включает соседние
+    `[warning]`-строки и «хвост» без собственного маркера сразу после
+    отмеченной строки — yt-dlp иногда дописывает пояснение (подсказку про
+    VPN) обычной строкой без ERROR:/[error] на ней самой. Дубликаты не
+    возникают: если «хвост» сам оказывается маркерной строкой, добавлять
+    его повторно не нужно — своя итерация цикла его и так подхватит.
+    """
+    lines = text.splitlines()
+    keep: list[str] = []
+    for i, ln in enumerate(lines):
+        if not _DISPLAY_LINE_RE.search(ln):
+            continue
+        keep.append(ln.strip())
+        if i + 1 < len(lines):
+            tail = lines[i + 1].strip()
+            if tail and not _DISPLAY_LINE_RE.search(tail):
+                keep.append(tail)
+    return "\n".join(keep)
 
 
 def _pick_fallback(outputs: Sequence[tuple[str, str]]) -> str:
@@ -155,7 +227,7 @@ def _pick_fallback(outputs: Sequence[tuple[str, str]]) -> str:
         for name, text in outputs:
             if name != wanted:
                 continue
-            candidate = _error_surface(text) or text.strip()
+            candidate = _display_surface(text) or text.strip()
             if candidate:
                 return candidate
     for _name, text in outputs:
@@ -179,7 +251,15 @@ def _parse_error(outputs: Sequence[tuple[str, str]], platform: str) -> str:
                 max_mb=settings.MAX_FILE_SIZE_MB,
             )
 
-    short_err = _pick_fallback(outputs)[:200]
+    # Маскируем ПЕРЕД обрезкой и экранированием. Порядок важен в обе стороны:
+    # обрезка «в лоб» до маскировки могла бы разрезать секрет пополам и
+    # оставить читаемый хвост (сигнатуру CDN, кусок sessionid); html.escape
+    # после маскировки испортил бы её же шаблоны (`&` → `&amp;` ломает
+    # `[?&]token=...`). Живые утечки без этой строки: `&sig=`/`&access_token=`
+    # в подписанных CDN-URL инстаграма, netscape-поле `sessionid<TAB>...`,
+    # пути `/app/secrets/cookies.txt`, `/tmp/jw_cookies_*`, credentials
+    # прокси в URL — любой пользователь бота вытягивал характеристики хоста.
+    short_err = mask_secrets(_pick_fallback(outputs))[:200]
     # Экранируем: сообщение уходит с parse_mode=HTML, а сырой вывод утилит
     # может содержать <, >, & и ломать разметку.
     return f"❌ Ошибка загрузки:\n<code>{html.escape(short_err)}</code>"
@@ -321,7 +401,18 @@ def _build_command(url: str, platform: str, output_path: Path, cookies_path: Pat
 def _find_downloaded_files(directory: Path, prefix: str) -> list[Path]:
     result = []
     for f in directory.iterdir():
-        if f.is_file() and f.name.startswith(prefix):
+        # gallery-dl (part=True по умолчанию) и yt-dlp пишут во временный
+        # `<...>.part`, пока элемент не докачан целиком, и переименовывают
+        # в финальное имя только на завершении. При обрыве (сеть, наш
+        # kill() на таймауте) `.part` может остаться на диске — без этого
+        # фильтра он разрешался в DownloadResult.file_paths как обычный
+        # файл: хендлер считает расширение `part` видео, Telegram отбивает
+        # всю media-группу, и весь частичный успех теряется целиком (живая
+        # находка ревью фикс-раунда 1). `--no-part` не берём осознанно: он
+        # убрал бы именно тот сигнал, по которому мы отличаем целый файл от
+        # обрыва, и оборванный элемент лёг бы под финальным именем без
+        # маркера вообще.
+        if f.is_file() and f.name.startswith(prefix) and not f.name.endswith(".part"):
             result.append(f)
 
     def _sort_key(p: Path) -> tuple[int, str]:
@@ -368,23 +459,53 @@ class GalleryDlRun:
     returncode: int | None = None
 
 
-def _build_gallery_dl_cmd(url: str, prefix: str, cookies_path: Path | None) -> list[str]:
+# Одиночный пин Pinterest — полный домен `.../pin/<id>/` или шортлинк
+# `pin.it/<code>`. Всё остальное на Pinterest (доска, профиль, поиск) не
+# ограничено платформой и получает низкий потолок — см. `_gallery_dl_item_limit`.
+_PINTEREST_SINGLE_PIN_RE = re.compile(r"pinterest\.[a-z.]+/pin/|pin\.it/", re.IGNORECASE)
+
+
+def _gallery_dl_item_limit(url: str, platform: str) -> int:
+    """Потолок `--range`: зависит от ФОРМЫ ссылки, а не только платформы.
+
+    Только доска/профиль/поиск Pinterest потенциально неограничены (1723
+    элемента в живом тесте) — им низкий `GALLERY_DL_MAX_ITEMS`. Одиночный
+    пин Pinterest, карусель Instagram (`/p/`, нативно ≤20 элементов) и
+    слайдшоу TikTok (`/photo/`) так разрастись не могут: раньше общий
+    потолок уходил во ВСЕ запуски gallery-dl и молча обрезал карусели,
+    которые до фикса H-6 приезжали целиком, — чинили одну тихую потерю
+    данных и тут же создавали другую (находка ревью фикс-раунда 1).
+    """
+    if platform == "pinterest" and not _PINTEREST_SINGLE_PIN_RE.search(url):
+        return GALLERY_DL_MAX_ITEMS
+    return GALLERY_DL_CAROUSEL_MAX_ITEMS
+
+
+def _build_gallery_dl_cmd(url: str, platform: str, prefix: str, cookies_path: Path | None) -> list[str]:
     """Командная строка gallery-dl. Вынесена отдельно, чтобы её можно было
     проверить тестом без сети.
 
-    `prefix` — наш uuid4-префикс. `{filename}` в шаблоне — это поле МЕТАДАННЫХ
-    gallery-dl (оригинальное имя файла у источника), а не наша переменная:
-    двойные фигурные скобки в f-строке дают литеральные одинарные. Именно оно
-    делает имя уникальным на элемент — без него все пины доски разрешались в
-    одно и то же имя и 9 из 12 пропускались как «уже существует».
-    `{filename|num}` — синтаксис альтернатив gallery-dl: если экстрактор не
-    проставил `filename`, подставится `num`.
+    `prefix` — наш uuid4-префикс. `{id}`/`{filename}` в шаблоне — это поля
+    МЕТАДАННЫХ gallery-dl, а не наши переменные: двойные фигурные скобки в
+    f-строке дают литеральные одинарные.
+
+    `{id}` выбран вместо дефолтного для Pinterest `{filename}` сознательно
+    (находка ревью фикс-раунда 1): `{filename}` — это хеш содержимого
+    CDN-URL картинки, у двух РЕПИНОВ одной и той же картинки на одной доске
+    он совпадает — второй пин разрешится в то же имя и будет пропущен как
+    «уже существует» (тот же класс потери, что чинили изначально, только
+    более редкий триггер). `{id}` — id самого пина, уникален всегда,
+    независимо от содержимого. `{num}` стоит ПЕРЕД альтернативой: это
+    порядок элемента ВНУТРИ поста (карусель 1..N) — если сдвинуть, сломается
+    ключ сортировки в `_find_downloaded_files` (первое `_<число>` после
+    префикса). `{id|filename|num}` — синтаксис альтернатив gallery-dl:
+    первое непустое значение, на случай если экстрактор не проставил `id`.
     """
     cmd = [
         "gallery-dl",
         "-D", str(DOWNLOAD_DIR),
-        "-f", f"{prefix}_{{num}}_{{filename|num}}.{{extension}}",
-        "--range", f"1-{GALLERY_DL_MAX_ITEMS}",
+        "-f", f"{prefix}_{{num}}_{{id|filename|num}}.{{extension}}",
+        "--range", f"1-{_gallery_dl_item_limit(url, platform)}",
     ]
     if cookies_path is not None:
         cmd.extend(["--cookies", str(cookies_path)])
@@ -392,9 +513,9 @@ def _build_gallery_dl_cmd(url: str, prefix: str, cookies_path: Path | None) -> l
     return cmd
 
 
-async def _try_gallery_dl(url: str, filename: str) -> GalleryDlRun:
+async def _try_gallery_dl(url: str, platform: str, filename: str) -> GalleryDlRun:
     with _ephemeral_cookies() as cookies_path:
-        cmd = _build_gallery_dl_cmd(url, filename, cookies_path)
+        cmd = _build_gallery_dl_cmd(url, platform, filename, cookies_path)
 
         logger.info("Falling back to gallery-dl | url={}", url)
 
@@ -449,9 +570,9 @@ async def _try_gallery_dl(url: str, filename: str) -> GalleryDlRun:
 
 
 async def _try_gallery_dl_fallback(
-    url: str, filename: str, outputs: list[tuple[str, str]]
+    url: str, platform: str, filename: str, outputs: list[tuple[str, str]]
 ) -> DownloadResult | None:
-    run = await _try_gallery_dl(url, filename)
+    run = await _try_gallery_dl(url, platform, filename)
     # stderr gallery-dl копим ВСЕГДА — даже на успехе, чтобы при последующем
     # провале другой ветки его текст не пропал.
     if run.stderr:
@@ -470,7 +591,14 @@ async def _try_gallery_dl_fallback(
     total_size_mb = round(sum(size for _, size in sized_gd) / (1024 * 1024), 2)
     ext = valid_gd[0].suffix.lower()
     media_type = "image" if ext in IMAGE_EXTS else "video"
-    logger.info("gallery-dl complete | files={} total_size={}MB", len(valid_gd), total_size_mb)
+    # См. DownloadResult.partial/.truncated: обе величины уже под рукой
+    # ровно там, где их иначе выбросили бы.
+    partial = run.returncode != 0 and bool(valid_gd)
+    truncated = len(valid_gd) == _gallery_dl_item_limit(url, platform)
+    logger.info(
+        "gallery-dl complete | files={} total_size={}MB partial={} truncated={}",
+        len(valid_gd), total_size_mb, partial, truncated,
+    )
 
     if len(valid_gd) > 1:
         return DownloadResult(
@@ -479,12 +607,16 @@ async def _try_gallery_dl_fallback(
             file_size_mb=total_size_mb,
             success=True,
             media_type=media_type,
+            partial=partial,
+            truncated=truncated,
         )
     return DownloadResult(
         file_path=str(valid_gd[0]),
         file_size_mb=total_size_mb,
         success=True,
         media_type=media_type,
+        partial=partial,
+        truncated=truncated,
     )
 
 
@@ -511,7 +643,7 @@ async def download_media(url: str, platform: str) -> DownloadResult:
         or (platform == "tiktok" and "/photo/" in url_lower)
     )
     if gallery_first:
-        gd_result = await _try_gallery_dl_fallback(url, filename, outputs)
+        gd_result = await _try_gallery_dl_fallback(url, platform, filename, outputs)
         if gd_result:
             return gd_result
         logger.info("gallery-dl primary returned nothing, falling back to yt-dlp | platform={} url={}", platform, url)
@@ -548,7 +680,14 @@ async def download_media(url: str, platform: str) -> DownloadResult:
                     stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=settings.DOWNLOAD_TIMEOUT)
                 except asyncio.TimeoutError:
                     logger.warning("Download timeout | url={}", url)
-                    process.kill()
+                    # Та же гонка asyncio.wait_for, что и в gallery-dl-ветке
+                    # (см. _try_gallery_dl): процесс может успеть завершиться
+                    # сам между истечением таймаута и этим вызовом — kill()
+                    # на уже мёртвом процессе бросает ProcessLookupError, и
+                    # вместо честного «таймаут» пользователь получил бы
+                    # «непредвиденная ошибка» из внешнего except ниже.
+                    with contextlib.suppress(ProcessLookupError):
+                        process.kill()
                     await process.wait()
                     _cleanup_glob(DOWNLOAD_DIR, filename)
                     return DownloadResult(success=False, error_message="⏱ Таймаут: сервер не ответил за 120 секунд")
@@ -579,7 +718,7 @@ async def download_media(url: str, platform: str) -> DownloadResult:
 
                     outputs.append(("yt-dlp", full_output))
                     if platform in GALLERY_DL_FALLBACK_PLATFORMS:
-                        gd_result = await _try_gallery_dl_fallback(url, filename, outputs)
+                        gd_result = await _try_gallery_dl_fallback(url, platform, filename, outputs)
                         if gd_result:
                             return gd_result
 
@@ -618,7 +757,7 @@ async def download_media(url: str, platform: str) -> DownloadResult:
 
             outputs.append(("yt-dlp", full_output))
             if platform in GALLERY_DL_FALLBACK_PLATFORMS:
-                gd_result = await _try_gallery_dl_fallback(url, filename, outputs)
+                gd_result = await _try_gallery_dl_fallback(url, platform, filename, outputs)
                 if gd_result:
                     return gd_result
 
@@ -628,5 +767,10 @@ async def download_media(url: str, platform: str) -> DownloadResult:
         except Exception as exc:
             logger.exception("Unexpected download error: {}", exc)
             _cleanup_glob(DOWNLOAD_DIR, filename)
-            # Экранируем текст исключения — уходит с parse_mode=HTML.
-            return DownloadResult(success=False, error_message=f"Непредвиденная ошибка: {html.escape(str(exc))}")
+            # Маскируем и экранируем: текст исключения (например, ошибка ОС
+            # с путём) уходит с parse_mode=HTML и может содержать тот же
+            # класс секретов, что и обычное сообщение об ошибке (см. _parse_error).
+            return DownloadResult(
+                success=False,
+                error_message=f"Непредвиденная ошибка: {html.escape(mask_secrets(str(exc)))}",
+            )
