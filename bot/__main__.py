@@ -81,7 +81,11 @@ async def main() -> None:
     dp = Dispatcher()
     dp.errors.register(on_unhandled_error)
 
-    dp.message.middleware(ThrottleMiddleware())
+    # Разные лимиты и раздельное состояние: сообщение — это загрузка,
+    # колбэк — навигация по меню. Общий лимит в три секунды сделал бы
+    # меню неюзабельным.
+    dp.message.middleware(ThrottleMiddleware(rate_limit=3.0, notify=True))
+    dp.callback_query.middleware(ThrottleMiddleware(rate_limit=0.7, notify=True))
 
     dp.include_router(admin_router)
     dp.include_router(user_router)
