@@ -131,6 +131,33 @@ def video_reject_code(info: MediaInfo | None) -> str | None:
     return None
 
 
+def _ffprobe_cmd(path: Path) -> list[str]:
+    """argv для ffprobe.
+
+    `-protocol_whitelist file` обязателен: на вход идёт недоверенный
+    скачанный файл, а демуксеры ffmpeg умеют открывать вложенные ссылки
+    (например, DASH-манифест внутри файла). В Debian trixie около 25 CVE
+    ffmpeg висят в статусе «vulnerable (no-dsa/postponed)» — трекер осознанно
+    отказался их патчить, в их числе OOB-чтение в DASH-демуксере с апстрим-
+    фиксом, не портированным в дистрибутив. Версией это не лечится, поэтому
+    не даём демуксеру ходить никуда, кроме обычного файла.
+
+    `-probesize`/`-analyzeduration` сознательно оставлены дефолтными: их
+    занижение даёт ложное «нет звука» на файлах, где аудиодорожка начинается
+    не с нулевой отметки, а это отказ, видимый пользователю, — теоретическая
+    уязвимость не стоит того, чтобы менять её на реальные ложные отказы.
+    Объём работы ffprobe и так ограничен таймаутом FFPROBE_TIMEOUT с
+    последующим kill()/wait() ниже.
+    """
+    return [
+        "ffprobe", "-v", "error",
+        "-protocol_whitelist", "file",
+        "-show_streams", "-show_format",
+        "-print_format", "json",
+        str(path),
+    ]
+
+
 async def probe_media(path: Path) -> MediaInfo | None:
     """Запускает ffprobe. Никогда не бросает — при любой беде возвращает None.
 
@@ -138,12 +165,7 @@ async def probe_media(path: Path) -> MediaInfo | None:
     случае убивается и дожидается, а отмена продолжает распространяться,
     как и полагается.
     """
-    cmd = [
-        "ffprobe", "-v", "error",
-        "-show_streams", "-show_format",
-        "-print_format", "json",
-        str(path),
-    ]
+    cmd = _ffprobe_cmd(path)
     try:
         process = await asyncio.create_subprocess_exec(
             *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,

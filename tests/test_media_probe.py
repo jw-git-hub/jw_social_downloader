@@ -14,6 +14,7 @@ from bot.services.media_probe import (
     REJECT_NO_VIDEO,
     REJECT_ZERO_DURATION,
     MediaInfo,
+    _ffprobe_cmd,
     parse_ffprobe_json,
     probe_media,
     video_reject_code,
@@ -302,3 +303,62 @@ async def test_probe_media_kills_child_process_on_cancellation(tmp_path):
     with pytest.raises(OSError):
         fd = os.open(fifo_path, os.O_WRONLY | os.O_NONBLOCK)
         os.close(fd)
+
+
+# ---------------------------------------------------------------------------
+# Харденинг флагов: ffprobe не должен уметь ходить в сеть по ссылке,
+# спрятанной внутри недоверенного контейнера. В trixie ~25 CVE ffmpeg висят
+# в статусе "не патчим" (в т.ч. OOB-чтение в DASH-демуксере) — версией это
+# не лечится, поэтому демуксеру запрещено открывать что-либо, кроме
+# обычного файла.
+# ---------------------------------------------------------------------------
+
+
+def test_ffprobe_command_restricts_protocols_to_plain_files(tmp_path):
+    target = tmp_path / "clip.mp4"
+    cmd = _ffprobe_cmd(target)
+    assert "-protocol_whitelist" in cmd
+    assert cmd[cmd.index("-protocol_whitelist") + 1] == "file"
+
+
+def test_protocol_whitelist_precedes_the_input_path(tmp_path):
+    target = tmp_path / "clip.mp4"
+    cmd = _ffprobe_cmd(target)
+    # Опции AVFormat применяются к следующему входу, поэтому флаг обязан
+    # стоять ДО пути; путь при этом остаётся последним аргументом.
+    assert cmd[-1] == str(target)
+    assert cmd.index("-protocol_whitelist") < len(cmd) - 1
+
+
+def test_probe_limits_are_left_at_defaults(tmp_path):
+    # Осознанное решение (см. media_probe.py): занижение probesize/
+    # analyzeduration даёт ложное «нет звука» на файлах, где аудиодорожка
+    # начинается не с нулевой отметки, а это отказ, видимый пользователю.
+    cmd = _ffprobe_cmd(tmp_path / "clip.mp4")
+    assert "-probesize" not in cmd
+    assert "-analyzeduration" not in cmd
+
+
+def test_ffprobe_command_matches_expected_shape(tmp_path):
+    # Явная фиксация всей формы команды — чтобы будущая правка, случайно
+    # потерявшая или переставившая флаг, была видна сразу, а не только через
+    # частичные проверки выше.
+    target = tmp_path / "clip.mp4"
+    assert _ffprobe_cmd(target) == [
+        "ffprobe", "-v", "error",
+        "-protocol_whitelist", "file",
+        "-show_streams", "-show_format",
+        "-print_format", "json",
+        str(target),
+    ]
+
+
+async def test_hardened_ffprobe_still_reads_a_real_file(media_files):
+    # Регрессия: ограничение протоколов не должно мешать обычному локальному
+    # файлу — он по-прежнему читается протоколом `file`.
+    info = await probe_media(media_files["ok"])
+    assert info is not None
+    assert info.has_video is True
+    assert info.has_audio is True
+    assert info.duration > 0
+    assert info.width > 0 and info.height > 0
