@@ -25,6 +25,16 @@ async def run_polling(dp, bot) -> None:
     await dp.start_polling(bot, drop_pending_updates=True)
 
 
+def build_session() -> AiohttpSession:
+    """HTTP-сессия к Bot API.
+
+    Таймаут берётся из настроек и заведомо больше серверного IDLE_TIMEOUT=500:
+    соединение должен закрывать сервер, а не мы. Зашитые 180 секунд не
+    покрывали отдачу крупного файла даже теоретически.
+    """
+    return AiohttpSession(timeout=settings.TELEGRAM_REQUEST_TIMEOUT)
+
+
 UNHANDLED_ERROR_TEXT = "⚠️ Что-то пошло не так. Попробуй ещё раз."
 
 
@@ -62,7 +72,7 @@ async def main() -> None:
 
     await init_db()
 
-    session = AiohttpSession(timeout=180)
+    session = build_session()
     bot = Bot(
         token=settings.BOT_TOKEN,
         session=session,
