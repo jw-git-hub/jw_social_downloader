@@ -372,7 +372,14 @@ async def test_success_path_survives_log_download_lock_error(monkeypatch, sqlite
     на УСПЕШНОМ пути. Без guard'а его падение уходит необработанным ДО
     status_msg.delete()/message.answer(): медиа уже доставлено, единица уже
     списана (деньги не теряются), но пользователь не видит "Готово", а
-    статус-сообщение "Скачиваю..." остаётся висеть навсегда."""
+    статус-сообщение "Скачиваю..." остаётся висеть навсегда.
+
+    Fix round 3, Minor (ревьюер): изначальная версия проверяла только
+    delete_calls==1 и truthy answer_calls — будущая регрессия (возврат
+    единицы на успешном пути ИЛИ тихое проглатывание ошибки журналирования
+    без единой записи в лог) её бы не покрасила. Добавлены: явная проверка,
+    что возврата НЕ было, что медиа реально ушло получателю, и что падение
+    записи в лог хотя бы залогировано (не проглочено молча)."""
     maker, engine = await _make_session_maker(sqlite_engine_factory, tmp_path, "success_log_locked.db")
     try:
         uid = 800000012
@@ -394,15 +401,24 @@ async def test_success_path_survives_log_download_lock_error(monkeypatch, sqlite
 
         monkeypatch.setattr(U, "log_download", _locked_log)
 
+        error_calls: list[str] = []
+        monkeypatch.setattr(U.logger, "error", lambda msg, *a, **k: error_calls.append(msg))
+
         msg = _FakeMessage(TEST_URL, uid)
         await U.handle_url(msg)  # не должно бросить, несмотря на падение лога
 
-        # Единица уже честно списана (успех, не про деньги) — этот тест
-        # про то, что пользователь всё равно получает финальный ответ и
-        # статус-сообщение не остаётся висеть навсегда.
+        # Единица уже честно списана (успех) — и НЕ должна вернуться, хотя
+        # бы и провалилась только запись лога (это не отказ доставки).
+        assert await _free_downloads_left(maker, uid) == 0
+        # Медиа реально ушло получателю, а не просто "не упало".
+        assert msg.sent_media == ["video"]
+        # Пользователь всё равно получает финальный ответ и статус-сообщение
+        # не остаётся висеть навсегда.
         assert msg.status_message is not None
         assert msg.status_message.delete_calls == 1
         assert msg.answer_calls
+        # Падение записи лога не проглочено молча.
+        assert error_calls
     finally:
         await engine.dispose()
 
@@ -457,8 +473,14 @@ async def test_forbidden_during_send_triggers_refund(monkeypatch, sqlite_engine_
     прозу лог-строки ("заблокировал бота") — мутация "перевести только
     текст на английский" красила бы тест при побайтово идентичном
     поведении (ложный сигнал регрессии на чистке формулировок/i18n).
-    Проверяем УРОВЕНЬ (`error_calls == []` и `info_calls` непусто), а не
-    текст — то же самое различающее свойство, без завязки на прозу.
+    Проверяем УРОВЕНЬ (никакого `error` с текстом про отправку, и
+    непустой `info`), а не текст — то же самое различающее свойство,
+    без завязки на прозу.
+
+    Fix round 3, Minor (ревьюер): `error_calls == []` было ШИРЕ
+    необходимого — любой будущий легитимный `logger.error` где-то ещё на
+    этом пути (не обязательно про отправку файла) красил бы тест зря.
+    Сужено до отсутствия конкретно записи про неудачную отправку файла.
     """
     maker, engine = await _make_session_maker(sqlite_engine_factory, tmp_path, "forbidden_send.db")
     try:
@@ -487,9 +509,10 @@ async def test_forbidden_during_send_triggers_refund(monkeypatch, sqlite_engine_
 
         # Ничего не доставлено -> единица возвращается (общее для обеих веток).
         assert await _free_downloads_left(maker, uid) == 1
-        # Отличимое свойство именно этой ветки: штатный INFO, а не ERROR
-        # (проверяем УРОВЕНЬ, не текст — см. N6 в докстринге).
-        assert error_calls == []
+        # Отличимое свойство именно этой ветки: НЕ падаем в общий except
+        # Exception ("Failed to send file: ...") — проверяем узко, по этой
+        # конкретной записи, а не по любому error вообще (см. N6 выше).
+        assert not any("Failed to send file" in m for m in error_calls)
         assert info_calls, "штатная блокировка должна залогироваться на уровне INFO"
     finally:
         await engine.dispose()
