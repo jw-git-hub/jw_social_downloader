@@ -23,7 +23,14 @@ RUN pip install --no-cache-dir -r requirements-dev.txt
 
 FROM base AS runtime
 COPY . .
-RUN mkdir -p /app/data /srv/jw_downloads
+# Бот кормит недоверенным контентом yt-dlp, gallery-dl и ffmpeg на каждой
+# загрузке, работает с host-сетью и раньше делал это от root. Непривилегированный
+# пользователь убирает самый дорогой исход любой дыры в этих утилитах.
+RUN mkdir -p /app/data /srv/jw_downloads \
+    && groupadd --gid 1000 botuser \
+    && useradd --uid 1000 --gid 1000 --no-create-home --shell /usr/sbin/nologin botuser \
+    && chown -R botuser:botuser /app /srv/jw_downloads
+USER botuser
 CMD ["python", "-m", "bot"]
 
 FROM testdeps AS test

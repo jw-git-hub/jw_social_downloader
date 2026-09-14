@@ -16,6 +16,7 @@ backups/
 
 # ── Локальные инструменты / приватное ──
 .claude/
+.superpowers/
 BOT_AUDIT_REPORT.md
 
 # ── Python ──
