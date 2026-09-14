@@ -86,6 +86,13 @@ async def test_reserve_quota_does_not_touch_banned_user(db_session):
 
 
 async def test_reserve_quota_skips_subscriber(db_session):
+    # Fix round 1, п.1: остаток НЕНУЛЕВОЙ (3, не 0). С нулевым остатком
+    # reserve_free_download сам вернул бы False из-за пустой квоты — это
+    # маскирует полную потерю проверки has_subscription в _reserve_quota
+    # (ревьюер эмпирически подтвердил: `if is_banned or has_subscription`
+    # можно заменить на `if is_banned:` и все тесты этого файла останутся
+    # зелёными, если остаток тут 0). Явная проверка "остаток не тронут"
+    # ниже — это и есть то свойство, которое нужно закрыть.
     tg = _tg_user()
     # subscription_until хранится naive и трактуется слоем БД как UTC.
     until = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(days=5)
@@ -94,7 +101,7 @@ async def test_reserve_quota_skips_subscriber(db_session):
             id=tg.id,
             username=tg.username,
             full_name=tg.full_name,
-            free_downloads_left=0,
+            free_downloads_left=3,
             subscription_until=until,
         )
     )
@@ -104,6 +111,8 @@ async def test_reserve_quota_skips_subscriber(db_session):
 
     assert has_sub is True
     assert reserved is False
+    db_session.expire_all()
+    assert (await db_session.get(User, tg.id)).free_downloads_left == 3
 
 
 async def test_refund_returns_exactly_one_unit(db_session):
