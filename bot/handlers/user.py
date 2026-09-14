@@ -6,9 +6,21 @@ from datetime import datetime, timezone
 
 import aiohttp
 from aiogram import F, Router
-from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError, TelegramRetryAfter
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramNetworkError,
+    TelegramRetryAfter,
+)
 from aiogram.filters import Command
-from aiogram.types import CallbackQuery, FSInputFile, InputMediaPhoto, InputMediaVideo, Message
+from aiogram.types import (
+    CallbackQuery,
+    FSInputFile,
+    InaccessibleMessage,
+    InputMediaPhoto,
+    InputMediaVideo,
+    Message,
+)
 from loguru import logger
 
 from bot.config import settings
@@ -58,11 +70,51 @@ def _is_admin(user_id: int) -> bool:
     return user_id == settings.ADMIN_ID
 
 
+NOT_MODIFIED_MARKER = "message is not modified"
+
+
+def _is_not_modified(exc: TelegramBadRequest) -> bool:
+    """«Текст и клавиатура уже такие» — это успех, а не ошибка."""
+    return NOT_MODIFIED_MARKER in str(exc).lower()
+
+
 async def _safe_edit(callback: CallbackQuery, text: str, reply_markup=None) -> None:
+    """Правит сообщение под кнопкой, а если это невозможно — шлёт новое.
+
+    Прежний фолбэк повторял ТОТ ЖЕ текст через callback.message.answer(): если
+    причина отказа была в самой разметке, вторая попытка падала так же, а
+    исключение уходило наружу. Плюс callback.message бывает InaccessibleMessage
+    или None (сообщение старше 48 часов) — тогда падали обе попытки сразу.
+    Поэтому доступность проверяем заранее, а фолбэк шлём через bot.send_message.
+    """
+    msg = callback.message
+    editable = msg is not None and not isinstance(msg, InaccessibleMessage)
+    chat_id = msg.chat.id if msg is not None else callback.from_user.id
+
+    if editable:
+        try:
+            await msg.edit_text(text, reply_markup=reply_markup)
+            return
+        except TelegramBadRequest as exc:
+            if _is_not_modified(exc):
+                return
+            logger.debug("edit_text отклонён, шлём новым сообщением | error={}", exc)
+        except TelegramForbiddenError:
+            logger.info("Пользователь заблокировал бота | user={}", callback.from_user.id)
+            return
+        except Exception as exc:
+            logger.warning("edit_text упал неожиданно | error={}", exc)
+
     try:
-        await callback.message.edit_text(text, reply_markup=reply_markup)
-    except TelegramBadRequest:
-        await callback.message.answer(text, reply_markup=reply_markup)
+        await callback.bot.send_message(
+            chat_id=chat_id, text=text, reply_markup=reply_markup
+        )
+    except TelegramForbiddenError:
+        logger.info("Пользователь заблокировал бота | user={}", callback.from_user.id)
+    except Exception as exc:
+        logger.warning(
+            "Не удалось доставить экран | user={} error={}", callback.from_user.id, exc
+        )
 
 
 async def _send_with_retry(send_coro_factory):
@@ -318,7 +370,7 @@ async def handle_url(message: Message) -> None:
             await status_msg.edit_text(
                 f"❌ <b>Не удалось скачать</b>\n{dl_result.error_message}"
             )
-        except TelegramBadRequest:
+        except (TelegramBadRequest, TelegramForbiddenError):
             pass
         return
 
@@ -427,6 +479,11 @@ async def handle_url(message: Message) -> None:
             f"Сетевая ошибка при отправке медиа, попытки исчерпаны | "
             f"sent={media_sent_count}/{media_total_count} error={e}"
         )
+    except TelegramForbiddenError as e:
+        # Юзер заблокировал бота посреди отправки. Это не сбой: писать ему
+        # больше некуда, статус-сообщение править бессмысленно.
+        send_error = e
+        logger.info("Пользователь заблокировал бота во время отправки | user={}", user_id)
     except Exception as e:
         send_error = e
         logger.error(f"Failed to send file: {e}")
@@ -445,7 +502,7 @@ async def handle_url(message: Message) -> None:
             )
         try:
             await status_msg.delete()
-        except TelegramBadRequest:
+        except (TelegramBadRequest, TelegramForbiddenError):
             pass
         # Best-effort: медиа доставлено, успех зафиксирован, status_msg удалён.
         # Сбой этого финального ответа не должен ничего переписывать.
@@ -478,5 +535,5 @@ async def handle_url(message: Message) -> None:
             await status_msg.edit_text("⚠️ Ошибка сети при отправке файла. Попробуй ещё раз.")
         else:
             await status_msg.edit_text("⚠️ Ошибка при отправке файла. Попробуй ещё раз.")
-    except TelegramBadRequest:
+    except (TelegramBadRequest, TelegramForbiddenError):
         pass
