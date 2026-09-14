@@ -15,9 +15,20 @@ services:
     env_file: .env
     volumes:
       - bot_data:/app/data
-      - ./secrets:/app/secrets
+      # Только чтение: банка кук — мастер-копия боевых сессий. Загрузчик с
+      # 62f7c30 работает с эфемерной копией, писать в мастер незачем, а любой
+      # процесс в контейнере мог её перезаписать.
+      - ./secrets:/app/secrets:ro
     tmpfs:
-      - /tmp/jw_downloads:size=200M
+      - /tmp/jw_downloads:size=200M,mode=1777
+    # Потолки обязательны: tmpfs под загрузки — это та же оперативная память,
+    # а хост бот делит с другими сервисами. memswap_limit, равный mem_limit,
+    # отключает своп: предсказуемый OOM одного контейнера лучше, чем
+    # своп-трэшинг всей коробки. Пересмотреть в Task 14 плана local-bot-api,
+    # когда загрузки уедут с tmpfs на диск.
+    mem_limit: 1g
+    memswap_limit: 1g
+    pids_limit: 256
     logging:
       driver: json-file
       options:
