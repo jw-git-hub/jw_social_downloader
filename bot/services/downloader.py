@@ -288,7 +288,16 @@ def _ephemeral_cookies() -> Iterator[Path | None]:
         yield None
         return
 
-    tmp_dir = Path(tempfile.mkdtemp(prefix="jw_cookies_"))
+    # Каталог кладём ВНУТРИ DOWNLOAD_DIR: он смонтирован как tmpfs, то есть
+    # живёт в памяти. Дефолтный /tmp контейнера — обычный слой на флеше
+    # (eMMC), и копия боевых кук пережила бы там `docker kill` и внезапное
+    # пропадание питания. Отдельного подметальщика для этих каталогов
+    # сознательно нет: `finally` ниже отрабатывает и на исключении, и на
+    # таймауте, а подметальщик, не различающий «каталог занят прямо сейчас»
+    # и «осиротел», убил бы куки у параллельной загрузки (семафор разрешает
+    # три одновременно).
+    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    tmp_dir = Path(tempfile.mkdtemp(prefix="jw_cookies_", dir=DOWNLOAD_DIR))
     try:
         tmp_cookies = tmp_dir / "cookies.txt"
         shutil.copyfile(cookies_file, tmp_cookies)
@@ -300,10 +309,19 @@ def _ephemeral_cookies() -> Iterator[Path | None]:
 def _build_command(url: str, platform: str, output_path: Path, cookies_path: Path | None) -> list[str]:
     cmd = [
         "yt-dlp",
-        "--no-check-certificates",
+        # --no-check-certificates НЕ ставим: банка несёт живые сессионные
+        # куки пяти платформ, и отключённая проверка TLS отдаёт их любому,
+        # кто способен встать посередине (подмена DNS, враждебный upstream,
+        # captive portal). Раньше флаг стоял ради тех же живых кук — они же
+        # и делают его опасным.
         "--socket-timeout", "30",
         "--retries", "3",
-        "--age-limit", "99",
+        # --age-limit НЕ ставим: у yt-dlp по умолчанию возрастного фильтра
+        # нет вовсе; "--age-limit 99" не отключал его, а ДОБАВЛЯЛ условие
+        # «рейтинг ≤ 99» и отбрасывал контент с более высоким или
+        # нестандартно оформленным рейтингом. Серверный возрастной гейт
+        # (правило age_gate в _ERROR_RULES — YouTube отвечает «Sign in to
+        # confirm your age») этим не отменяется и остаётся достижимым.
         "--max-filesize", f"{settings.MAX_FILE_SIZE_MB}M",
         "-o", str(output_path),
     ]
@@ -561,7 +579,7 @@ async def _try_gallery_dl(url: str, platform: str, filename: str) -> GalleryDlRu
     with _ephemeral_cookies() as cookies_path:
         cmd = _build_gallery_dl_cmd(url, platform, filename, cookies_path)
 
-        logger.info("Falling back to gallery-dl | url={}", url)
+        logger.info("Falling back to gallery-dl | url={}", mask_secrets(url))
 
         try:
             process = await asyncio.create_subprocess_exec(
@@ -572,7 +590,7 @@ async def _try_gallery_dl(url: str, platform: str, filename: str) -> GalleryDlRu
                     process.communicate(), timeout=settings.DOWNLOAD_TIMEOUT
                 )
             except asyncio.TimeoutError:
-                logger.warning("gallery-dl timeout | url={}", url)
+                logger.warning("gallery-dl timeout | url={}", mask_secrets(url))
                 # Гонка asyncio.wait_for: процесс может успеть завершиться
                 # сам между истечением таймаута и этим вызовом — kill() на
                 # уже мёртвом процессе бросает ProcessLookupError, из-за
@@ -689,7 +707,7 @@ async def download_media(url: str, platform: str) -> DownloadResult:
         gd_result = await _try_gallery_dl_fallback(url, platform, filename, outputs)
         if gd_result:
             return gd_result
-        logger.info("gallery-dl primary returned nothing, falling back to yt-dlp | platform={} url={}", platform, url)
+        logger.info("gallery-dl primary returned nothing, falling back to yt-dlp | platform={} url={}", platform, mask_secrets(url))
         _cleanup_glob(DOWNLOAD_DIR, filename)
 
     with _ephemeral_cookies() as cookies_path:
@@ -702,7 +720,7 @@ async def download_media(url: str, platform: str) -> DownloadResult:
         else:
             cmd = _build_command(url, platform, output_path, cookies_path)
 
-        logger.info("Starting download | platform={} url={}", platform, url)
+        logger.info("Starting download | platform={} url={}", platform, mask_secrets(url))
 
         # Для TikTok делаем несколько попыток запуска yt-dlp: транзиторный WAF-челлендж
         # (rehydration / 403) часто проходит со второй попытки. Для остальных платформ
@@ -722,7 +740,7 @@ async def download_media(url: str, platform: str) -> DownloadResult:
                 try:
                     stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=settings.DOWNLOAD_TIMEOUT)
                 except asyncio.TimeoutError:
-                    logger.warning("Download timeout | url={}", url)
+                    logger.warning("Download timeout | url={}", mask_secrets(url))
                     # Та же гонка asyncio.wait_for, что и в gallery-dl-ветке
                     # (см. _try_gallery_dl): процесс может успеть завершиться
                     # сам между истечением таймаута и этим вызовом — kill()
