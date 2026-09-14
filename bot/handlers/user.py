@@ -14,10 +14,11 @@ from loguru import logger
 from bot.config import settings
 from bot.db.engine import async_session
 from bot.db.queries import (
-    decrement_free_downloads,
     get_or_create_user,
     increment_total_downloads,
     log_download,
+    refund_free_download,
+    reserve_free_download,
 )
 from bot.keyboards.inline import (
     get_after_download_kb,
@@ -93,6 +94,62 @@ async def _send_with_retry(send_coro_factory):
                 f"попытка={attempt + 1}/{len(SEND_RETRY_DELAYS) + 1} error={e}"
             )
             await asyncio.sleep(delay)
+
+
+async def _reserve_quota(session, tg_user) -> tuple[int, bool, bool, bool]:
+    """Первый шаг загрузки: пользователь, бан, подписка и резерв единицы квоты.
+
+    Возвращает (user_id, is_banned, has_subscription, reserved). Резервирование
+    делается ЗДЕСЬ ЖЕ, в той же транзакции, что и чтение — иначе между чтением
+    остатка и списанием помещаются параллельные загрузки того же юзера, и с
+    одним оставшимся скачиванием он получает три-семь.
+
+    Забаненному и подписчику единица не резервируется: первому загрузка
+    запрещена, второму квота не нужна.
+    """
+    user = await get_or_create_user(session, tg_user)
+    db_user_id = user.id
+    is_banned = user.is_banned
+
+    sub_until = user.subscription_until
+    if sub_until and sub_until.tzinfo is None:
+        sub_until = sub_until.replace(tzinfo=timezone.utc)
+    has_subscription = bool(sub_until and sub_until > datetime.now(timezone.utc))
+
+    if is_banned or has_subscription:
+        return db_user_id, is_banned, has_subscription, False
+
+    reserved = await reserve_free_download(session, db_user_id)
+    return db_user_id, is_banned, has_subscription, reserved
+
+
+def _quota_action(reserved: bool, download_ok: bool, media_sent_count: int) -> str:
+    """Что сделать с зарезервированной единицей: "keep" или "refund".
+
+    Возвращаем только если пользователь не получил ничего: либо провалилась
+    загрузка, либо не ушёл ни один файл. Частично доставленный альбом не
+    возвращается — медиа у пользователя уже есть.
+    """
+    if not reserved:
+        return "keep"
+    if not download_ok:
+        return "refund"
+    if media_sent_count == 0:
+        return "refund"
+    return "keep"
+
+
+async def _refund_quota(db_user_id: int) -> None:
+    """Возврат единицы отдельной короткой транзакцией.
+
+    Падение возврата не должно ронять хендлер: пользователь уже увидел ошибку,
+    а потерянная единица — меньшее зло, чем необработанное исключение.
+    """
+    try:
+        async with async_session() as session, session.begin():
+            await refund_free_download(session, db_user_id)
+    except Exception as exc:
+        logger.error("Не удалось вернуть единицу квоты | user={} error={}", db_user_id, exc)
 
 
 @router.message(Command("start"))
@@ -225,26 +282,19 @@ async def handle_url(message: Message) -> None:
     url, platform = result
     waiting_for_url.discard(user_id)
 
-    # F1 шаг 1: короткая write-транзакция. Создаём/находим пользователя и
-    # оцениваем бан/подписку/квоту, сохраняя только примитивы в локальные
-    # переменные. Транзакция коммитится (и строка нового пользователя
-    # фиксируется) до любого download/upload и до любого log_download по FK.
+    # C-1 шаг 1: одна короткая транзакция читает пользователя И резервирует
+    # единицу квоты. Раньше остаток читался здесь, а списывался после аплоада.
     async with async_session() as session, session.begin():
-        user = await get_or_create_user(session, message.from_user)
-        db_user_id = user.id
-        is_banned = user.is_banned
-
-        sub_until = user.subscription_until
-        if sub_until and sub_until.tzinfo is None:
-            sub_until = sub_until.replace(tzinfo=timezone.utc)
-        has_subscription: bool = bool(sub_until and sub_until > datetime.now(timezone.utc))
-        has_free = user.free_downloads_left > 0
+        db_user_id, is_banned, has_subscription, reserved = await _reserve_quota(
+            session, message.from_user
+        )
 
     if is_banned:
+        # Резервирования не было — возвращать нечего.
         await message.reply("🚫 Ваш аккаунт заблокирован. Обратитесь к администратору.")
         return
 
-    if not has_subscription and not has_free:
+    if not has_subscription and not reserved:
         await message.answer(
             "🚫 Бесплатный лимит исчерпан.\n"
             "Оформи подписку для безлимитного доступа 👇",
@@ -252,18 +302,18 @@ async def handle_url(message: Message) -> None:
         )
         return
 
-    # F1 шаг 2: статус-сообщение — без открытой db-сессии.
     status_msg = await message.reply("⏳ <b>Скачиваю медиа...</b>\nЭто займёт несколько секунд")
 
-    # F1 шаг 3: скачивание — БЕЗ открытой db-сессии, чтобы не держать
-    # SQLite write-lock на протяжении всего download+upload (до 120с).
+    # Скачивание — БЕЗ открытой db-сессии, чтобы не держать SQLite write-lock
+    # на всю длину download+upload.
     async with download_semaphore:
         dl_result = await download_media(url, platform)
 
-    # F1 шаг 4: скачивание не удалось — короткая tx на лог, правим статус и выходим.
     if not dl_result.success:
         async with async_session() as session, session.begin():
             await log_download(session, db_user_id, url, platform, "failed")
+        if _quota_action(reserved, download_ok=False, media_sent_count=0) == "refund":
+            await _refund_quota(db_user_id)
         try:
             await status_msg.edit_text(
                 f"❌ <b>Не удалось скачать</b>\n{dl_result.error_message}"
@@ -272,9 +322,15 @@ async def handle_url(message: Message) -> None:
             pass
         return
 
-    # F1 шаги 5-8: аплоад медиа, затем короткие транзакции на квоту/лог.
     media_total_count = len(dl_result.file_paths) if dl_result.file_paths else 1
     media_sent_count = 0
+    send_error: Exception | None = None
+
+    # C-1 шаг 2: внутри try остаются ТОЛЬКО вызовы отправки в Telegram.
+    # Записи в БД и ответы пользователю вынесены наружу: раньше транзакция
+    # успеха лежала внутри, и её падение откатывало инкремент и success-лог, а
+    # управление уходило в except, который писал status="failed" и показывал
+    # «Ошибка при отправке», хотя медиа уже было доставлено.
     try:
         if dl_result.file_paths and len(dl_result.file_paths) > 1:
             # Множественные файлы (карусель) — отправляем media group чанками.
@@ -300,7 +356,6 @@ async def handle_url(message: Message) -> None:
                     except OSError:
                         size_mb = 0
                     if is_image and size_mb > 10:
-                        # Фото > 10 МБ Telegram не примет как photo — уходит документом.
                         oversized_images.append(path_str)
                         continue
                     sendable.append((path_str, is_image))
@@ -344,42 +399,56 @@ async def handle_url(message: Message) -> None:
                     await _send_with_retry(lambda d=doc: message.reply_document(document=d))
                     media_sent_count += 1
         else:
-            # Одиночный файл — текущее поведение
+            # Одиночный файл
             media = FSInputFile(dl_result.file_path)
             if dl_result.media_type == "image":
                 if dl_result.file_size_mb and dl_result.file_size_mb > 10:
                     await _send_with_retry(
-                        lambda: message.reply_document(document=media, caption=f"✅ Фото из {platform.capitalize()}")
+                        lambda: message.reply_document(
+                            document=media, caption=f"✅ Фото из {platform.capitalize()}"
+                        )
                     )
                 else:
                     await _send_with_retry(
-                        lambda: message.reply_photo(photo=media, caption=f"✅ Фото из {platform.capitalize()}")
+                        lambda: message.reply_photo(
+                            photo=media, caption=f"✅ Фото из {platform.capitalize()}"
+                        )
                     )
             else:
                 await _send_with_retry(
-                    lambda: message.reply_video(video=media, caption=f"✅ Видео из {platform.capitalize()}")
+                    lambda: message.reply_video(
+                        video=media, caption=f"✅ Видео из {platform.capitalize()}"
+                    )
                 )
             media_sent_count = 1
+    except (TelegramNetworkError, TelegramRetryAfter, asyncio.TimeoutError, aiohttp.ClientError) as e:
+        send_error = e
+        logger.error(
+            f"Сетевая ошибка при отправке медиа, попытки исчерпаны | "
+            f"sent={media_sent_count}/{media_total_count} error={e}"
+        )
+    except Exception as e:
+        send_error = e
+        logger.error(f"Failed to send file: {e}")
+    finally:
+        paths_to_remove = dl_result.file_paths or []
+        if dl_result.file_path and dl_result.file_path not in paths_to_remove:
+            paths_to_remove.append(dl_result.file_path)
+        for p in paths_to_remove:
+            await remove_file(p)
 
-        # F1 шаг 6 / F13: сначала db-записи (короткая tx), потом статус-сообщение.
+    if send_error is None:
         async with async_session() as session, session.begin():
-            if not has_subscription:
-                await decrement_free_downloads(session, db_user_id)
             await increment_total_downloads(session, db_user_id)
             await log_download(
                 session, db_user_id, url, platform, "success", dl_result.file_size_mb
             )
-
-        # F13: удаляем статус-сообщение ПОСЛЕДНИМ и под guard, чтобы падение
-        # тут не приводило к edit_text по удалённому сообщению.
         try:
             await status_msg.delete()
         except TelegramBadRequest:
             pass
-
-        # Best-effort: медиа доставлено, успех уже зафиксирован в БД и status_msg
-        # удалён. Сбой этого финального ответа НЕ должен утекать во внешний except
-        # (иначе — ложный лог "failed" + edit по уже удалённому status_msg).
+        # Best-effort: медиа доставлено, успех зафиксирован, status_msg удалён.
+        # Сбой этого финального ответа не должен ничего переписывать.
         try:
             await message.answer(
                 "✅ Готово! Что дальше?",
@@ -387,37 +456,27 @@ async def handle_url(message: Message) -> None:
             )
         except Exception:
             pass
-    except (TelegramNetworkError, TelegramRetryAfter, asyncio.TimeoutError, aiohttp.ClientError) as e:
-        # F1 шаг 7: лог в короткой tx.
-        logger.error(
-            f"Сетевая ошибка при отправке медиа, попытки исчерпаны | "
-            f"sent={media_sent_count}/{media_total_count} error={e}"
-        )
-        async with async_session() as session, session.begin():
-            await log_download(session, db_user_id, url, platform, "failed")
-        # F13: guard edit статус-сообщения.
-        try:
-            if media_total_count > 1:
-                await status_msg.edit_text(
-                    f"⚠️ Отправлено {media_sent_count} из {media_total_count} файлов, "
-                    "дальше произошла ошибка сети. Попробуй ещё раз."
-                )
-            else:
-                await status_msg.edit_text("⚠️ Ошибка сети при отправке файла. Попробуй ещё раз.")
-        except TelegramBadRequest:
-            pass
-    except Exception as e:
-        logger.error(f"Failed to send file: {e}")
-        async with async_session() as session, session.begin():
-            await log_download(session, db_user_id, url, platform, "failed")
-        try:
+        return
+
+    async with async_session() as session, session.begin():
+        await log_download(session, db_user_id, url, platform, "failed")
+    if _quota_action(reserved, download_ok=True, media_sent_count=media_sent_count) == "refund":
+        await _refund_quota(db_user_id)
+
+    is_network_error = isinstance(
+        send_error,
+        (TelegramNetworkError, TelegramRetryAfter, asyncio.TimeoutError, aiohttp.ClientError),
+    )
+    try:
+        if media_total_count > 1:
+            tail = "ошибка сети" if is_network_error else "ошибка"
+            await status_msg.edit_text(
+                f"⚠️ Отправлено {media_sent_count} из {media_total_count} файлов, "
+                f"дальше произошла {tail}. Попробуй ещё раз."
+            )
+        elif is_network_error:
+            await status_msg.edit_text("⚠️ Ошибка сети при отправке файла. Попробуй ещё раз.")
+        else:
             await status_msg.edit_text("⚠️ Ошибка при отправке файла. Попробуй ещё раз.")
-        except TelegramBadRequest:
-            pass
-    finally:
-        # F1 шаг 8: удаление скачанных файлов (без изменений).
-        paths_to_remove = dl_result.file_paths or []
-        if dl_result.file_path and dl_result.file_path not in paths_to_remove:
-            paths_to_remove.append(dl_result.file_path)
-        for p in paths_to_remove:
-            await remove_file(p)
+    except TelegramBadRequest:
+        pass
