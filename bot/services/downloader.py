@@ -18,7 +18,17 @@ from bot.config import settings
 from bot.utils.log_guard import mask_secrets
 
 DOWNLOAD_DIR = Path("/tmp/jw_downloads")
-IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".gif"}
+VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".mov", ".m4v"}
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".heic"}
+# .gif вынесен из изображений: sendPhoto/InputMediaPhoto сохраняет только первый
+# кадр и молча теряет анимацию — отдавать такой файл нужно через sendAnimation
+# (см. _media_type_for).
+ANIMATION_EXTS = {".gif"}
+ALLOWED_EXTS = VIDEO_EXTS | IMAGE_EXTS | ANIMATION_EXTS
+# Промежуточные артефакты yt-dlp: отдельные DASH-дорожки вида `<prefix>.f137.mp4`
+# имеют допустимое расширение (.mp4 ∈ VIDEO_EXTS) — одного белого списка мало,
+# их дополнительно отсеивает _is_finished_media через этот шаблон.
+_FRAGMENT_RE = re.compile(r"\.f\d+\.[A-Za-z0-9]+$")
 GALLERY_DL_FALLBACK_PLATFORMS = {"instagram", "pinterest", "tiktok"}
 # Потолок числа элементов на ОДНУ единицу квоты. Только доска/профиль/поиск
 # Pinterest не ограничены платформой — 1723 элемента в живом тесте. Одиночный
@@ -314,6 +324,11 @@ def _build_command(url: str, platform: str, output_path: Path, cookies_path: Pat
             "--add-header", ua,
             "--add-header", accept_lang,
         ])
+        # Раньше единственная ветка без фиксации контейнера: лучшая пара DASH
+        # у Instagram часто vp9/opus (не mp4-совместимо), yt-dlp склеивал в
+        # .mkv/.webm — расширение мимо IMAGE_EXTS, файл уходил как видео, и
+        # Telegram отдавал невоспроизводимое вложение.
+        cmd.extend(["--merge-output-format", "mp4"])
     elif platform == "tiktok":
         # У текущего yt-dlp формат-ID TikTok — h264_<res>_* / bytevc1_<res>_* (склеенные
         # video+audio), плюс watermark-версии download / download_addr. Старых play_addr_*
@@ -398,25 +413,54 @@ def _build_command(url: str, platform: str, output_path: Path, cookies_path: Pat
     return cmd
 
 
+def _is_finished_media(path: Path) -> bool:
+    """Готовый к отправке файл, а не промежуточный артефакт загрузчика.
+
+    Белый список расширений (ALLOWED_EXTS) сам по себе уже отсекает
+    `<...>.part`: gallery-dl (part=True по умолчанию) и yt-dlp пишут во
+    временный `.part`, пока элемент не докачан целиком, и переименовывают в
+    финальное имя только на завершении — суффикс `.part` не входит ни в одно
+    из трёх множеств. При обрыве (сеть, наш kill() на таймауте) `.part` может
+    остаться на диске; раньше без явного фильтра он разрешался в
+    DownloadResult.file_paths как обычный файл (живая находка ревью
+    фикс-раунда 1). `--no-part` не берём осознанно: он убрал бы именно тот
+    сигнал, по которому отличаем целый файл от обрыва, и оборванный элемент
+    лёг бы под финальным именем без маркера вообще.
+
+    Одного белого списка мало: отдельные DASH-дорожки вида `<prefix>.f137.mp4`
+    имеют допустимое расширение — их отсеивает _FRAGMENT_RE.
+    """
+    if path.suffix.lower() not in ALLOWED_EXTS:
+        return False
+    return not _FRAGMENT_RE.search(path.name)
+
+
+def _media_type_for(path: Path) -> str:
+    """Единый источник истины для типа медиа по расширению файла.
+
+    Используется и внутри загрузчика (выбор ветки DownloadResult), и должен
+    использоваться хендлером при отправке — чтобы классификация не
+    расходилась по нескольким местам (см. ALLOWED_EXTS/ANIMATION_EXTS).
+    """
+    ext = path.suffix.lower()
+    if ext in ANIMATION_EXTS:
+        return "animation"
+    if ext in IMAGE_EXTS:
+        return "image"
+    return "video"
+
+
 def _find_downloaded_files(directory: Path, prefix: str) -> list[Path]:
     result = []
     for f in directory.iterdir():
-        # gallery-dl (part=True по умолчанию) и yt-dlp пишут во временный
-        # `<...>.part`, пока элемент не докачан целиком, и переименовывают
-        # в финальное имя только на завершении. При обрыве (сеть, наш
-        # kill() на таймауте) `.part` может остаться на диске — без этого
-        # фильтра он разрешался в DownloadResult.file_paths как обычный
-        # файл: хендлер считает расширение `part` видео, Telegram отбивает
-        # всю media-группу, и весь частичный успех теряется целиком (живая
-        # находка ревью фикс-раунда 1). `--no-part` не берём осознанно: он
-        # убрал бы именно тот сигнал, по которому мы отличаем целый файл от
-        # обрыва, и оборванный элемент лёг бы под финальным именем без
-        # маркера вообще.
-        if f.is_file() and f.name.startswith(prefix) and not f.name.endswith(".part"):
-            result.append(f)
+        if not f.is_file() or not f.name.startswith(prefix):
+            continue
+        if not _is_finished_media(f):
+            continue
+        result.append(f)
 
     def _sort_key(p: Path) -> tuple[int, str]:
-        # Extract numeric suffix after prefix: prefix_42.ext → 42
+        # Числовой суффикс сразу после префикса: prefix_42.ext → 42
         rest = p.name[len(prefix):]
         m = re.search(r'_(\d+)', rest)
         return (int(m.group(1)) if m else 0, p.name)
@@ -589,8 +633,7 @@ async def _try_gallery_dl_fallback(
 
     valid_gd = [path for path, _ in sized_gd]
     total_size_mb = round(sum(size for _, size in sized_gd) / (1024 * 1024), 2)
-    ext = valid_gd[0].suffix.lower()
-    media_type = "image" if ext in IMAGE_EXTS else "video"
+    media_type = _media_type_for(valid_gd[0])
     # См. DownloadResult.partial/.truncated: обе величины уже под рукой
     # ровно там, где их иначе выбросили бы.
     partial = run.returncode != 0 and bool(valid_gd)
@@ -731,8 +774,7 @@ async def download_media(url: str, platform: str) -> DownloadResult:
                     logger.warning("yt-dlp exited with code {} but files exist | stderr={}", process.returncode, stderr_text[:200])
 
                 first_file = valid_files[0]
-                ext = first_file.suffix.lower()
-                media_type = "image" if ext in IMAGE_EXTS else "video"
+                media_type = _media_type_for(first_file)
 
                 if len(valid_files) > 1:
                     return DownloadResult(
