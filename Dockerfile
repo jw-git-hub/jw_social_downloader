@@ -30,6 +30,11 @@ RUN mkdir -p /app/data /srv/jw_downloads \
     && groupadd --gid 1000 botuser \
     && useradd --uid 1000 --gid 1000 --no-create-home --shell /usr/sbin/nologin botuser \
     && chown -R botuser:botuser /app /srv/jw_downloads
+# Ручная проверка этой стадии (ревью раунда 1): дешёвого способа проверить
+# uid боевой стадии изнутри pytest нет — тесты гоняются в стадии test,
+# которая от runtime не наследуется и осознанно осталась root (см. ниже), а
+# docker-in-docker ради одного assert того не стоит. Проверяется командой:
+#   docker build --target runtime -t tmp . && docker run --rm tmp id
 USER botuser
 CMD ["python", "-m", "bot"]
 
