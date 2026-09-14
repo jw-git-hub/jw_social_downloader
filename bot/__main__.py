@@ -25,6 +25,38 @@ async def run_polling(dp, bot) -> None:
     await dp.start_polling(bot, drop_pending_updates=True)
 
 
+UNHANDLED_ERROR_TEXT = "⚠️ Что-то пошло не так. Попробуй ещё раз."
+
+
+async def on_unhandled_error(event) -> None:
+    """Последний рубеж: исключение, не пойманное хендлером.
+
+    Без него любое исключение = тишина для пользователя и крутилка на
+    неотвеченном колбэке до 30 секунд. Ответ пользователю — best-effort:
+    он мог заблокировать бота ровно этим исключением, и падать здесь
+    во второй раз бессмысленно.
+    """
+    update = getattr(event, "update", None)
+    logger.opt(exception=getattr(event, "exception", None)).error(
+        "Unhandled update error | update_id={}", getattr(update, "update_id", None)
+    )
+
+    callback = getattr(update, "callback_query", None)
+    if callback is not None:
+        try:
+            await callback.answer(UNHANDLED_ERROR_TEXT, show_alert=False)
+        except Exception:
+            pass
+        return
+
+    message = getattr(update, "message", None)
+    if message is not None:
+        try:
+            await message.answer(UNHANDLED_ERROR_TEXT)
+        except Exception:
+            pass
+
+
 async def main() -> None:
     setup_logging()
 
@@ -37,6 +69,7 @@ async def main() -> None:
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
     dp = Dispatcher()
+    dp.errors.register(on_unhandled_error)
 
     dp.message.middleware(ThrottleMiddleware())
 
