@@ -52,14 +52,30 @@ class Settings(BaseSettings):
 
 
 def _within_one_edit(a: str, b: str) -> bool:
-    """True, если строки различаются не более чем одной правкой символа."""
+    """True, если строки различаются не более чем одной правкой: вставкой,
+    удалением, заменой одного символа или перестановкой двух СОСЕДНИХ
+    символов.
+
+    Перестановка — отдельный случай, не сводится к замене одного символа:
+    при равной длине она меняет сразу ДВЕ позиции (USDT → UDST: позиции
+    «S»/«D» обе расходятся), то есть расстояние Хэмминга у неё 2, а не 1.
+    Без этой ветки ровно такая опечатка — самый частый бытовой вид, когда
+    путают порядок соседних букв, — проходила мимо проверки (ревью раунда 1:
+    `SUBSCRIPTION_PRICE_UDST` молча игнорировался).
+    """
     if a == b:
         return True
     la, lb = len(a), len(b)
     if abs(la - lb) > 1:
         return False
     if la == lb:
-        return sum(1 for x, y in zip(a, b) if x != y) == 1
+        mismatches = [i for i in range(la) if a[i] != b[i]]
+        if len(mismatches) == 1:
+            return True
+        if len(mismatches) == 2:
+            i, k = mismatches
+            return k == i + 1 and a[i] == b[k] and a[k] == b[i]
+        return False
 
     short, long_ = (a, b) if la < lb else (b, a)
     i = j = 0
@@ -92,14 +108,22 @@ def check_env_keys(environ: Mapping[str, str] | None = None) -> list[str]:
     Возвращает пустой список: непохожие переменные — не наша забота. Опечатка
     же поднимает ValueError, потому что молчаливо неверный адрес оплаты стоит
     денег, а лишний перезапуск с исправленным именем — нет.
+
+    Сравнение регистронезависимое. `Settings` не задаёт `case_sensitive`
+    явно, а у pydantic-settings это `False` по умолчанию: `ADMIN_Id`
+    биндится на поле `ADMIN_ID` совершенно корректно, это не опечатка, а
+    рабочий конфиг (ревью раунда 1: регистрозависимое сравнение валило
+    старт на таком ключе). Регистр учитывается только в тексте сообщения —
+    там показан ключ ровно так, как он задан в окружении.
     """
     source = os.environ if environ is None else environ
     known = set(Settings.model_fields)
+    known_upper = {k.upper() for k in known}
     typos = [
         (key, near)
         for key in source
-        if key not in known
-        for near in (next((k for k in known if _within_one_edit(key, k)), None),)
+        if key.upper() not in known_upper
+        for near in (next((k for k in known if _within_one_edit(key.upper(), k.upper())), None),)
         if near is not None
     ]
     if typos:

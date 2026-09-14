@@ -25,6 +25,25 @@ def test_typo_by_an_extra_character_is_fatal():
         check_env_keys({"ADMIN_IDD": "1"})
 
 
+def test_typo_by_adjacent_transposition_is_fatal():
+    """Ревью раунда 1: перестановка соседних букв — самый частый бытовой вид
+    опечатки (USDT → UDST) — при равной длине строк давала расстояние
+    Хэмминга 2, а не 1, и раньше проходила мимо проверки незамеченной. Поле
+    денежное, как и в исходной находке M-26."""
+    with pytest.raises(ValueError) as excinfo:
+        check_env_keys({"SUBSCRIPTION_PRICE_UDST": "999"})
+    assert "SUBSCRIPTION_PRICE_UDST" in str(excinfo.value)
+    assert "SUBSCRIPTION_PRICE_USDT" in str(excinfo.value)
+
+
+def test_case_only_difference_is_not_a_typo():
+    """Ревью раунда 1: pydantic-settings по умолчанию регистронезависим
+    (`case_sensitive` не задан явно => `False`) — `ADMIN_Id` биндится на
+    `ADMIN_ID` корректно, это рабочий конфиг, а не опечатка. Регистрозависимое
+    сравнение раньше валило старт на таком ключе."""
+    assert check_env_keys({"ADMIN_Id": "1"}) == []
+
+
 def test_declared_keys_pass():
     assert check_env_keys({"ADMIN_ID": "1", "TELEGRAM_API_ID": "1", "TELEGRAM_API_HASH": "x"}) == []
 
