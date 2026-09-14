@@ -354,18 +354,64 @@ async def handle_url(message: Message) -> None:
         )
         return
 
-    status_msg = await message.reply("⏳ <b>Скачиваю медиа...</b>\nЭто займёт несколько секунд")
-
-    # Скачивание — БЕЗ открытой db-сессии, чтобы не держать SQLite write-lock
-    # на всю длину download+upload.
-    async with download_semaphore:
-        dl_result = await download_media(url, platform)
-
-    if not dl_result.success:
-        async with async_session() as session, session.begin():
-            await log_download(session, db_user_id, url, platform, "failed")
+    # Fix round 1, п.3 (окно 1/3): между резервированием и этим вызовом юзер
+    # мог заблокировать бота в ту же секунду — раньше единица терялась молча.
+    try:
+        status_msg = await message.reply(
+            "⏳ <b>Скачиваю медиа...</b>\nЭто займёт несколько секунд"
+        )
+    except (TelegramBadRequest, TelegramForbiddenError) as e:
+        logger.info(
+            "Не удалось отправить статус-сообщение | user={} error={}", user_id, e
+        )
         if _quota_action(reserved, download_ok=False, media_sent_count=0) == "refund":
             await _refund_quota(db_user_id)
+        return
+
+    # Fix round 1, п.3 (окно 2/3): download_media НЕ гарантирует возврат
+    # DownloadResult при любом исходе — до её собственного try (downloader.py)
+    # успевают отработать mkdir/gallery-dl fallback/ephemeral cookies, и там
+    # может прилететь, например, OSError(ENOSPC) при заполненном диске.
+    # Скачивание — БЕЗ открытой db-сессии, чтобы не держать SQLite write-lock
+    # на всю длину download+upload.
+    try:
+        async with download_semaphore:
+            dl_result = await download_media(url, platform)
+    except Exception as e:
+        logger.error("download_media упал до собственной обработки ошибок | error={}", e)
+        if _quota_action(reserved, download_ok=False, media_sent_count=0) == "refund":
+            await _refund_quota(db_user_id)
+        try:
+            async with async_session() as session, session.begin():
+                await log_download(session, db_user_id, url, platform, "failed")
+        except Exception as log_exc:
+            logger.error(
+                "Не удалось записать лог загрузки | user={} error={}", db_user_id, log_exc
+            )
+        try:
+            await status_msg.edit_text(
+                "❌ <b>Не удалось скачать</b>\nПроизошла внутренняя ошибка. Попробуй ещё раз."
+            )
+        except (TelegramBadRequest, TelegramForbiddenError):
+            pass
+        return
+
+    if not dl_result.success:
+        # Fix round 1, п.3 (окно 3/3): возврат единицы — ПЕРЕД записью в лог.
+        # Неудачная транзакция лога (например SQLite "database is locked",
+        # штатный исход под нагрузкой) не должна стоить пользователю
+        # оплаченной попытки; сама транзакция лога дополнительно обёрнута —
+        # её падение не должно рушить хендлер после того как возврат уже
+        # сделан.
+        if _quota_action(reserved, download_ok=False, media_sent_count=0) == "refund":
+            await _refund_quota(db_user_id)
+        try:
+            async with async_session() as session, session.begin():
+                await log_download(session, db_user_id, url, platform, "failed")
+        except Exception as log_exc:
+            logger.error(
+                "Не удалось записать лог загрузки | user={} error={}", db_user_id, log_exc
+            )
         try:
             await status_msg.edit_text(
                 f"❌ <b>Не удалось скачать</b>\n{dl_result.error_message}"
@@ -515,10 +561,17 @@ async def handle_url(message: Message) -> None:
             pass
         return
 
-    async with async_session() as session, session.begin():
-        await log_download(session, db_user_id, url, platform, "failed")
+    # Fix round 1, п.3: тот же порядок, что и в ветке выше — возврат единицы
+    # ПЕРЕД записью лога, и сама запись лога обёрнута отдельно.
     if _quota_action(reserved, download_ok=True, media_sent_count=media_sent_count) == "refund":
         await _refund_quota(db_user_id)
+    try:
+        async with async_session() as session, session.begin():
+            await log_download(session, db_user_id, url, platform, "failed")
+    except Exception as log_exc:
+        logger.error(
+            "Не удалось записать лог загрузки | user={} error={}", db_user_id, log_exc
+        )
 
     is_network_error = isinstance(
         send_error,
