@@ -1,11 +1,24 @@
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from aiogram.types import Chat, InaccessibleMessage
 
 from bot.handlers.user import _is_not_modified, _safe_edit
 
 
 class _StubBot:
+    """Fix round 1, п.5: этот стаб send_message НИКОГДА не падает, поэтому
+    тесты ниже, использующие его, доказывают только "не пробрасывает
+    исключение", а не "экран гарантированно доставлен". На проде
+    `BadRequest: can't parse entities` — это ошибка в самом ТЕКСТЕ, и
+    send_message с тем же текстом упадёт ровно так же: сработает finальный
+    `except Exception` в `_safe_edit`, и пользователь не получит НИЧЕГО.
+    Спеке это соответствует (бриф Task 26 требовал "не пробрасывать", а не
+    "доставить любой ценой") — но не путать assert'ы ниже с гарантией
+    доставки.
+    """
+
     def __init__(self) -> None:
         self.sent: list[tuple[int, str]] = []
 
@@ -106,3 +119,28 @@ async def test_safe_edit_does_not_leak_unexpected_errors():
     await _safe_edit(cb, "экран меню")
 
     assert cb.bot.sent == [(4242, "экран меню")]
+
+
+async def test_safe_edit_never_treats_real_inaccessible_message_as_editable(monkeypatch):
+    """Fix round 1, п.4: закрывает guard `not isinstance(msg, InaccessibleMessage)`.
+
+    На настоящем aiogram 3.31.0 у `InaccessibleMessage` нет атрибута
+    `edit_text` вовсе, поэтому даже БЕЗ guard'а `AttributeError` ловится
+    общим `except Exception`, и экран всё равно доставляется фолбэком —
+    внешнее поведение (что в итоге ушло пользователю) от guard'а не зависит,
+    это подтверждено вручную и намеренно не проверяется этим тестом.
+    Guard — про то, что код НИКОГДА не должен ПЫТАТЬСЯ вызвать edit_text на
+    недоступном сообщении (корректность и чистота логов, не пользовательский
+    результат). Чтобы отличить "никогда не пытается" от "пытается и ловит
+    исключение", сюда подставлен исполняемый edit_text: без guard'а он был бы
+    вызван и `_safe_edit` вернулся бы, не дойдя до `send_message`.
+    """
+    edit_mock = AsyncMock()
+    monkeypatch.setattr(InaccessibleMessage, "edit_text", edit_mock, raising=False)
+    inaccessible = InaccessibleMessage(chat=Chat(id=999, type="private"), message_id=1, date=0)
+    cb = _StubCallback(inaccessible)
+
+    await _safe_edit(cb, "экран меню")
+
+    edit_mock.assert_not_called()
+    assert cb.bot.sent == [(999, "экран меню")]
