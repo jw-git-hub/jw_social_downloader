@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 from datetime import datetime, timezone
+from urllib.parse import urlsplit, urlunsplit
 
 import aiohttp
 from aiogram import F, Router
@@ -68,6 +69,27 @@ WELCOME_TEXT = (
 
 def _is_admin(user_id: int) -> bool:
     return user_id == settings.ADMIN_ID
+
+
+def _url_for_log(url: str) -> str:
+    """схема://хост/путь — без query и без fragment, для логов (не для БД).
+
+    Fix round 3, N4: `mask_secrets` (bot/utils/log_guard.py, чужое владение)
+    — это АЛЛОУЛИСТ имён query-параметров (~14 штук), а не эвристика по
+    форме значения. Что в список не входит (например TikTok `_t`,
+    `sec_user_id`, Meta `mibextid`, Pinterest `invite_code`) — уходит в лог
+    дословно, и это подтверждено живым замером. Секреты живут именно в
+    query-строке; для диагностики падения (какая платформа, какой ресурс)
+    query не нужен вовсе. Поэтому в лог идёт голый путь, а не борьба за
+    полноту чужого аллоулиста. `mask_secrets` всё равно применяется поверх
+    (глобальный патчер loguru) — если что-то похожее на секрет всё же
+    окажется в пути, вторым рубежом его добьёт она.
+    """
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return "<unparseable-url>"
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
 
 
 NOT_MODIFIED_MARKER = "message is not modified"
@@ -392,7 +414,7 @@ async def handle_url(message: Message) -> None:
         # диагностических строк в этом файле.
         logger.exception(
             "download_media упал до собственной обработки ошибок | user={} url={} platform={}",
-            db_user_id, url, platform,
+            db_user_id, _url_for_log(url), platform,
         )
         if _quota_action(reserved, download_ok=False, media_sent_count=0) == "refund":
             await _refund_quota(db_user_id)

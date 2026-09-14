@@ -18,13 +18,18 @@
 
 from __future__ import annotations
 
+import logging
+
 import bot.handlers.user as U
+import pytest
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
+from loguru import logger as loguru_logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from bot.db.models import EXTRA_INDEX_DDL, Base, User
 from bot.services.downloader import DownloadResult
+from bot.utils.log_guard import setup_logging
 
 # Реальная ссылка, которую parse_url распознаёт как TikTok — handle_url не
 # должен уйти в ветку "это не похоже на ссылку" ни в одном сценарии.
@@ -486,5 +491,93 @@ async def test_forbidden_during_send_triggers_refund(monkeypatch, sqlite_engine_
         # (проверяем УРОВЕНЬ, не текст — см. N6 в докстринге).
         assert error_calls == []
         assert info_calls, "штатная блокировка должна залогироваться на уровне INFO"
+    finally:
+        await engine.dispose()
+
+
+# ── Fix round 3: query-строка с секретом не должна уходить в лог ──
+
+
+@pytest.fixture
+def isolated_logger():
+    """Loguru и корневой stdlib-logging — глобальное состояние процесса.
+
+    setup_logging() (вызывается тестом ниже) снимает ВСЕ синки и заворачивает
+    корневой logging через свой _InterceptHandler — без сохранения и
+    восстановления это протекло бы в остальные тесты сессии. Тот же приём,
+    что и в tests/test_log_guard.py (пакет 0, файл не импортируется — чтобы
+    не тянуть чужой тестовый модуль, здесь локальная копия того же паттерна
+    на bot.utils.log_guard.setup_logging, публичном API пакета 0).
+    """
+    root_logger = logging.getLogger()
+    prev_handlers = list(root_logger.handlers)
+    prev_level = root_logger.level
+    loguru_logger.remove()
+    yield loguru_logger
+    loguru_logger.remove()
+    loguru_logger.configure(patcher=None)
+    root_logger.handlers = prev_handlers
+    root_logger.setLevel(prev_level)
+
+
+async def test_download_media_crash_log_does_not_leak_unallowlisted_query_secret(
+    monkeypatch, sqlite_engine_factory, tmp_path, isolated_logger
+):
+    """Fix round 3, N4 (частично закрыт в round 2, добит здесь): mask_secrets
+    (bot/utils/log_guard.py, чужое владение) — аллоулист ИМЁН query-
+    параметров (~14 штук), НЕ эвристика по форме значения. `_t` (TikTok) в
+    список не входит и маскировкой не ловится — подтверждено живым замером
+    ревьюера на РЕАЛЬНОМ файле лога. До Fix round 3 в лог при КАЖДОМ падении
+    download_media безусловно летел весь исходный URL пользователя вместе с
+    query-строкой; теперь — только схема://хост/путь через `_url_for_log`.
+
+    Читаем РЕАЛЬНЫЙ файл лога через настоящий loguru-пайплайн
+    (setup_logging + боевой патчер mask_secrets), а не стаб `logger.error` —
+    стаб проверяет только аргументы ДО маскировки и патчера, то есть
+    доказывает меньше (ревьюер это прямо отметил, "стаб логгера тут
+    доказывает меньше").
+
+    Граница честности: `download_media` здесь падает с ОБЩЕЙ ошибкой
+    (`OSError`), которая сама по себе URL не содержит — это тестирует
+    ровно тот канал, который контролирует user.py (пакет D). Если бы
+    реальное исключение из downloader.py (пакет B) само содержало сырой
+    URL в своём __str__ (не наш код, не наша строка формата), это попало
+    бы в traceback через logger.exception и НЕ было бы поймано текущей
+    правкой — это отдельный, уже заведённый ревьюером как отдельный пункт
+    владельцу пробел в аллоулисте mask_secrets, не пакета D.
+    """
+    log_file = tmp_path / "bot.log"
+    setup_logging(str(log_file))
+
+    secret_url = (
+        "https://www.tiktok.com/@someuser/video/1234567890123456789"
+        "?_t=ZS8SECRETVALUEHERE1234567890&_r=1"
+    )
+
+    maker, engine = await _make_session_maker(sqlite_engine_factory, tmp_path, "log_leak.db")
+    try:
+        uid = 800000013
+        await _seed_user(maker, id=uid, free_downloads_left=1)
+        monkeypatch.setattr(U, "async_session", maker)
+
+        async def _boom(url, platform):
+            raise OSError("No space left on device")
+
+        monkeypatch.setattr(U, "download_media", _boom)
+
+        msg = _FakeMessage(secret_url, uid)
+        await U.handle_url(msg)  # не должно бросить
+
+        loguru_logger.remove()  # закрываем файловый синк, чтобы контент дошёл до диска
+        written = log_file.read_text(encoding="utf-8")
+
+        assert "ZS8SECRETVALUEHERE1234567890" not in written, (
+            "секрет из query-параметра _t (не входит в аллоулист mask_secrets) "
+            "утёк в лог"
+        )
+        assert "_t=" not in written
+        # Диагностическая ценность сохранена: платформа и путь видны.
+        assert "tiktok" in written
+        assert "/@someuser/video/1234567890123456789" in written
     finally:
         await engine.dispose()
