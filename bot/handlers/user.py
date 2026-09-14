@@ -360,7 +360,13 @@ async def handle_url(message: Message) -> None:
         status_msg = await message.reply(
             "⏳ <b>Скачиваю медиа...</b>\nЭто займёт несколько секунд"
         )
-    except (TelegramBadRequest, TelegramForbiddenError) as e:
+    except Exception as e:
+        # Fix round 2, N1: было (TelegramBadRequest, TelegramForbiddenError)
+        # — узкий except пропускал TelegramNetworkError/TelegramRetryAfter
+        # (сетевой сбой или 429 не менее вероятны тут, чем блокировка бота),
+        # и они улетали из хендлера необработанными, унося единицу с собой.
+        # Возврат и return корректны для ЛЮБОГО исключения на этом шаге —
+        # дальше по коду ничего не сделано и делать нечего.
         logger.info(
             "Не удалось отправить статус-сообщение | user={} error={}", user_id, e
         )
@@ -541,10 +547,22 @@ async def handle_url(message: Message) -> None:
             await remove_file(p)
 
     if send_error is None:
-        async with async_session() as session, session.begin():
-            await increment_total_downloads(session, db_user_id)
-            await log_download(
-                session, db_user_id, url, platform, "success", dl_result.file_size_mb
+        # Fix round 2, N2: третий (последний) незащищённый сайт log_download —
+        # тот же "database is locked", что уже закрыт на двух других сайтах в
+        # Fix round 1. Без guard'а его падение уходит необработанным ДО
+        # status_msg.delete()/message.answer(): медиа уже доставлено, единица
+        # уже списана (деньги не теряются), но пользователь не видит "Готово",
+        # статус-сообщение "Скачиваю..." остаётся висеть навсегда, и в
+        # диспетчер летит необработанное исключение.
+        try:
+            async with async_session() as session, session.begin():
+                await increment_total_downloads(session, db_user_id)
+                await log_download(
+                    session, db_user_id, url, platform, "success", dl_result.file_size_mb
+                )
+        except Exception as log_exc:
+            logger.error(
+                "Не удалось записать успешную загрузку | user={} error={}", db_user_id, log_exc
             )
         try:
             await status_msg.delete()

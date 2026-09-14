@@ -19,7 +19,7 @@
 from __future__ import annotations
 
 import bot.handlers.user as U
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
@@ -279,6 +279,36 @@ async def test_refund_when_status_message_send_is_forbidden(monkeypatch, sqlite_
         await engine.dispose()
 
 
+async def test_refund_when_status_message_send_hits_network_error(monkeypatch, sqlite_engine_factory, tmp_path):
+    """Fix round 2, N1: (TelegramBadRequest, TelegramForbiddenError) вокруг
+    message.reply(...) статус-сообщения было слишком узко —
+    TelegramNetworkError/TelegramRetryAfter не менее (а RetryAfter даже
+    более) вероятны на этом шаге, и оба пролетали мимо guard'а необработанными,
+    унося единицу с собой. Тест — на TelegramRetryAfter (первый вызов API
+    после того, как юзер прислал несколько ссылок подряд)."""
+    maker, engine = await _make_session_maker(sqlite_engine_factory, tmp_path, "retry_after_status.db")
+    try:
+        uid = 800000011
+        await _seed_user(maker, id=uid, free_downloads_left=1)
+        monkeypatch.setattr(U, "async_session", maker)
+
+        async def _must_not_be_called(*a, **k):
+            raise AssertionError("download_media must not run if the status message never sent")
+
+        monkeypatch.setattr(U, "download_media", _must_not_be_called)
+
+        msg = _FakeMessage(
+            TEST_URL,
+            uid,
+            reply_raises=TelegramRetryAfter(method=None, message="Too Many Requests", retry_after=5),
+        )
+        await U.handle_url(msg)  # не должно бросить
+
+        assert await _free_downloads_left(maker, uid) == 1
+    finally:
+        await engine.dispose()
+
+
 async def test_refund_when_download_media_raises(monkeypatch, sqlite_engine_factory, tmp_path):
     """Fix round 1, окно 2/3: download_media НЕ гарантирует DownloadResult —
     mkdir/gallery-dl fallback/ephemeral cookies выполняются до её try.
@@ -328,6 +358,46 @@ async def test_refund_survives_log_download_lock_error(monkeypatch, sqlite_engin
         await U.handle_url(msg)  # не должно бросить, несмотря на падение лога
 
         assert await _free_downloads_left(maker, uid) == 1
+    finally:
+        await engine.dispose()
+
+
+async def test_success_path_survives_log_download_lock_error(monkeypatch, sqlite_engine_factory, tmp_path):
+    """Fix round 2, N2: третий (последний) незащищённый сайт log_download —
+    на УСПЕШНОМ пути. Без guard'а его падение уходит необработанным ДО
+    status_msg.delete()/message.answer(): медиа уже доставлено, единица уже
+    списана (деньги не теряются), но пользователь не видит "Готово", а
+    статус-сообщение "Скачиваю..." остаётся висеть навсегда."""
+    maker, engine = await _make_session_maker(sqlite_engine_factory, tmp_path, "success_log_locked.db")
+    try:
+        uid = 800000012
+        await _seed_user(maker, id=uid, free_downloads_left=1)
+        monkeypatch.setattr(U, "async_session", maker)
+
+        async def _ok(url, platform):
+            return DownloadResult(
+                success=True,
+                file_path="/tmp/does-not-exist.mp4",
+                media_type="video",
+                file_size_mb=1.0,
+            )
+
+        monkeypatch.setattr(U, "download_media", _ok)
+
+        async def _locked_log(*a, **k):
+            raise RuntimeError("database is locked")
+
+        monkeypatch.setattr(U, "log_download", _locked_log)
+
+        msg = _FakeMessage(TEST_URL, uid)
+        await U.handle_url(msg)  # не должно бросить, несмотря на падение лога
+
+        # Единица уже честно списана (успех, не про деньги) — этот тест
+        # про то, что пользователь всё равно получает финальный ответ и
+        # статус-сообщение не остаётся висеть навсегда.
+        assert msg.status_message is not None
+        assert msg.status_message.delete_calls == 1
+        assert msg.answer_calls
     finally:
         await engine.dispose()
 
