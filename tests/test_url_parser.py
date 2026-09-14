@@ -86,10 +86,15 @@ def test_regional_pinterest_hosts_are_accepted(host):
 
 
 def test_host_case_is_normalised_for_regional_pinterest():
-    # "PL.PINTEREST.COM" не является ключом ни одного словаря — платформа
-    # определяется только через регексп по форме хоста, и именно поэтому
-    # этот тест чувствителен к тому, что хост приводится к нижнему регистру
-    # ДО сравнения с регекспом (сам регексп не компилируется с re.IGNORECASE).
+    # Поправка после ревью: комментарий здесь раньше приписывал
+    # регистронезависимость вызову .lower() внутри _normalize_host — это
+    # холостое утверждение, мутация подтвердила: urlparse(...).hostname САМ
+    # всегда возвращает нижний регистр (штатное поведение stdlib), поэтому
+    # ко входу _normalize_host он приходит уже нормализованным, и .lower()
+    # там избыточен для любого вызова через публичный parse_url. Тест
+    # остаётся — он честно проверяет ИТОГОВОЕ поведение parse_url на хосте,
+    # которого нет ни в одном словаре (только через регексп по форме), а не
+    # то, какая именно строчка кода регистр приводит.
     result = parse_url("HTTPS://PL.PINTEREST.COM/pin/123456789012345678/")
     assert result is not None
     assert result[1] == "pinterest"
@@ -124,6 +129,16 @@ def test_schemeless_links_are_accepted_and_normalised(text, platform):
     url, detected = result
     assert detected == platform
     assert url.startswith("https://")
+
+
+def test_schemeless_link_keeps_query_string():
+    # Regression (ревью, фикс-раунд 1): до анкера-лукахеда в бессхемной ветке
+    # опциональная группа пути матчила только "/...", поэтому "?v=abc" без
+    # ведущего "/" отбрасывался целиком — "youtube.com?v=abc" превращалось в
+    # ссылку на главную страницу, а не на конкретное видео.
+    result = parse_url("youtube.com?v=aaaaaaaaaaa")
+    assert result is not None
+    assert result == ("https://youtube.com?v=aaaaaaaaaaa", "youtube")
 
 
 # ── Query-строка сохраняется целиком ──────────────────────────────────────
@@ -216,3 +231,90 @@ def test_schemed_url_wins_over_bare_domain_later_in_the_text():
     result = parse_url("https://youtu.be/aaaaaaaaaaa и ещё pin.it/abc")
     assert result is not None
     assert result[1] == "youtube"
+
+
+# ── Фикс-раунд 1 (ревью): два Critical SSRF и два Important ──────────────
+#
+# C-1: TLD Pinterest раньше матчился открытым классом [a-z]{2,4}(?:\.[a-z]{2})?
+# — "evil.co" читался как "TLD=evil плюс ccTLD=co", и pinterest.evil.co/
+# pinterest.hack.io проходили аллоулист. Атакующему не нужен чужой бренд в
+# домене — только короткий домен под коротким ccTLD, который он регистрирует
+# сам. Закрыто явным перечнем TLD, которыми Pinterest реально владеет
+# (_PINTEREST_TLDS в url_parser.py).
+#
+# C-2: бессхемная ветка матчила домен из _BARE_ALT как ПРЕФИКС более
+# длинного чужого хоста и молча отбрасывала хвост — "pinterest.evil.com/pin/1/"
+# находил "pinterest.evil.co" (TLD-альтернативу "com" читало как "co" плюс
+# непойманный остаток "m"), "youtu.be.evil.net/x" находил ровно "youtu.be".
+# Ветка не "проходила тот же фильтр", что схемная, — она ПОДМЕНЯЛА хост ДО
+# фильтра. Закрыто лукахедом (?![\w.-]) сразу после домена.
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "https://pinterest.evil.co/pin/1/",
+        "https://pinterest.evil.co:6379/",
+        "https://pinterest.hack.io/x",
+        "https://sub.pinterest.evil.co/x",
+        "https://pinterest.evil.me/x",
+        "https://pinterest.evil.ly/x",
+    ],
+)
+def test_pinterest_tld_squatting_is_rejected(text):
+    # C-1. До фикса открытый класс [a-z]{2,4}(?:\.[a-z]{2})? принимал ЛЮБОЙ
+    # 2-4-буквенный домен под ЛЮБЫМ двухбуквенным ccTLD как "TLD Pinterest".
+    assert parse_url(text) is None, text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # Бессхемные близнецы уже существующих схемных негативов из секции
+        # выше ("pinterest.com.evil.net", "instagram.com.evil.net" и т.п.)
+        # — именно в бессхемной ветке была дыра C-2, схемная всегда матчила
+        # весь хвост целиком через [^\s<>"']+ и уже была безопасна.
+        "pinterest.evil.com/pin/1/",
+        "instagram.com.evil.net/p/1/",
+        "youtu.be.evil.net/x",
+        "tiktok.com.evil.net/@u/video/1",
+        "facebook.com.evil.net/x",
+        "fb.watch.evil.net/x",
+        "pin.it.evil.net/x",
+    ],
+)
+def test_bare_domain_match_does_not_truncate_to_a_shorter_prefix(text):
+    # C-2. До фикса бессхемная ветка матчила ровно домен-литерал/TLD-форму и
+    # молча останавливалась там же, где чужой хост лишь НАЧИНАЛСЯ с похожей
+    # на настоящую подстроки — а не отвергала ссылку с неопознанным хвостом.
+    assert parse_url(text) is None, text
+
+
+def test_nfkc_homoglyph_host_does_not_raise():
+    # I-1. urlparse бросает ValueError на хостах, чьи символы меняются под
+    # NFKC-нормализацией ("℀" нормализуется в "a/c") — глобального
+    # обработчика ошибок в проекте нет, поэтому непойманное исключение
+    # раньше означало, что пользователь не получал ответа вообще на любое
+    # сообщение с таким паттерном. Неподдерживаемая ссылка — это None.
+    assert parse_url("https://pinterest℀.com/x") is None
+
+
+def test_backslash_in_authority_is_rejected():
+    # I-2. Python здесь видит валидный "userinfo@host" и корректно относит
+    # всё до "@" к userinfo, отдавая host=pinterest.com — а urllib3 (её
+    # использует gallery-dl) трактует "\" как эквивалент "/" и обрывает
+    # authority на "127.0.0.1" раньше "@". Один и тот же текст ссылки
+    # означает разный хост для разных библиотек внутри одного и того же
+    # бота — parser-differential SSRF. Легитимных ссылок с "\" в authority
+    # ни у одной из пяти платформ нет.
+    assert parse_url(r"https://127.0.0.1\@pinterest.com/pin/1/") is None
+
+
+def test_backslash_outside_authority_does_not_trigger_rejection():
+    # Проверка границы фикса I-2: запрет должен быть специфичен именно для
+    # authority, а не для URL целиком — обратный слэш в пути (сам по себе
+    # синтаксически нестандартный, но не создающий host-confusion) не повод
+    # отвергать ссылку.
+    result = parse_url("https://www.instagram.com/p/a\\b/")
+    assert result is not None
+    assert result[1] == "instagram"
