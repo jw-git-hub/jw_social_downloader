@@ -383,8 +383,17 @@ async def handle_url(message: Message) -> None:
     try:
         async with download_semaphore:
             dl_result = await download_media(url, platform)
-    except Exception as e:
-        logger.error("download_media упал до собственной обработки ошибок | error={}", e)
+    except Exception:
+        # Fix round 2, N4: logger.exception (не .error) — тянет traceback, а
+        # не только str(e); на программной ошибке из глубины downloader.py
+        # (AttributeError и т.п.) раньше в логе оставалось буквально
+        # "'NoneType' object has no attribute ...' без единого шанса
+        # локализовать место. user=/url=/platform= — как у соседних
+        # диагностических строк в этом файле.
+        logger.exception(
+            "download_media упал до собственной обработки ошибок | user={} url={} platform={}",
+            db_user_id, url, platform,
+        )
         if _quota_action(reserved, download_ok=False, media_sent_count=0) == "refund":
             await _refund_quota(db_user_id)
         try:

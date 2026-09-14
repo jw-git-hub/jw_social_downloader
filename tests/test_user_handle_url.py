@@ -446,8 +446,14 @@ async def test_forbidden_during_send_triggers_refund(monkeypatch, sqlite_engine_
     убрать выделенный `except TelegramForbiddenError` целиком (провалившись
     в общий `except Exception`), этот тест по возврату НЕ краснеет — именно
     поэтому проверка ниже целится в единственное реально отличимое свойство
-    этой ветки: уровень и текст лога (`INFO` "заблокировал бота", а не
-    `ERROR` "Failed to send file").
+    этой ветки: УРОВЕНЬ лога (штатный INFO, а не ERROR общего except).
+
+    Fix round 2, N6: первая версия этой проверки цеплялась за русскую
+    прозу лог-строки ("заблокировал бота") — мутация "перевести только
+    текст на английский" красила бы тест при побайтово идентичном
+    поведении (ложный сигнал регрессии на чистке формулировок/i18n).
+    Проверяем УРОВЕНЬ (`error_calls == []` и `info_calls` непусто), а не
+    текст — то же самое различающее свойство, без завязки на прозу.
     """
     maker, engine = await _make_session_maker(sqlite_engine_factory, tmp_path, "forbidden_send.db")
     try:
@@ -476,9 +482,9 @@ async def test_forbidden_during_send_triggers_refund(monkeypatch, sqlite_engine_
 
         # Ничего не доставлено -> единица возвращается (общее для обеих веток).
         assert await _free_downloads_left(maker, uid) == 1
-        # Отличимое свойство именно этой ветки: штатный INFO-лог про блокировку,
-        # а не ERROR "Failed to send file" из общего except Exception.
-        assert any("заблокировал бота" in m for m in info_calls)
-        assert not any("Failed to send file" in m for m in error_calls)
+        # Отличимое свойство именно этой ветки: штатный INFO, а не ERROR
+        # (проверяем УРОВЕНЬ, не текст — см. N6 в докстринге).
+        assert error_calls == []
+        assert info_calls, "штатная блокировка должна залогироваться на уровне INFO"
     finally:
         await engine.dispose()
