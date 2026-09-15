@@ -60,14 +60,83 @@ def test_sweep_survives_a_file_vanishing_mid_pass(tmp_path, monkeypatch):
     assert removed == 1
 
 
-def test_sweep_skips_subdirectories(tmp_path, monkeypatch):
+def test_sweep_skips_unrelated_subdirectories(tmp_path, monkeypatch):
+    """Каталоги без префикса jw_cookies_ подметальщик не трогает вовсе."""
     monkeypatch.setattr(cleanup, "DOWNLOAD_DIR", tmp_path)
-    (tmp_path / "jw_cookies_abc").mkdir()
+    (tmp_path / "some_other_dir").mkdir()
 
     removed = cleanup.sweep_once(max_age_minutes=10, now=time.time() + 3600)
 
     assert removed == 0
-    assert (tmp_path / "jw_cookies_abc").is_dir()
+    assert (tmp_path / "some_other_dir").is_dir()
+
+
+def test_old_cookie_dir_is_removed(tmp_path, monkeypatch):
+    """Осиротевший (пережил жёсткое убийство процесса) каталог кук подчищается."""
+    monkeypatch.setattr(cleanup, "DOWNLOAD_DIR", tmp_path)
+    monkeypatch.setattr(cleanup, "COOKIE_DIR_MAX_AGE_SEC", 1800)
+    cookie_dir = tmp_path / "jw_cookies_abc"
+    cookie_dir.mkdir()
+
+    removed = cleanup.sweep_once(max_age_minutes=10, now=time.time() + 1800 + 60)
+
+    assert removed == 1
+    assert not cookie_dir.exists()
+
+
+def test_fresh_cookie_dir_survives(tmp_path, monkeypatch):
+    """Каталог кук идущей загрузки (моложе порога кук) не трогаем."""
+    monkeypatch.setattr(cleanup, "DOWNLOAD_DIR", tmp_path)
+    monkeypatch.setattr(cleanup, "COOKIE_DIR_MAX_AGE_SEC", 1800)
+    cookie_dir = tmp_path / "jw_cookies_abc"
+    cookie_dir.mkdir()
+
+    removed = cleanup.sweep_once(max_age_minutes=10, now=time.time() + 60)
+
+    assert removed == 0
+    assert cookie_dir.is_dir()
+
+
+def test_cookie_dir_between_thresholds_survives(tmp_path, monkeypatch):
+    """H-регресс: между max_age_minutes (10 мин) и порогом кук (30 мин)
+    каталог кук обязан пережить проход — иначе подметальщик срежет куки
+    у ещё идущей загрузки (DOWNLOAD_TIMEOUT 15 мин)."""
+    monkeypatch.setattr(cleanup, "DOWNLOAD_DIR", tmp_path)
+    monkeypatch.setattr(cleanup, "COOKIE_DIR_MAX_AGE_SEC", 1800)
+    cookie_dir = tmp_path / "jw_cookies_abc"
+    cookie_dir.mkdir()
+
+    # 15 минут: старше max_age_minutes*60 (600с), но моложе COOKIE_DIR_MAX_AGE_SEC (1800с).
+    removed = cleanup.sweep_once(max_age_minutes=10, now=time.time() + 900)
+
+    assert removed == 0
+    assert cookie_dir.is_dir()
+
+
+def test_unrelated_dir_survives_even_when_very_old(tmp_path, monkeypatch):
+    """Посторонний каталог не подчищается ни по одному из порогов."""
+    monkeypatch.setattr(cleanup, "DOWNLOAD_DIR", tmp_path)
+    monkeypatch.setattr(cleanup, "COOKIE_DIR_MAX_AGE_SEC", 1800)
+    other_dir = tmp_path / "some_other_dir"
+    other_dir.mkdir()
+
+    removed = cleanup.sweep_once(max_age_minutes=10, now=time.time() + TWO_MONTHS)
+
+    assert removed == 0
+    assert other_dir.is_dir()
+
+
+def test_cookie_dir_threshold_is_derived_from_download_timeout():
+    """Пин самой формулы, а не только ветвления sweep_once.
+
+    Все тесты выше monkeypatch-ят COOKIE_DIR_MAX_AGE_SEC и потому не замечают,
+    если реальную формулу в cleanup.py подменят на max_age_minutes*60 (10 мин,
+    тот самый баг, которого всё ТЗ просило избежать). Порог кук обязан быть
+    выведен из DOWNLOAD_TIMEOUT и быть строго больше 10 минут, иначе
+    подметальщик срежет куки у ещё идущей загрузки (DOWNLOAD_TIMEOUT 15 мин).
+    """
+    assert cleanup.COOKIE_DIR_MAX_AGE_SEC == cleanup.settings.DOWNLOAD_TIMEOUT * 2
+    assert cleanup.COOKIE_DIR_MAX_AGE_SEC > 10 * 60
 
 
 def test_sweep_returns_zero_when_directory_absent(tmp_path, monkeypatch):

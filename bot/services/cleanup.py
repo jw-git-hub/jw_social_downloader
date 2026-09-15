@@ -2,12 +2,23 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import time
 from pathlib import Path
 
 from loguru import logger
 
-DOWNLOAD_DIR = Path("/tmp/jw_downloads")
+from bot.config import settings
+
+DOWNLOAD_DIR = Path(settings.DOWNLOAD_ROOT)
+
+# Каталог кук живёт ровно столько, сколько идёт загрузка. Берём двойной
+# DOWNLOAD_TIMEOUT: всё, что старше, гарантированно осиротело — процесс,
+# который его создал, уже не может быть жив. Общий max_age_minutes здесь не
+# годится: по умолчанию он 10 минут против 15-минутного DOWNLOAD_TIMEOUT, и
+# подметальщик срезал бы куки у идущей загрузки.
+COOKIE_DIR_PREFIX = "jw_cookies_"
+COOKIE_DIR_MAX_AGE_SEC = settings.DOWNLOAD_TIMEOUT * 2
 
 
 async def remove_file(path: str | Path) -> None:
@@ -51,6 +62,19 @@ def sweep_once(max_age_minutes: int, now: float | None = None) -> int:
 
     for entry in DOWNLOAD_DIR.iterdir():
         try:
+            if entry.is_dir():
+                # Осиротевшие каталоги _ephemeral_cookies (downloader.py):
+                # переживают только жёсткое убийство процесса (docker kill,
+                # OOM-kill, отключение питания), поэтому свой, более широкий
+                # порог — см. COOKIE_DIR_MAX_AGE_SEC. Любой другой каталог
+                # по-прежнему не трогаем.
+                if not entry.name.startswith(COOKIE_DIR_PREFIX):
+                    continue
+                if (now - _landed_at(entry)) <= COOKIE_DIR_MAX_AGE_SEC:
+                    continue
+                shutil.rmtree(entry, ignore_errors=True)
+                removed += 1
+                continue
             if not entry.is_file():
                 continue
             if (now - _landed_at(entry)) <= max_age_sec:

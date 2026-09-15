@@ -17,7 +17,7 @@ from loguru import logger
 from bot.config import settings
 from bot.utils.log_guard import mask_secrets
 
-DOWNLOAD_DIR = Path("/tmp/jw_downloads")
+DOWNLOAD_DIR = Path(settings.DOWNLOAD_ROOT)
 VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".mov", ".m4v"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".heic"}
 # .gif вынесен из изображений: sendPhoto/InputMediaPhoto сохраняет только первый
@@ -288,14 +288,16 @@ def _ephemeral_cookies() -> Iterator[Path | None]:
         yield None
         return
 
-    # Каталог кладём ВНУТРИ DOWNLOAD_DIR: он смонтирован как tmpfs, то есть
-    # живёт в памяти. Дефолтный /tmp контейнера — обычный слой на флеше
-    # (eMMC), и копия боевых кук пережила бы там `docker kill` и внезапное
-    # пропадание питания. Отдельного подметальщика для этих каталогов
-    # сознательно нет: `finally` ниже отрабатывает и на исключении, и на
-    # таймауте, а подметальщик, не различающий «каталог занят прямо сейчас»
-    # и «осиротел», убил бы куки у параллельной загрузки (семафор разрешает
-    # три одновременно).
+    # Каталог кладём ВНУТРИ DOWNLOAD_DIR: он смонтирован с хоста на диск
+    # (/mnt/storage), а не держится в оперативной памяти, поэтому
+    # единственная защита от утечки копии боевых кук — гарантированная
+    # подчистка. `finally` ниже отрабатывает на исключении и на таймауте, но
+    # НЕ на жёстком убийстве процесса (docker kill, OOM-kill, отключение
+    # питания) — тогда каталог осиротеет и останется на диске. От этого
+    # случая защищает подметальщик (bot/services/cleanup.py): он подбирает
+    # каталоги `jw_cookies_*` по возрасту, используя отдельный порог
+    # `cleanup.COOKIE_DIR_MAX_AGE_SEC` (не общий max_age_minutes), чтобы не
+    # снести куки у ещё идущей загрузки.
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     tmp_dir = Path(tempfile.mkdtemp(prefix="jw_cookies_", dir=DOWNLOAD_DIR))
     try:

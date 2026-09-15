@@ -58,3 +58,18 @@ def test_download_root_default_matches_the_shared_mount_path():
     from bot.config import Settings
 
     assert Settings.model_fields["DOWNLOAD_ROOT"].default == "/srv/jw_downloads"
+
+
+def test_downloader_and_cleanup_use_the_configured_download_root():
+    # DOWNLOAD_DIR в обоих модулях обязан читаться из settings.DOWNLOAD_ROOT,
+    # а не быть захардкожен отдельно — иначе они снова могут разъехаться
+    # (как это было с /tmp/jw_downloads, который физически не совпадал с
+    # каталогом, ожидаемым telegram-bot-api).
+    from pathlib import Path
+
+    import bot.services.cleanup as cleanup
+    import bot.services.downloader as downloader
+    from bot.config import settings
+
+    assert downloader.DOWNLOAD_DIR == Path(settings.DOWNLOAD_ROOT)
+    assert cleanup.DOWNLOAD_DIR == Path(settings.DOWNLOAD_ROOT)
