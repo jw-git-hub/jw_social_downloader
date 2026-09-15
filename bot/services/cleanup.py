@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import shutil
 import time
@@ -19,6 +20,44 @@ DOWNLOAD_DIR = Path(settings.DOWNLOAD_ROOT)
 # подметальщик срезал бы куки у идущей загрузки.
 COOKIE_DIR_PREFIX = "jw_cookies_"
 COOKIE_DIR_MAX_AGE_SEC = settings.DOWNLOAD_TIMEOUT * 2
+
+# Общий порог подметальщика ОБЯЗАН быть строго больше DOWNLOAD_TIMEOUT,
+# выраженного в минутах — иначе загрузка, идущая дольше порога, подметается
+# у себя из-под ног (H-находка ревизии 2026-09-12: __main__.py звал
+# periodic_cleanup() без аргументов, брались умолчания сигнатуры 5/10 минут,
+# и CLEANUP_MAX_AGE_MIN=45 из настроек не использовался вообще). 45 > 15
+# сейчас сходится, но это совпадение конфигурации, а не гарантия: подними
+# владелец DOWNLOAD_TIMEOUT — и дефект вернётся молча. Поэтому эффективный
+# порог всегда ПЕРЕСЧИТЫВАЕТСЯ как max(настройка, 2×таймаута) — та же схема
+# защиты, что уже применена к COOKIE_DIR_MAX_AGE_SEC несколькими строками
+# выше, один источник правды (DOWNLOAD_TIMEOUT).
+
+
+def _effective_cleanup_max_age_min(configured_min: int, timeout_sec: int) -> int:
+    """Формула инварианта, вынесенная отдельной функцией ради юнит-теста на
+    произвольных значениях (а не только на текущих settings). math.ceil — на
+    случай, если DOWNLOAD_TIMEOUT не кратен 60 секундам: без округления вверх
+    «дважды таймаут в минутах» мог бы оказаться меньше самого таймаута из-за
+    отбрасывания дробной части.
+    """
+    timeout_min = math.ceil(timeout_sec / 60)
+    return max(configured_min, timeout_min * 2)
+
+
+EFFECTIVE_CLEANUP_MAX_AGE_MIN = _effective_cleanup_max_age_min(
+    settings.CLEANUP_MAX_AGE_MIN, settings.DOWNLOAD_TIMEOUT
+)
+if EFFECTIVE_CLEANUP_MAX_AGE_MIN != settings.CLEANUP_MAX_AGE_MIN:
+    # Не молчим: если это когда-нибудь сработает, владелец должен увидеть
+    # причину в логе при следующем перезапуске, а не гадать, почему уборка
+    # стала реже.
+    logger.warning(
+        "CLEANUP_MAX_AGE_MIN={} мин слишком мал для DOWNLOAD_TIMEOUT={}с; "
+        "используется пересчитанный порог {} мин",
+        settings.CLEANUP_MAX_AGE_MIN,
+        settings.DOWNLOAD_TIMEOUT,
+        EFFECTIVE_CLEANUP_MAX_AGE_MIN,
+    )
 
 
 async def remove_file(path: str | Path) -> None:
@@ -90,7 +129,9 @@ def sweep_once(max_age_minutes: int, now: float | None = None) -> int:
     return removed
 
 
-async def periodic_cleanup(interval_minutes: int = 5, max_age_minutes: int = 10) -> None:
+async def periodic_cleanup(
+    interval_minutes: int = 5, max_age_minutes: int = EFFECTIVE_CLEANUP_MAX_AGE_MIN
+) -> None:
     while True:
         await asyncio.sleep(interval_minutes * 60)
         try:

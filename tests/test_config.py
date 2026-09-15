@@ -1,3 +1,9 @@
+import re
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
 def test_new_transport_settings_have_expected_defaults():
     from bot.config import settings
 
@@ -73,3 +79,52 @@ def test_downloader_and_cleanup_use_the_configured_download_root():
 
     assert downloader.DOWNLOAD_DIR == Path(settings.DOWNLOAD_ROOT)
     assert cleanup.DOWNLOAD_DIR == Path(settings.DOWNLOAD_ROOT)
+
+
+def test_max_file_size_env_var_overrides_the_code_default(monkeypatch):
+    """Предохранитель (владелец, 2026-09-15): пока транспорт — облачный Bot
+    API с потолком 50 МБ, .env на хосте временно выставляет
+    MAX_FILE_SIZE_MB=50 поверх целевого дефолта 1500 из bot/config.py
+    (тот дефолт поднят заранее под Tasks 12/13 и пином отдельным тестом
+    test_size_and_timeout_raised_for_local_api — трогать его нельзя).
+
+    .env — вне git и не копируется в тестовый образ (.dockerignore), поэтому
+    сам файл здесь не проверить. Но docker-compose подаёт его строки как
+    ОБЫЧНЫЕ переменные окружения процесса (env_file), и именно этот механизм
+    здесь проверяется по факту прогона Settings, а не предполагается."""
+    monkeypatch.delenv("MAX_FILE_SIZE_MB", raising=False)
+    from bot.config import Settings
+
+    assert Settings().MAX_FILE_SIZE_MB == 1500
+
+    monkeypatch.setenv("MAX_FILE_SIZE_MB", "50")
+    assert Settings().MAX_FILE_SIZE_MB == 50
+
+
+def test_cloud_api_safety_valve_stays_until_local_bot_api_migration():
+    """Тройной предохранитель Task 2/12/13 на время переходного периода:
+    MAX_FILE_SIZE_MB в коде уже поднят до 1500 (целевое значение под
+    локальный telegram-bot-api), но транспорт всё ещё ОБЛАЧНЫЙ Bot API с
+    жёстким потолком 50 МБ. Пока bot/__main__.py не строит клиента к
+    локальному серверу (TelegramAPIServer / Bot(..., api=...) — Tasks
+    12/13), .env обязан держать временное значение 50, и это отражено в
+    .env.example.
+
+    Тест ЕСТЕСТВЕННО покраснеет, когда Tasks 12/13 добавят локальный Bot API
+    в __main__.py — это СИГНАЛ снять предохранитель (вернуть .env
+    MAX_FILE_SIZE_MB на 1500) и обновить/удалить сам тест, а не поломка,
+    которую нужно чинить в коде.
+    """
+    main_source = (ROOT / "bot" / "__main__.py").read_text(encoding="utf-8")
+    migrated = "TelegramAPIServer" in main_source or re.search(r"\bapi\s*=\s*\w", main_source)
+    assert not migrated, (
+        "локальный Bot API уже подключен в __main__.py — самое время убрать "
+        "временный предохранитель MAX_FILE_SIZE_MB=50 из .env (вернуть 1500) "
+        "и актуализировать/удалить этот тест"
+    )
+
+    example = (ROOT / ".env.example").read_text(encoding="utf-8")
+    assert "MAX_FILE_SIZE_MB=50" in example, (
+        "временное значение предохранителя (50) должно быть видно в "
+        ".env.example, пока транспорт — облачный Bot API"
+    )

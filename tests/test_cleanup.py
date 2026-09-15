@@ -1,12 +1,15 @@
 import asyncio
 import os
+import re
 import time
+from pathlib import Path
 
 import pytest
 
 from bot.services import cleanup
 
 TWO_MONTHS = 60 * 60 * 24 * 60
+ROOT = Path(__file__).resolve().parent.parent
 
 
 def test_file_with_backdated_mtime_is_not_swept(tmp_path, monkeypatch):
@@ -158,6 +161,70 @@ async def test_remove_file_does_not_log_error_for_already_gone_file(tmp_path):
 
     assert records, "ожидалась хотя бы одна запись в лог"
     assert all(r["level"].name != "ERROR" for r in records)
+
+
+def test_effective_cleanup_threshold_formula_always_exceeds_the_timeout():
+    """Пин инварианта, а не только текущих чисел: эффективный порог обязан
+    оставаться строго больше DOWNLOAD_TIMEOUT (в минутах) для ЛЮБОГО таймаута,
+    а не только для сегодняшних 900с/45мин. Проверяем саму формулу
+    `_effective_cleanup_max_age_min`, а не производный от неё константный
+    атрибут модуля — так тест ловит регресс формулы независимо от текущих
+    значений settings."""
+    for timeout_sec in (60, 599, 900, 1800, 2401, 3600):
+        eff = cleanup._effective_cleanup_max_age_min(10, timeout_sec)
+        assert eff * 60 > timeout_sec, (
+            f"эффективный порог {eff} мин не строго больше таймаута {timeout_sec}с"
+        )
+
+
+def test_effective_cleanup_threshold_self_heals_when_configured_value_is_too_low():
+    """Если владелец поднимет DOWNLOAD_TIMEOUT, не тронув CLEANUP_MAX_AGE_MIN,
+    дефект ревизии 2026-09-12 обязан не вернуться молча: эффективный порог
+    должен ПЕРЕСЧИТАТЬСЯ вверх, а не остаться заниженной настройкой."""
+    # DOWNLOAD_TIMEOUT поднят до 40 минут; настройка 45 мин этого больше не
+    # покрывает (45 < 80) — формула обязана поднять эффективный порог до 80.
+    assert cleanup._effective_cleanup_max_age_min(45, 2400) == 80
+    # А если настройка и так с запасом (45 мин при таймауте 15 мин) — трогать
+    # её не нужно, эффективный порог остаётся равен настройке.
+    assert cleanup._effective_cleanup_max_age_min(45, 900) == 45
+
+
+def test_module_level_effective_threshold_matches_current_settings():
+    """Пин связки модульной константы с текущими settings (а не только
+    формулы в вакууме): EFFECTIVE_CLEANUP_MAX_AGE_MIN обязан быть тем же
+    значением, что формула даёт для реальных CLEANUP_MAX_AGE_MIN/
+    DOWNLOAD_TIMEOUT, и обязан быть строго больше DOWNLOAD_TIMEOUT в минутах
+    прямо сейчас."""
+    expected = cleanup._effective_cleanup_max_age_min(
+        cleanup.settings.CLEANUP_MAX_AGE_MIN, cleanup.settings.DOWNLOAD_TIMEOUT
+    )
+    assert cleanup.EFFECTIVE_CLEANUP_MAX_AGE_MIN == expected
+    assert cleanup.EFFECTIVE_CLEANUP_MAX_AGE_MIN * 60 > cleanup.settings.DOWNLOAD_TIMEOUT
+
+
+def test_periodic_cleanup_default_is_the_effective_threshold_not_a_bare_ten():
+    """Регресс-стража сигнатуры: дефолт `max_age_minutes` в periodic_cleanup
+    обязан быть EFFECTIVE_CLEANUP_MAX_AGE_MIN, а не захардкоженные 10 минут
+    (то самое умолчание, из-за которого CLEANUP_MAX_AGE_MIN=45 не работал)."""
+    import inspect
+
+    default = inspect.signature(cleanup.periodic_cleanup).parameters["max_age_minutes"].default
+    assert default == cleanup.EFFECTIVE_CLEANUP_MAX_AGE_MIN
+
+
+def test_main_calls_periodic_cleanup_with_an_explicit_threshold():
+    """H-находка ревизии 2026-09-12: `__main__.py` звал `periodic_cleanup()`
+    БЕЗ аргументов, поэтому CLEANUP_MAX_AGE_MIN=45 никогда не участвовал в
+    уборке и брались умолчания сигнатуры (5/10 минут) — при DOWNLOAD_TIMEOUT
+    900с (15 минут) это подметает ещё идущую загрузку. Тест читает исходник
+    __main__.py напрямую: если кто-то снова напишет `periodic_cleanup()` без
+    аргументов, это должно упасть здесь, а не выясниться в проде."""
+    source = (ROOT / "bot" / "__main__.py").read_text(encoding="utf-8")
+    assert re.search(r"periodic_cleanup\(\s*\)", source) is None, (
+        "periodic_cleanup() вызван без аргументов — CLEANUP_MAX_AGE_MIN снова "
+        "не будет использоваться"
+    )
+    assert "max_age_minutes=EFFECTIVE_CLEANUP_MAX_AGE_MIN" in source
 
 
 async def test_periodic_cleanup_survives_a_failing_pass(tmp_path, monkeypatch):

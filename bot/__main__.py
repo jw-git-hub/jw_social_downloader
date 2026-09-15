@@ -11,7 +11,7 @@ from bot.config import settings
 from bot.db.engine import init_db
 from bot.handlers import admin_router, user_router
 from bot.middlewares.throttle import ThrottleMiddleware
-from bot.services.cleanup import periodic_cleanup
+from bot.services.cleanup import EFFECTIVE_CLEANUP_MAX_AGE_MIN, periodic_cleanup
 from bot.utils.log_guard import setup_logging
 
 
@@ -102,7 +102,14 @@ async def main() -> None:
         else:
             logger.error("Cleanup task exited unexpectedly")
 
-    _cleanup_task = asyncio.create_task(periodic_cleanup())  # noqa: F841
+    # Явный max_age_minutes, а не умолчание сигнатуры: раньше periodic_cleanup
+    # звался вовсе без аргументов, брались умолчания 5/10 минут, и настройка
+    # CLEANUP_MAX_AGE_MIN=45 не участвовала вовсе (H-находка ревизии 2026-09-12).
+    # EFFECTIVE_CLEANUP_MAX_AGE_MIN, а не «сырой» settings.CLEANUP_MAX_AGE_MIN —
+    # он же гарантированно больше DOWNLOAD_TIMEOUT (см. bot/services/cleanup.py).
+    _cleanup_task = asyncio.create_task(
+        periodic_cleanup(max_age_minutes=EFFECTIVE_CLEANUP_MAX_AGE_MIN)
+    )  # noqa: F841
     _cleanup_task.add_done_callback(_log_task_death)
 
     await bot.set_my_commands([
