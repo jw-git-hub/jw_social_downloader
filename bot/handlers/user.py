@@ -44,6 +44,7 @@ from bot.keyboards.inline import (
 )
 from bot.services.cleanup import remove_file
 from bot.services.downloader import download_media
+from bot.utils.text import esc
 from bot.utils.url_parser import parse_url
 
 router = Router(name="user")
@@ -69,6 +70,39 @@ WELCOME_TEXT = (
 
 def _is_admin(user_id: int) -> bool:
     return user_id == settings.ADMIN_ID
+
+
+def _payment_details_text() -> str:
+    """Экран реквизитов. Все три значения приходят из .env и экранируются:
+    «NGUYEN VAN A & CO» в сыром HTML роняет экран у всех пользователей."""
+    return (
+        "🏦 <b>Реквизиты для оплаты:</b>\n\n"
+        f"💎 <b>USDT (TRC20):</b>\n<code>{esc(settings.USDT_TRC20_ADDRESS)}</code>\n\n"
+        f"🇻🇳 <b>VN Bank:</b>\n<code>{esc(settings.VN_BANK_DETAILS)}</code>\n\n"
+        f"🇹🇭 <b>TH Bank:</b>\n<code>{esc(settings.TH_BANK_DETAILS)}</code>\n\n"
+        "📩 После оплаты отправь скриншот администратору 👇"
+    )
+
+
+def _support_text() -> str:
+    return (
+        "✉️ <b>Связь с администратором</b>\n\n"
+        f"Напиши администратору: {esc(settings.ADMIN_USERNAME)}\n\n"
+        "Отправь ему скриншот оплаты или опиши проблему."
+    )
+
+
+def _download_failed_text(error_message: str | None) -> str:
+    """error_message приходит из загрузчика УЖЕ экранированным
+    (downloader.py:77 и :443 прогоняют текст через html.escape).
+    Экранировать второй раз нельзя — пользователь увидит «&amp;lt;»."""
+    return f"❌ <b>Не удалось скачать</b>\n{error_message or 'Причина неизвестна'}"
+
+
+def _media_caption(platform: str, kind: str) -> str:
+    """Подпись к отправляемому медиа. kind: "video" | "image" | "animation" | "album"."""
+    titles = {"video": "Видео", "image": "Фото", "animation": "GIF", "album": "Медиа"}
+    return f"✅ {titles.get(kind, 'Медиа')} из {esc(platform.capitalize())}"
 
 
 def _url_for_log(url: str) -> str:
@@ -301,11 +335,7 @@ async def cb_pay_details(callback: CallbackQuery) -> None:
     await callback.answer()
     await _safe_edit(
         callback,
-        "🏦 <b>Реквизиты для оплаты:</b>\n\n"
-        f"💎 <b>USDT (TRC20):</b>\n<code>{settings.USDT_TRC20_ADDRESS}</code>\n\n"
-        f"🇻🇳 <b>VN Bank:</b>\n<code>{settings.VN_BANK_DETAILS}</code>\n\n"
-        f"🇹🇭 <b>TH Bank:</b>\n<code>{settings.TH_BANK_DETAILS}</code>\n\n"
-        "📩 После оплаты отправь скриншот администратору 👇",
+        _payment_details_text(),
         reply_markup=get_payment_details_kb(is_admin=_is_admin(callback.from_user.id)),
     )
 
@@ -315,9 +345,7 @@ async def cb_support(callback: CallbackQuery) -> None:
     await callback.answer()
     await _safe_edit(
         callback,
-        "✉️ <b>Связь с администратором</b>\n\n"
-        f"Напиши администратору: {settings.ADMIN_USERNAME}\n\n"
-        "Отправь ему скриншот оплаты или опиши проблему.",
+        _support_text(),
         reply_markup=get_back_to_menu_kb(is_admin=_is_admin(callback.from_user.id)),
     )
 
@@ -450,9 +478,7 @@ async def handle_url(message: Message) -> None:
                 "Не удалось записать лог загрузки | user={} error={}", db_user_id, log_exc
             )
         try:
-            await status_msg.edit_text(
-                f"❌ <b>Не удалось скачать</b>\n{dl_result.error_message}"
-            )
+            await status_msg.edit_text(_download_failed_text(dl_result.error_message))
         except (TelegramBadRequest, TelegramForbiddenError):
             pass
         return
@@ -476,7 +502,7 @@ async def handle_url(message: Message) -> None:
             # F11: Telegram отклоняет фото > 10 МБ и НЕ допускает смешивания
             # документов с фото/видео в одной media group. Поэтому крупные
             # изображения вынимаем из группы и шлём отдельными документами.
-            caption = f"✅ Медиа из {platform.capitalize()}"
+            caption = _media_caption(platform, "album")
             total = len(dl_result.file_paths)
             first_media_captioned = False
             for chunk_start in range(0, total, MEDIA_GROUP_CHUNK_SIZE):
@@ -540,19 +566,19 @@ async def handle_url(message: Message) -> None:
                 if dl_result.file_size_mb and dl_result.file_size_mb > 10:
                     await _send_with_retry(
                         lambda: message.reply_document(
-                            document=media, caption=f"✅ Фото из {platform.capitalize()}"
+                            document=media, caption=_media_caption(platform, "image")
                         )
                     )
                 else:
                     await _send_with_retry(
                         lambda: message.reply_photo(
-                            photo=media, caption=f"✅ Фото из {platform.capitalize()}"
+                            photo=media, caption=_media_caption(platform, "image")
                         )
                     )
             else:
                 await _send_with_retry(
                     lambda: message.reply_video(
-                        video=media, caption=f"✅ Видео из {platform.capitalize()}"
+                        video=media, caption=_media_caption(platform, "video")
                     )
                 )
             media_sent_count = 1
