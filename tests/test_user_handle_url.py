@@ -76,15 +76,16 @@ class _FakeMessage:
 
     def __init__(
         self,
-        text: str,
+        text: str | None,
         uid: int,
         *,
+        caption: str | None = None,
         reply_raises: Exception | None = None,
         status_edit_raises: Exception | None = None,
         status_delete_raises: Exception | None = None,
     ) -> None:
         self.text = text
-        self.caption = None
+        self.caption = caption
         self.from_user = _FakeUser(uid)
         self.reply_calls: list[str] = []
         self.answer_calls: list[tuple[str, object]] = []
@@ -517,6 +518,100 @@ async def test_forbidden_during_send_triggers_refund(monkeypatch, sqlite_engine_
         assert info_calls, "штатная блокировка должна залогироваться на уровне INFO"
     finally:
         await engine.dispose()
+
+
+# ── Fix round 1 (Task 27+28 review), Important #1: M-2 полностью откатим —
+# полный прогон остаётся зелёным ──
+#
+# Ревьюер тремя мутациями (декоратор обратно на F.text; удаление ветки
+# "message.text is None -> return"; parse_url(message.text or "") вместо
+# parse_url(_incoming_text(message))) откатил весь M-2 и получил 369 passed:
+# все тесты этого файла вызывают U.handle_url(msg) напрямую, минуя
+# зарегистрированный на роутере фильтр декоратора, а FakeMessage до этого
+# раунда всегда имел caption=None — сообщение "фото с подписью-ссылкой"
+# ни разу не было собрано.
+#
+# Способ проверки фильтра декоратора: router.message — TelegramEventObserver
+# (aiogram 3.26), handler.callback хранит исходную функцию как есть, поэтому
+# можно найти HandlerObject по identity (`is U.handle_url`) и вызвать его
+# `await handler.check(fake_message)` — это ровно тот код, которым
+# aiogram.Dispatcher решает, доходит ли обновление до handle_url, без
+# необходимости гонять полноценный Dispatcher/Bot. Альтернатива (собрать
+# настоящий aiogram.types.Message и прогнать через dp.feed_update) даёт то
+# же самое покрытие фильтра при значительно большей стоимости фикстуры —
+# выбран более простой инструмент с тем же диагностическим свойством.
+
+
+def _handle_url_handler():
+    for handler in U.router.message.handlers:
+        if handler.callback is U.handle_url:
+            return handler
+    raise AssertionError("handle_url не зарегистрирован на router.message")
+
+
+async def test_handle_url_router_filter_matches_caption_only_message():
+    """Мутация 1 (`F.text | F.caption` -> `F.text`): без подписи в фильтре
+    сообщение с caption и без text не дойдёт до handle_url на живом роутере,
+    хотя прямой вызов U.handle_url(msg) в тестах ниже это не заметит."""
+    handler = _handle_url_handler()
+
+    matched, _data = await handler.check(
+        _FakeMessage(None, 1, caption="смотри https://vt.tiktok.com/abc")
+    )
+
+    assert matched is True
+
+
+async def test_handle_url_downloads_link_from_caption_when_text_is_empty(
+    monkeypatch, sqlite_engine_factory, tmp_path
+):
+    """Мутация 3 (`parse_url(message.text or "")` вместо
+    `parse_url(_incoming_text(message))`): подпись к фото со ссылкой должна
+    доходить до резервирования квоты и вызова download_media, даже когда
+    `.text` пуст (это ровно ситуация "фото с ссылкой в подписи")."""
+    maker, engine = await _make_session_maker(sqlite_engine_factory, tmp_path, "caption_link.db")
+    try:
+        uid = 800000014
+        await _seed_user(maker, id=uid, free_downloads_left=1)
+        monkeypatch.setattr(U, "async_session", maker)
+
+        download_calls: list[tuple[str, str]] = []
+
+        async def _ok(url, platform):
+            download_calls.append((url, platform))
+            return DownloadResult(
+                success=True,
+                file_path="/tmp/does-not-exist.mp4",
+                media_type="video",
+                file_size_mb=1.0,
+            )
+
+        monkeypatch.setattr(U, "download_media", _ok)
+
+        msg = _FakeMessage(None, uid, caption="смотри https://vt.tiktok.com/abc")
+        await U.handle_url(msg)
+
+        assert download_calls, "download_media должен быть вызван по ссылке из подписи"
+        assert download_calls[0][1] == "tiktok"
+        # Квота честно зарезервирована и потрачена (медиа доставлено).
+        assert await _free_downloads_left(maker, uid) == 0
+    finally:
+        await engine.dispose()
+
+
+async def test_handle_url_silently_ignores_caption_without_link_when_not_waiting():
+    """Мутация 2 (удаление ветки `if message.text is None: return`): фото без
+    ссылки в подписи, когда пользователь НЕ в режиме ожидания ссылки, не
+    должно провоцировать ответ главным меню на каждое пересланное фото —
+    бот должен промолчать (ни answer, ни reply)."""
+    uid = 800000015
+    U.waiting_for_url.discard(uid)  # изоляция от других тестов файла
+
+    msg = _FakeMessage(None, uid, caption="просто отпуск, без единой ссылки")
+    await U.handle_url(msg)
+
+    assert msg.answer_calls == []
+    assert msg.reply_calls == []
 
 
 # ── Fix round 3: query-строка с секретом не должна уходить в лог ──
