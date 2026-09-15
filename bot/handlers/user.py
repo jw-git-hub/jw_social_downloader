@@ -54,18 +54,61 @@ waiting_for_url: set[int] = set()
 MEDIA_GROUP_CHUNK_SIZE = 5  # Telegram допускает до 10, но большие чанки (~10 МБ) вызывают таймауты
 SEND_RETRY_DELAYS = (2, 5, 10)  # экспоненциальный backoff между повторными попытками отправки
 
-WELCOME_TEXT = (
-    "👋 <b>Добро пожаловать!</b>\n\n"
-    "Я — бот для скачивания видео из соцсетей.\n\n"
-    "🌐 <b>Поддерживаемые платформы:</b>\n"
-    "├ 📸 Instagram\n"
-    "├ 🎵 TikTok\n"
-    "├ 📘 Facebook\n"
-    "├ 📌 Pinterest\n"
-    "└ 📺 YouTube\n\n"
-    "🎁 У тебя <b>3 бесплатных</b> скачивания.\n\n"
-    "Выбери действие 👇"
-)
+def _quota_line(free_left: int, has_subscription: bool) -> str:
+    """Одна строка о правах пользователя. Раньше здесь была захардкоженная
+    тройка, которую читали и исчерпавший квоту, и платящий подписчик."""
+    if has_subscription:
+        return "👑 Подписка активна — скачивай без ограничений."
+    if free_left > 0:
+        return f"🎁 Осталось бесплатных: <b>{free_left} из {settings.FREE_DOWNLOADS}</b>."
+    return "🚫 Бесплатные скачивания закончились — нужна подписка."
+
+
+def _welcome_text(free_left: int, has_subscription: bool) -> str:
+    return (
+        "👋 <b>Добро пожаловать!</b>\n\n"
+        "Я — бот для скачивания видео из соцсетей.\n\n"
+        "🌐 <b>Поддерживаемые платформы:</b>\n"
+        "├ 📸 Instagram\n"
+        "├ 🎵 TikTok\n"
+        "├ 📘 Facebook\n"
+        "├ 📌 Pinterest\n"
+        "└ 📺 YouTube\n\n"
+        f"{_quota_line(free_left, has_subscription)}\n\n"
+        "Выбери действие 👇"
+    )
+
+
+def _help_text(free_left: int, has_subscription: bool) -> str:
+    return (
+        "📖 <b>Как пользоваться ботом:</b>\n\n"
+        "1️⃣ Нажми <b>«Скачать видео»</b>\n"
+        "2️⃣ Отправь ссылку на видео\n"
+        "3️⃣ Дождись файла — длинное видео в высоком качестве качается минутами\n\n"
+        "🌐 <b>Платформы:</b> Instagram, TikTok, Facebook, Pinterest, YouTube\n\n"
+        f"{_quota_line(free_left, has_subscription)}"
+    )
+
+
+def _status_text(
+    free_left: int, has_subscription: bool, sub_until, total_downloads: int
+) -> str:
+    if has_subscription and sub_until is not None:
+        sub_text = "✅ до " + sub_until.strftime("%d.%m.%Y")
+    else:
+        sub_text = "❌ Не активна"
+    return (
+        f"📊 <b>Твой профиль:</b>\n\n"
+        f"🎟 Осталось бесплатных: <b>{free_left} из {settings.FREE_DOWNLOADS}</b>\n"
+        f"👑 Подписка: <b>{sub_text}</b>\n"
+        f"📥 Всего скачано: <b>{total_downloads}</b>"
+    )
+
+
+def _incoming_text(message) -> str:
+    """Текст сообщения или подпись к медиа. Раньше хендлер смотрел только
+    в .text, поэтому бот молчал на фото со ссылкой в подписи."""
+    return message.text or message.caption or ""
 
 
 def _is_admin(user_id: int) -> bool:
@@ -231,6 +274,17 @@ async def _reserve_quota(session, tg_user) -> tuple[int, bool, bool, bool]:
     return db_user_id, is_banned, has_subscription, reserved
 
 
+async def _user_quota_state(tg_user) -> tuple[int, bool]:
+    """(остаток бесплатных, активна ли подписка) — одна короткая транзакция."""
+    async with async_session() as session, session.begin():
+        user = await get_or_create_user(session, tg_user)
+        sub_until = user.subscription_until
+        if sub_until and sub_until.tzinfo is None:
+            sub_until = sub_until.replace(tzinfo=timezone.utc)
+        has_subscription = bool(sub_until and sub_until > datetime.now(timezone.utc))
+        return user.free_downloads_left, has_subscription
+
+
 def _quota_action(reserved: bool, download_ok: bool, media_sent_count: int) -> str:
     """Что сделать с зарезервированной единицей: "keep" или "refund".
 
@@ -262,18 +316,25 @@ async def _refund_quota(db_user_id: int) -> None:
 
 @router.message(Command("start"))
 async def cmd_start(message: Message) -> None:
-    async with async_session() as session, session.begin():
-        await get_or_create_user(session, message.from_user)
+    free_left, has_subscription = await _user_quota_state(message.from_user)
     is_admin = _is_admin(message.from_user.id)
-    await message.answer(WELCOME_TEXT, reply_markup=get_main_menu_kb(is_admin=is_admin))
+    await message.answer(
+        _welcome_text(free_left, has_subscription),
+        reply_markup=get_main_menu_kb(is_admin=is_admin),
+    )
 
 
 @router.callback_query(F.data == "menu:main")
 async def cb_main_menu(callback: CallbackQuery) -> None:
     await callback.answer()
     waiting_for_url.discard(callback.from_user.id)
+    free_left, has_subscription = await _user_quota_state(callback.from_user)
     is_admin = _is_admin(callback.from_user.id)
-    await _safe_edit(callback, WELCOME_TEXT, reply_markup=get_main_menu_kb(is_admin=is_admin))
+    await _safe_edit(
+        callback,
+        _welcome_text(free_left, has_subscription),
+        reply_markup=get_main_menu_kb(is_admin=is_admin),
+    )
 
 
 @router.callback_query(F.data == "menu:download")
@@ -295,21 +356,17 @@ async def cb_status(callback: CallbackQuery) -> None:
     await callback.answer()
     async with async_session() as session, session.begin():
         user = await get_or_create_user(session, callback.from_user)
+        free_left = user.free_downloads_left
+        total_downloads = user.total_downloads
+        sub_until = user.subscription_until
 
-    sub_until = user.subscription_until
     if sub_until and sub_until.tzinfo is None:
         sub_until = sub_until.replace(tzinfo=timezone.utc)
-    if sub_until and sub_until > datetime.now(timezone.utc):
-        sub_text = "✅ до " + sub_until.strftime("%d.%m.%Y")
-    else:
-        sub_text = "❌ Не активна"
+    has_subscription = bool(sub_until and sub_until > datetime.now(timezone.utc))
 
     await _safe_edit(
         callback,
-        f"📊 <b>Твой профиль:</b>\n\n"
-        f"🎟 Бесплатных скачиваний: <b>{user.free_downloads_left}/{settings.FREE_DOWNLOADS}</b>\n"
-        f"👑 Подписка: <b>{sub_text}</b>\n"
-        f"📥 Всего скачано: <b>{user.total_downloads}</b>",
+        _status_text(free_left, has_subscription, sub_until, total_downloads),
         reply_markup=get_status_kb(is_admin=_is_admin(callback.from_user.id)),
     )
 
@@ -353,32 +410,36 @@ async def cb_support(callback: CallbackQuery) -> None:
 @router.callback_query(F.data == "menu:help")
 async def cb_help(callback: CallbackQuery) -> None:
     await callback.answer()
+    free_left, has_subscription = await _user_quota_state(callback.from_user)
     await _safe_edit(
         callback,
-        "📖 <b>Как пользоваться ботом:</b>\n\n"
-        "1️⃣ Нажми <b>«Скачать видео»</b>\n"
-        "2️⃣ Отправь ссылку на видео\n"
-        "3️⃣ Получи видео за секунды!\n\n"
-        "🌐 <b>Платформы:</b> Instagram, TikTok, Facebook, Pinterest, YouTube\n\n"
-        "🎁 <b>3 бесплатных</b> скачивания, далее — подписка.",
+        _help_text(free_left, has_subscription),
         reply_markup=get_help_kb(is_admin=_is_admin(callback.from_user.id)),
     )
 
 
-@router.message(F.text)
+@router.message(F.text | F.caption)
 async def handle_url(message: Message) -> None:
     user_id = message.from_user.id
-    result = parse_url(message.text)
+    result = parse_url(_incoming_text(message))
 
     if result is None and user_id in waiting_for_url:
         await message.answer(
-            "🔗 Это не похоже на ссылку. Отправь ссылку из Instagram, TikTok, Facebook, Pinterest или YouTube.",
-            reply_markup=get_back_to_menu_kb(is_admin=_is_admin(message.from_user.id)),
+            "🔗 Это не похоже на ссылку. Отправь ссылку из Instagram, TikTok, "
+            "Facebook, Pinterest или YouTube.",
+            reply_markup=get_back_to_menu_kb(is_admin=_is_admin(user_id)),
         )
         return
 
     if result is None:
-        await message.answer("Выбери действие 👇", reply_markup=get_main_menu_kb(is_admin=_is_admin(message.from_user.id)))
+        if message.text is None:
+            # Медиа без ссылки в подписи — молчим, чтобы не отвечать меню на
+            # каждое пересланное изображение.
+            return
+        await message.answer(
+            "Выбери действие 👇",
+            reply_markup=get_main_menu_kb(is_admin=_is_admin(user_id)),
+        )
         return
 
     url, platform = result
@@ -408,7 +469,7 @@ async def handle_url(message: Message) -> None:
     # мог заблокировать бота в ту же секунду — раньше единица терялась молча.
     try:
         status_msg = await message.reply(
-            "⏳ <b>Скачиваю медиа...</b>\nЭто займёт несколько секунд"
+            "⏳ <b>Скачиваю медиа...</b>\nБольшой файл может качаться несколько минут"
         )
     except Exception as e:
         # Fix round 2, N1: было (TelegramBadRequest, TelegramForbiddenError)

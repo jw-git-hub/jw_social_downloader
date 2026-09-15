@@ -84,6 +84,7 @@ class _FakeMessage:
         status_delete_raises: Exception | None = None,
     ) -> None:
         self.text = text
+        self.caption = None
         self.from_user = _FakeUser(uid)
         self.reply_calls: list[str] = []
         self.answer_calls: list[tuple[str, object]] = []
