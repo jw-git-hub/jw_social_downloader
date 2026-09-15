@@ -46,6 +46,7 @@ from bot.keyboards.inline import (
 )
 from bot.services.cleanup import remove_file
 from bot.services.downloader import ANIMATION_EXTS, IMAGE_EXTS, download_media
+from bot.services.media_probe import probe_media
 from bot.utils.text import esc
 from bot.utils.url_parser import parse_url
 
@@ -65,6 +66,12 @@ waiting_for_url: dict[int, float] = {}
 
 MEDIA_GROUP_CHUNK_SIZE = 5  # Telegram допускает до 10, но большие чанки (~10 МБ) вызывают таймауты
 SEND_RETRY_DELAYS = (2, 5, 10)  # экспоненциальный backoff между повторными попытками отправки
+
+# Беззвучное короткое видео — это «гифка»: в Telegram анимация и есть mp4 без
+# звука. Pinterest и подобные отдают такие ролики немыми, и с reply_video они
+# приходили плеером вместо зацикленной гифки. Потолок длительности нужен,
+# чтобы длинная немая запись не превратилась в автоплей-луп без управления.
+SILENT_VIDEO_AS_ANIMATION_MAX_SEC = 60.0
 
 def _quota_line(free_left: int, has_subscription: bool) -> str:
     """Одна строка о правах пользователя. Раньше здесь была захардкоженная
@@ -722,11 +729,37 @@ async def _process_download(message: Message, url: str, platform: str) -> None:
                         )
                     )
             else:
-                await _send_with_retry(
-                    lambda: message.reply_video(
-                        video=media, caption=_media_caption(platform, "video")
+                # Беззвучное короткое видео (например, Pinterest-пин) —
+                # фактически «гифка», и Telegram должен получить её через
+                # sendAnimation, а не sendVideo, иначе придёт плеер вместо
+                # зацикленного автоплея. ffprobe не должен уметь сломать
+                # отправку: любое исключение здесь равнозначно None.
+                try:
+                    probe_info = await probe_media(Path(dl_result.file_path))
+                except Exception as exc:
+                    logger.warning(
+                        "probe_media упал, отправляем как обычное видео | path={} error={}",
+                        dl_result.file_path, exc,
                     )
-                )
+                    probe_info = None
+
+                if (
+                    probe_info is not None
+                    and not probe_info.has_audio
+                    and 0 < probe_info.duration <= SILENT_VIDEO_AS_ANIMATION_MAX_SEC
+                    and Path(dl_result.file_path).suffix.lower() == ".mp4"
+                ):
+                    await _send_with_retry(
+                        lambda: message.reply_animation(
+                            animation=media, caption=_media_caption(platform, "animation")
+                        )
+                    )
+                else:
+                    await _send_with_retry(
+                        lambda: message.reply_video(
+                            video=media, caption=_media_caption(platform, "video")
+                        )
+                    )
             media_sent_count = 1
     except (TelegramNetworkError, TelegramRetryAfter, asyncio.TimeoutError, aiohttp.ClientError) as e:
         send_error = e
