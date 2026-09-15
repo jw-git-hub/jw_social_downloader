@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 from datetime import datetime, timezone
+from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
 import aiohttp
@@ -43,13 +45,23 @@ from bot.keyboards.inline import (
     get_status_kb,
 )
 from bot.services.cleanup import remove_file
-from bot.services.downloader import download_media
+from bot.services.downloader import ANIMATION_EXTS, IMAGE_EXTS, download_media
 from bot.utils.text import esc
 from bot.utils.url_parser import parse_url
 
 router = Router(name="user")
 download_semaphore = asyncio.Semaphore(3)
-waiting_for_url: set[int] = set()
+
+# Один пользователь — одна загрузка одновременно. Общего семафора на три слота
+# мало: троттл в 3 с позволяет занять все три за девять секунд на всю длину
+# загрузки (до DOWNLOAD_TIMEOUT), и остальные висят на «Скачиваю медиа...».
+MAX_CONCURRENT_PER_USER = 1
+user_active_downloads: dict[int, int] = {}
+
+# Кто нажал «Скачать видео» и ещё не прислал ссылку. Раньше был set, который
+# рос до конца жизни процесса: ушедшего пользователя из него ничто не убирало.
+WAITING_TTL = 3600.0
+waiting_for_url: dict[int, float] = {}
 
 MEDIA_GROUP_CHUNK_SIZE = 5  # Telegram допускает до 10, но большие чанки (~10 МБ) вызывают таймауты
 SEND_RETRY_DELAYS = (2, 5, 10)  # экспоненциальный backoff между повторными попытками отправки
@@ -113,6 +125,56 @@ def _incoming_text(message) -> str:
 
 def _is_admin(user_id: int) -> bool:
     return user_id == settings.ADMIN_ID
+
+
+def _classify(path_str: str) -> str:
+    """"animation" | "image" | "video" по расширению файла.
+
+    Расширения берутся из bot/services/downloader.py: раньше здесь был свой
+    кортеж без точек, и он разъехался с загрузчиком на .gif.
+    """
+    ext = Path(path_str).suffix.lower()
+    if ext in ANIMATION_EXTS:
+        return "animation"
+    if ext in IMAGE_EXTS:
+        return "image"
+    return "video"
+
+
+def _try_take_user_slot(user_id: int) -> bool:
+    """Занимает слот загрузки. False — у пользователя уже идёт загрузка."""
+    if user_active_downloads.get(user_id, 0) >= MAX_CONCURRENT_PER_USER:
+        return False
+    user_active_downloads[user_id] = user_active_downloads.get(user_id, 0) + 1
+    return True
+
+
+def _release_user_slot(user_id: int) -> None:
+    left = user_active_downloads.get(user_id, 0) - 1
+    if left > 0:
+        user_active_downloads[user_id] = left
+    else:
+        user_active_downloads.pop(user_id, None)
+
+
+def _mark_waiting(user_id: int) -> None:
+    """Отмечает ожидание ссылки и попутно вытесняет протухшие записи
+    (тот же приём, что в bot/middlewares/throttle.py:28-34)."""
+    now = time.monotonic()
+    waiting_for_url[user_id] = now
+    stale = [uid for uid, ts in waiting_for_url.items() if (now - ts) > WAITING_TTL]
+    for uid in stale:
+        del waiting_for_url[uid]
+
+
+def _is_waiting(user_id: int) -> bool:
+    ts = waiting_for_url.get(user_id)
+    if ts is None:
+        return False
+    if (time.monotonic() - ts) > WAITING_TTL:
+        del waiting_for_url[user_id]
+        return False
+    return True
 
 
 def _payment_details_text() -> str:
@@ -327,7 +389,7 @@ async def cmd_start(message: Message) -> None:
 @router.callback_query(F.data == "menu:main")
 async def cb_main_menu(callback: CallbackQuery) -> None:
     await callback.answer()
-    waiting_for_url.discard(callback.from_user.id)
+    waiting_for_url.pop(callback.from_user.id, None)
     free_left, has_subscription = await _user_quota_state(callback.from_user)
     is_admin = _is_admin(callback.from_user.id)
     await _safe_edit(
@@ -340,7 +402,7 @@ async def cb_main_menu(callback: CallbackQuery) -> None:
 @router.callback_query(F.data == "menu:download")
 async def cb_download(callback: CallbackQuery) -> None:
     await callback.answer()
-    waiting_for_url.add(callback.from_user.id)
+    _mark_waiting(callback.from_user.id)
     await _safe_edit(
         callback,
         "📥 <b>Скачивание видео</b>\n\n"
@@ -423,7 +485,7 @@ async def handle_url(message: Message) -> None:
     user_id = message.from_user.id
     result = parse_url(_incoming_text(message))
 
-    if result is None and user_id in waiting_for_url:
+    if result is None and _is_waiting(user_id):
         await message.answer(
             "🔗 Это не похоже на ссылку. Отправь ссылку из Instagram, TikTok, "
             "Facebook, Pinterest или YouTube.",
@@ -443,7 +505,22 @@ async def handle_url(message: Message) -> None:
         return
 
     url, platform = result
-    waiting_for_url.discard(user_id)
+    waiting_for_url.pop(user_id, None)
+
+    # Слот берём ДО резервирования квоты: отказ не должен стоить единицы.
+    if not _try_take_user_slot(user_id):
+        await message.reply(
+            "⏳ Я ещё качаю твою предыдущую ссылку. Дождись её и пришли следующую."
+        )
+        return
+    try:
+        await _process_download(message, url, platform)
+    finally:
+        _release_user_slot(user_id)
+
+
+async def _process_download(message: Message, url: str, platform: str) -> None:
+    user_id = message.from_user.id
 
     # C-1 шаг 1: одна короткая транзакция читает пользователя И резервирует
     # единицу квоты. Раньше остаток читался здесь, а списывался после аплоада.
@@ -555,40 +632,37 @@ async def handle_url(message: Message) -> None:
     # «Ошибка при отправке», хотя медиа уже было доставлено.
     try:
         if dl_result.file_paths and len(dl_result.file_paths) > 1:
-            # Множественные файлы (карусель) — отправляем media group чанками.
-            # Telegram limit: 10 items per media group, но чанки ближе к 10
-            # файлам/10 МБ вызывают таймауты при отправке, поэтому режем
-            # на чанки по MEDIA_GROUP_CHUNK_SIZE (5) элементов.
-            #
-            # F11: Telegram отклоняет фото > 10 МБ и НЕ допускает смешивания
-            # документов с фото/видео в одной media group. Поэтому крупные
-            # изображения вынимаем из группы и шлём отдельными документами.
+            # Карусель — media group чанками по MEDIA_GROUP_CHUNK_SIZE.
+            # Вне альбома идут: анимации (Telegram не смешивает их с фото и
+            # видео в одной группе) и изображения тяжелее 10 МБ (их не примут
+            # как photo).
             caption = _media_caption(platform, "album")
             total = len(dl_result.file_paths)
             first_media_captioned = False
             for chunk_start in range(0, total, MEDIA_GROUP_CHUNK_SIZE):
                 chunk = dl_result.file_paths[chunk_start:chunk_start + MEDIA_GROUP_CHUNK_SIZE]
-                sendable: list[tuple[str, bool]] = []
-                oversized_images = []
+                sendable: list[tuple[str, str]] = []
+                standalone: list[tuple[str, str]] = []
                 for path_str in chunk:
-                    ext = path_str.rsplit(".", 1)[-1].lower() if "." in path_str else ""
-                    is_image = ext in ("jpg", "jpeg", "png", "webp", "heic", "gif")
+                    kind = _classify(path_str)
                     try:
                         size_mb = os.path.getsize(path_str) / (1024 * 1024)
                     except OSError:
                         size_mb = 0
-                    if is_image and size_mb > 10:
-                        oversized_images.append(path_str)
+                    if kind == "animation":
+                        standalone.append((path_str, "animation"))
                         continue
-                    sendable.append((path_str, is_image))
+                    if kind == "image" and size_mb > 10:
+                        standalone.append((path_str, "document"))
+                        continue
+                    sendable.append((path_str, kind))
 
                 if len(sendable) == 1:
-                    # Telegram отклоняет альбом не из 2–10 элементов, поэтому
-                    # единственный не-oversized элемент шлём одиночно.
-                    path_str, is_image = sendable[0]
+                    # Telegram отклоняет альбом не из 2–10 элементов.
+                    path_str, kind = sendable[0]
                     f = FSInputFile(path_str)
                     cap = caption if not first_media_captioned else None
-                    if is_image:
+                    if kind == "image":
                         await _send_with_retry(
                             lambda ff=f, c=cap: message.reply_photo(photo=ff, caption=c)
                         )
@@ -600,30 +674,41 @@ async def handle_url(message: Message) -> None:
                     media_sent_count += 1
                 elif len(sendable) >= 2:
                     media_group = []
-                    for path_str, is_image in sendable:
+                    for path_str, kind in sendable:
                         f = FSInputFile(path_str)
-                        if not first_media_captioned:
-                            if is_image:
-                                media_group.append(InputMediaPhoto(media=f, caption=caption))
-                            else:
-                                media_group.append(InputMediaVideo(media=f, caption=caption))
-                            first_media_captioned = True
+                        cap = caption if not first_media_captioned else None
+                        if kind == "image":
+                            media_group.append(InputMediaPhoto(media=f, caption=cap))
                         else:
-                            if is_image:
-                                media_group.append(InputMediaPhoto(media=f))
-                            else:
-                                media_group.append(InputMediaVideo(media=f))
-                    await _send_with_retry(lambda mg=media_group: message.reply_media_group(media=mg))
+                            media_group.append(InputMediaVideo(media=f, caption=cap))
+                        first_media_captioned = True
+                    await _send_with_retry(
+                        lambda mg=media_group: message.reply_media_group(media=mg)
+                    )
                     media_sent_count += len(media_group)
 
-                for path_str in oversized_images:
-                    doc = FSInputFile(path_str)
-                    await _send_with_retry(lambda d=doc: message.reply_document(document=d))
+                for path_str, kind in standalone:
+                    f = FSInputFile(path_str)
+                    cap = caption if not first_media_captioned else None
+                    if kind == "animation":
+                        await _send_with_retry(
+                            lambda ff=f, c=cap: message.reply_animation(animation=ff, caption=c)
+                        )
+                    else:
+                        await _send_with_retry(
+                            lambda ff=f, c=cap: message.reply_document(document=ff, caption=c)
+                        )
+                    first_media_captioned = True
                     media_sent_count += 1
         else:
-            # Одиночный файл
             media = FSInputFile(dl_result.file_path)
-            if dl_result.media_type == "image":
+            if dl_result.media_type == "animation":
+                await _send_with_retry(
+                    lambda: message.reply_animation(
+                        animation=media, caption=_media_caption(platform, "animation")
+                    )
+                )
+            elif dl_result.media_type == "image":
                 if dl_result.file_size_mb and dl_result.file_size_mb > 10:
                     await _send_with_retry(
                         lambda: message.reply_document(

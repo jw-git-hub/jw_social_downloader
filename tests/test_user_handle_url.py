@@ -605,7 +605,7 @@ async def test_handle_url_silently_ignores_caption_without_link_when_not_waiting
     должно провоцировать ответ главным меню на каждое пересланное фото —
     бот должен промолчать (ни answer, ни reply)."""
     uid = 800000015
-    U.waiting_for_url.discard(uid)  # изоляция от других тестов файла
+    U.waiting_for_url.pop(uid, None)  # изоляция от других тестов файла
 
     msg = _FakeMessage(None, uid, caption="просто отпуск, без единой ссылки")
     await U.handle_url(msg)
