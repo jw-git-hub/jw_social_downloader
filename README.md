@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/hero.gif" width="720" alt="jw_social_downloader — ссылка превращается в готовый файл" />
+</p>
+
 # jw_social_downloader
 
 **Telegram-бот для скачивания видео и фото из Instagram, TikTok, Facebook, Pinterest и YouTube.**
