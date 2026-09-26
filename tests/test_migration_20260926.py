@@ -63,6 +63,7 @@ def test_migration_adds_tables_drops_counter_and_keeps_subscriptions(tmp_path):
     assert code == 0
     assert "free_downloads_left" not in _columns(db, "users")
     assert {"user_id", "reserved_at"} <= _columns(db, "free_download")
+    assert "telegram_payment_charge_id" in _columns(db, "star_payment")
     conn = sqlite3.connect(db)
     assert conn.execute("SELECT subscription_until, total_downloads FROM users").fetchone() == (SUB_UNTIL, 7)
     conn.close()

@@ -52,6 +52,29 @@ class FreeDownload(Base):
     reserved_at: Mapped[datetime]
 
 
+class StarPayment(Base):
+    """Одно списание звёзд: первый платёж подписки или её продление.
+
+    `telegram_payment_charge_id` уникален — повторная доставка того же
+    платежа не создаёт вторую строку. `subscription_charge_id` — номер
+    ПЕРВОГО платежа подписки: Telegram отменяет автопродление только по нему.
+    `refunded_at` пуст, пока платёж не возвращён.
+    """
+
+    __tablename__ = "star_payment"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), index=True)
+    telegram_payment_charge_id: Mapped[str] = mapped_column(String(255), unique=True)
+    subscription_charge_id: Mapped[str] = mapped_column(String(255))
+    amount: Mapped[int]
+    invoice_payload: Mapped[str] = mapped_column(String(128))
+    is_first: Mapped[bool]
+    subscription_expiration: Mapped[Optional[datetime]] = mapped_column(nullable=True)
+    created_at: Mapped[datetime] = mapped_column(default=func.now())
+    refunded_at: Mapped[Optional[datetime]] = mapped_column(nullable=True)
+
+
 # Пожизненный счётчик бесплатных скачиваний, заменённый журналом `free_download`.
 # Удаляется из боевой базы скриптом scripts/migrate_20260926.py; bot/db/engine.py
 # отказывается стартовать, пока колонка на месте.
