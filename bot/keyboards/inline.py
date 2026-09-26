@@ -29,17 +29,16 @@ def get_back_to_menu_kb(is_admin: bool = False) -> InlineKeyboardMarkup:
 
 def get_paywall_kb(is_admin: bool = False) -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton(text="💳 Показать реквизиты", callback_data="pay:show_details")],
-        [InlineKeyboardButton(text="✉️  Связаться с админом", callback_data="menu:support")],
+        [InlineKeyboardButton(text="👑 Оформить подписку", callback_data="menu:subscribe")],
         [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:main")],
     ]
     rows.extend(_maybe_admin_row(is_admin))
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def get_payment_details_kb(is_admin: bool = False) -> InlineKeyboardMarkup:
+def get_subscribe_kb(invoice_url: str, price: int, is_admin: bool = False) -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton(text="✉️  Отправить скриншот админу", callback_data="menu:support")],
+        [InlineKeyboardButton(text=f"⭐ Оформить за {price} ⭐", url=invoice_url)],
         [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:main")],
     ]
     rows.extend(_maybe_admin_row(is_admin))

@@ -30,14 +30,16 @@ from bot.config import settings
 from bot.db.engine import async_session
 from bot.db.free_quota import FreeQuota, free_quota_status, refund_free_download, reserve_free_download
 from bot.db.queries import get_or_create_user, increment_total_downloads, log_download
+from bot.handlers.info import support_text
+from bot.handlers.payments import CANCEL_HINT, get_invoice_link
 from bot.keyboards.inline import (
     get_after_download_kb,
     get_back_to_menu_kb,
     get_help_kb,
     get_main_menu_kb,
     get_paywall_kb,
-    get_payment_details_kb,
     get_status_kb,
+    get_subscribe_kb,
 )
 from bot.services.cleanup import remove_file
 from bot.services.downloader import ANIMATION_EXTS, IMAGE_EXTS, download_media
@@ -210,26 +212,6 @@ def _is_waiting(user_id: int) -> bool:
         del waiting_for_url[user_id]
         return False
     return True
-
-
-def _payment_details_text() -> str:
-    """Экран реквизитов. Все три значения приходят из .env и экранируются:
-    «NGUYEN VAN A & CO» в сыром HTML роняет экран у всех пользователей."""
-    return (
-        "🏦 <b>Реквизиты для оплаты:</b>\n\n"
-        f"💎 <b>USDT (TRC20):</b>\n<code>{esc(settings.USDT_TRC20_ADDRESS)}</code>\n\n"
-        f"🇻🇳 <b>VN Bank:</b>\n<code>{esc(settings.VN_BANK_DETAILS)}</code>\n\n"
-        f"🇹🇭 <b>TH Bank:</b>\n<code>{esc(settings.TH_BANK_DETAILS)}</code>\n\n"
-        "📩 После оплаты отправь скриншот администратору 👇"
-    )
-
-
-def _support_text() -> str:
-    return (
-        "✉️ <b>Связь с администратором</b>\n\n"
-        f"Напиши администратору: {esc(settings.ADMIN_USERNAME)}\n\n"
-        "Отправь ему скриншот оплаты или опиши проблему."
-    )
 
 
 def _download_failed_text(error_message: str | None) -> str:
@@ -450,29 +432,44 @@ async def cb_status(callback: CallbackQuery) -> None:
     )
 
 
-@router.callback_query(F.data == "menu:subscribe")
-async def cb_subscribe(callback: CallbackQuery) -> None:
-    await callback.answer()
-    await _safe_edit(
-        callback,
+PAYMENT_UNAVAILABLE_TEXT = "⚠️ Оплата временно недоступна, попробуй позже."
+
+
+def _subscribe_text(sub_until: datetime | None) -> str:
+    if sub_until is not None:
+        return (
+            f"👑 <b>Подписка активна</b> до <b>{sub_until.strftime('%d.%m.%Y')}</b>.\n\n"
+            f"Если оформлена звёздами — продлится сама; {CANCEL_HINT}."
+        )
+    return (
         "👑 <b>Подписка</b>\n\n"
-        "Безлимитное скачивание видео на 30 дней.\n\n"
-        "💰 <b>Стоимость:</b>\n"
-        f"├ {settings.SUBSCRIPTION_PRICE_USDT} USDT\n"
-        f"├ {settings.SUBSCRIPTION_PRICE_VND:,} VND\n"
-        f"└ {settings.SUBSCRIPTION_PRICE_THB} THB\n\n"
-        "Выбери действие 👇",
-        reply_markup=get_paywall_kb(is_admin=_is_admin(callback.from_user.id)),
+        f"Безлимитные скачивания на 30 дней — <b>{settings.SUBSCRIPTION_PRICE_STARS} ⭐</b>.\n"
+        f"Продлевается автоматически каждые 30 дней; {CANCEL_HINT}.\n\n"
+        "Оплачивая, ты принимаешь условия: /terms"
     )
 
 
-@router.callback_query(F.data == "pay:show_details")
-async def cb_pay_details(callback: CallbackQuery) -> None:
+@router.callback_query(F.data == "menu:subscribe")
+async def cb_subscribe(callback: CallbackQuery) -> None:
+    """Кнопки покупки при активной подписке нет: Telegram разрешает одному
+    человеку несколько подписок сразу — это было бы двойное списание."""
     await callback.answer()
+    is_admin = _is_admin(callback.from_user.id)
+    async with async_session() as session, session.begin():
+        sub_until = _active_subscription_until(await get_or_create_user(session, callback.from_user))
+    if sub_until is not None:
+        await _safe_edit(callback, _subscribe_text(sub_until), reply_markup=get_back_to_menu_kb(is_admin=is_admin))
+        return
+    try:
+        link = await get_invoice_link(callback.bot)
+    except Exception as exc:
+        logger.error("Не удалось создать ссылку на оплату | error={}", exc)
+        await _safe_edit(callback, PAYMENT_UNAVAILABLE_TEXT, reply_markup=get_back_to_menu_kb(is_admin=is_admin))
+        return
     await _safe_edit(
         callback,
-        _payment_details_text(),
-        reply_markup=get_payment_details_kb(is_admin=_is_admin(callback.from_user.id)),
+        _subscribe_text(None),
+        reply_markup=get_subscribe_kb(link, settings.SUBSCRIPTION_PRICE_STARS, is_admin=is_admin),
     )
 
 
@@ -481,7 +478,7 @@ async def cb_support(callback: CallbackQuery) -> None:
     await callback.answer()
     await _safe_edit(
         callback,
-        _support_text(),
+        support_text(),
         reply_markup=get_back_to_menu_kb(is_admin=_is_admin(callback.from_user.id)),
     )
 

@@ -27,6 +27,11 @@ class ThrottleMiddleware(BaseMiddleware):
         event: Any,
         data: Dict[str, Any],
     ) -> Any:
+        if getattr(event, "successful_payment", None) is not None:
+            # Звёзды уже списаны: отброшенное известие = оплаченная, но не
+            # продлённая подписка. Платёж идёт к хендлеру всегда.
+            return await handler(event, data)
+
         user = getattr(event, "from_user", None)
         if user is None:
             # Сообщение от анонимного админа группы или пост канала: троттлить

@@ -9,20 +9,58 @@ from loguru import logger
 
 from bot.config import settings
 from bot.db.engine import init_db
-from bot.handlers import admin_router, user_router
+from bot.handlers import admin_router, info_router, payments_router, user_router
 from bot.middlewares.throttle import ThrottleMiddleware
 from bot.services.cleanup import EFFECTIVE_CLEANUP_MAX_AGE_MIN, periodic_cleanup
 from bot.utils.log_guard import setup_logging
 
+BACKLOG_BATCH = 100
+
+PUBLIC_COMMANDS = [
+    BotCommand(command="start", description="🏠 Главное меню"),
+    BotCommand(command="terms", description="📄 Условия использования"),
+    BotCommand(command="support", description="✉️ Поддержка"),
+    BotCommand(command="paysupport", description="💳 Вопросы по оплате"),
+]
+
+
+async def replay_pending_payments(bot, dp) -> None:
+    """Очередь, накопившаяся за простой: платежи обработать, остальное выбросить.
+
+    Раньше очередь сбрасывалась целиком (`drop_pending_updates=True`), чтобы
+    ссылки из простоя не качались заново со списанием квоты. Но продление
+    подписки Telegram списывает сам в любой момент, и известие, пришедшее
+    во время перезапуска, терялось бы вместе со ссылками. Запрос с
+    `offset = последний + 1` подтверждает выброс остального.
+    """
+    await bot.delete_webhook(drop_pending_updates=False)
+    allowed = dp.resolve_used_update_types()
+    offset = None
+    while True:
+        updates = await bot.get_updates(
+            offset=offset, timeout=0, limit=BACKLOG_BATCH, allowed_updates=allowed
+        )
+        if not updates:
+            return
+        for update in updates:
+            if update.message is not None and update.message.successful_payment is not None:
+                await dp.feed_update(bot, update)
+        offset = updates[-1].update_id + 1
+
 
 async def run_polling(dp, bot) -> None:
-    """Запуск лонг-поллинга.
+    """Запуск лонг-поллинга после разбора очереди простоя.
 
-    `drop_pending_updates=True` обязателен: Telegram держит очередь до 24
-    часов, и без сброса каждая ссылка, присланная во время простоя, качается
-    заново со списанием квоты, а ответ прилетает в давно забытый диалог.
+    Если разбор не удался (сеть), ведём себя как раньше — сбрасываем очередь
+    целиком: старые ссылки качать нельзя, а упасть на старте хуже.
     """
-    await dp.start_polling(bot, drop_pending_updates=True)
+    try:
+        await replay_pending_payments(bot, dp)
+    except Exception as exc:
+        logger.warning("Разбор очереди простоя не удался, сбрасываем её | error={}", exc)
+        await dp.start_polling(bot, drop_pending_updates=True)
+        return
+    await dp.start_polling(bot)
 
 
 def build_session() -> AiohttpSession:
@@ -88,6 +126,8 @@ async def main() -> None:
     dp.callback_query.middleware(ThrottleMiddleware(rate_limit=0.7, notify=True))
 
     dp.include_router(admin_router)
+    dp.include_router(payments_router)
+    dp.include_router(info_router)
     dp.include_router(user_router)
 
     def _log_task_death(task: asyncio.Task) -> None:
@@ -112,16 +152,11 @@ async def main() -> None:
     )  # noqa: F841
     _cleanup_task.add_done_callback(_log_task_death)
 
-    await bot.set_my_commands([
-        BotCommand(command="start", description="🏠 Главное меню"),
-    ])
+    await bot.set_my_commands(PUBLIC_COMMANDS)
     from aiogram.types import BotCommandScopeChat
     try:
         await bot.set_my_commands(
-            [
-                BotCommand(command="start", description="🏠 Главное меню"),
-                BotCommand(command="admin", description="⚙️  Админ-панель"),
-            ],
+            [*PUBLIC_COMMANDS, BotCommand(command="admin", description="⚙️  Админ-панель")],
             scope=BotCommandScopeChat(chat_id=settings.ADMIN_ID),
         )
     except Exception:

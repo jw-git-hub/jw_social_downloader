@@ -8,11 +8,12 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 def test_typo_in_a_money_key_is_fatal():
-    """M-26: `USDT_TRC2O_ADDRESS` игнорировался, и адрес оплаты был пустым."""
+    """M-26: `ADMIN_USERNAMF` игнорировался, и в поддержке показывалась
+    заглушка вместо ника администратора."""
     with pytest.raises(ValueError) as excinfo:
-        check_env_keys({"USDT_TRC2O_ADDRESS": "whatever"})
-    assert "USDT_TRC2O_ADDRESS" in str(excinfo.value)
-    assert "USDT_TRC20_ADDRESS" in str(excinfo.value)
+        check_env_keys({"ADMIN_USERNAMF": "whatever"})
+    assert "ADMIN_USERNAMF" in str(excinfo.value)
+    assert "ADMIN_USERNAME" in str(excinfo.value)
 
 
 def test_typo_by_a_missing_character_is_fatal():
@@ -27,13 +28,13 @@ def test_typo_by_an_extra_character_is_fatal():
 
 def test_typo_by_adjacent_transposition_is_fatal():
     """Ревью раунда 1: перестановка соседних букв — самый частый бытовой вид
-    опечатки (USDT → UDST) — при равной длине строк давала расстояние
+    опечатки (STARS → STRAS) — при равной длине строк давала расстояние
     Хэмминга 2, а не 1, и раньше проходила мимо проверки незамеченной. Поле
     денежное, как и в исходной находке M-26."""
     with pytest.raises(ValueError) as excinfo:
-        check_env_keys({"SUBSCRIPTION_PRICE_UDST": "999"})
-    assert "SUBSCRIPTION_PRICE_UDST" in str(excinfo.value)
-    assert "SUBSCRIPTION_PRICE_USDT" in str(excinfo.value)
+        check_env_keys({"SUBSCRIPTION_PRICE_STRAS": "999"})
+    assert "SUBSCRIPTION_PRICE_STRAS" in str(excinfo.value)
+    assert "SUBSCRIPTION_PRICE_STARS" in str(excinfo.value)
 
 
 def test_case_only_difference_is_not_a_typo():
@@ -63,3 +64,13 @@ def test_every_setting_is_documented_in_env_example():
     example = (ROOT / ".env.example").read_text(encoding="utf-8")
     missing = [name for name in Settings.model_fields if name not in example]
     assert missing == [], f"не задокументированы в .env.example: {missing}"
+
+
+def test_subscription_price_is_bounded_by_telegram_limits():
+    from pydantic import ValidationError
+
+    from bot.config import Settings
+
+    for bad in ("0", "10001"):
+        with pytest.raises(ValidationError):
+            Settings(SUBSCRIPTION_PRICE_STARS=bad)

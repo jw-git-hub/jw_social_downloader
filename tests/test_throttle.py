@@ -82,3 +82,18 @@ async def test_stale_entries_are_evicted():
     # rate_limit=0 означает, что все прошлые отметки протухли сразу.
     assert len(mw.user_timestamps) <= 1
     assert len(mw.notified_at) == 0
+
+
+class FakePaymentEvent(FakeEvent):
+    def __init__(self, user_id=1000000001):
+        super().__init__(user_id)
+        self.successful_payment = object()
+
+
+async def test_payment_is_never_throttled():
+    """Звёзды уже списаны — отбросить известие о платеже значит не продлить подписку."""
+    mw = ThrottleMiddleware(rate_limit=10.0, notify=True)
+    await mw(_passthrough, FakeEvent(), {})
+    event = FakePaymentEvent()
+    assert await mw(_passthrough, event, {}) == "handled"
+    assert event.answers == []
