@@ -77,7 +77,7 @@ async def test_silent_short_video_is_sent_as_animation(monkeypatch, sqlite_engin
     maker, engine = await _make_session_maker(sqlite_engine_factory, tmp_path, "silent_short.db")
     try:
         uid = 990201
-        await _seed_user(maker, id=uid, free_downloads_left=1)
+        await _seed_user(maker, id=uid, free_left=1)
         monkeypatch.setattr("bot.handlers.user.async_session", maker)
 
         async def _ok(url, platform):
@@ -108,7 +108,7 @@ async def test_video_with_audio_is_sent_as_video(monkeypatch, sqlite_engine_fact
     maker, engine = await _make_session_maker(sqlite_engine_factory, tmp_path, "with_audio.db")
     try:
         uid = 990202
-        await _seed_user(maker, id=uid, free_downloads_left=1)
+        await _seed_user(maker, id=uid, free_left=1)
         monkeypatch.setattr("bot.handlers.user.async_session", maker)
 
         async def _ok(url, platform):
@@ -139,7 +139,7 @@ async def test_silent_video_over_duration_cap_is_sent_as_video(monkeypatch, sqli
     maker, engine = await _make_session_maker(sqlite_engine_factory, tmp_path, "silent_long.db")
     try:
         uid = 990203
-        await _seed_user(maker, id=uid, free_downloads_left=1)
+        await _seed_user(maker, id=uid, free_left=1)
         monkeypatch.setattr("bot.handlers.user.async_session", maker)
 
         async def _ok(url, platform):
@@ -170,7 +170,7 @@ async def test_unreadable_file_probe_none_falls_back_to_video(monkeypatch, sqlit
     maker, engine = await _make_session_maker(sqlite_engine_factory, tmp_path, "probe_none.db")
     try:
         uid = 990204
-        await _seed_user(maker, id=uid, free_downloads_left=1)
+        await _seed_user(maker, id=uid, free_left=1)
         monkeypatch.setattr("bot.handlers.user.async_session", maker)
 
         async def _ok(url, platform):
@@ -208,7 +208,7 @@ async def test_probe_media_raising_falls_back_to_video_without_crashing(
     maker, engine = await _make_session_maker(sqlite_engine_factory, tmp_path, "probe_raises.db")
     try:
         uid = 990205
-        await _seed_user(maker, id=uid, free_downloads_left=1)
+        await _seed_user(maker, id=uid, free_left=1)
         monkeypatch.setattr("bot.handlers.user.async_session", maker)
 
         async def _ok(url, platform):
@@ -241,7 +241,7 @@ async def test_silent_short_webm_is_sent_as_video(monkeypatch, sqlite_engine_fac
     maker, engine = await _make_session_maker(sqlite_engine_factory, tmp_path, "silent_webm.db")
     try:
         uid = 990207
-        await _seed_user(maker, id=uid, free_downloads_left=1)
+        await _seed_user(maker, id=uid, free_left=1)
         monkeypatch.setattr("bot.handlers.user.async_session", maker)
 
         async def _ok(url, platform):
@@ -272,7 +272,7 @@ async def test_image_media_type_never_calls_probe_media(monkeypatch, sqlite_engi
     maker, engine = await _make_session_maker(sqlite_engine_factory, tmp_path, "image_no_probe.db")
     try:
         uid = 990206
-        await _seed_user(maker, id=uid, free_downloads_left=1)
+        await _seed_user(maker, id=uid, free_left=1)
         monkeypatch.setattr("bot.handlers.user.async_session", maker)
 
         async def _ok(url, platform):

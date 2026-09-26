@@ -1,6 +1,7 @@
 import os
 from typing import Mapping
 
+from pydantic import Field
 from pydantic_settings import BaseSettings
 
 
@@ -14,7 +15,8 @@ class Settings(BaseSettings):
     USDT_TRC20_ADDRESS: str = ""
     VN_BANK_DETAILS: str = ""
     TH_BANK_DETAILS: str = ""
-    FREE_DOWNLOADS: int = 3
+    # Бесплатные скачивания за скользящие 24 часа (см. bot/db/free_quota.py).
+    FREE_DOWNLOADS_PER_DAY: int = Field(default=3, ge=1)
     MAX_FILE_SIZE_MB: int = 1500
     DOWNLOAD_TIMEOUT: int = 900
     COOKIES_FILE: str = ""

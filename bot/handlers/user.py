@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
@@ -28,13 +28,8 @@ from loguru import logger
 
 from bot.config import settings
 from bot.db.engine import async_session
-from bot.db.queries import (
-    get_or_create_user,
-    increment_total_downloads,
-    log_download,
-    refund_free_download,
-    reserve_free_download,
-)
+from bot.db.free_quota import FreeQuota, free_quota_status, refund_free_download, reserve_free_download
+from bot.db.queries import get_or_create_user, increment_total_downloads, log_download
 from bot.keyboards.inline import (
     get_after_download_kb,
     get_back_to_menu_kb,
@@ -47,7 +42,7 @@ from bot.keyboards.inline import (
 from bot.services.cleanup import remove_file
 from bot.services.downloader import ANIMATION_EXTS, IMAGE_EXTS, download_media
 from bot.services.media_probe import probe_media
-from bot.utils.text import esc
+from bot.utils.text import esc, format_wait
 from bot.utils.url_parser import parse_url
 
 router = Router(name="user")
@@ -73,17 +68,44 @@ SEND_RETRY_DELAYS = (2, 5, 10)  # экспоненциальный backoff ме�
 # чтобы длинная немая запись не превратилась в автоплей-луп без управления.
 SILENT_VIDEO_AS_ANIMATION_MAX_SEC = 60.0
 
-def _quota_line(free_left: int, has_subscription: bool) -> str:
-    """Одна строка о правах пользователя. Раньше здесь была захардкоженная
-    тройка, которую читали и исчерпавший квоту, и платящий подписчик."""
+def _active_subscription_until(user) -> datetime | None:
+    """Конец подписки в UTC, если она ещё действует; иначе None.
+
+    SQLite отдаёт naive-datetime в UTC — без приведения сравнение с aware
+    `now` падает. Раньше этот кусок был скопирован в трёх хендлерах.
+    """
+    until = user.subscription_until
+    if until is None:
+        return None
+    if until.tzinfo is None:
+        until = until.replace(tzinfo=timezone.utc)
+    return until if until > datetime.now(timezone.utc) else None
+
+
+def _wait_text(quota: FreeQuota) -> str:
+    """Через сколько откроется следующее бесплатное скачивание."""
+    if quota.next_at is None:
+        return format_wait(timedelta(0))
+    return format_wait(quota.next_at - datetime.now(timezone.utc))
+
+
+def _free_left_text(quota: FreeQuota) -> str:
+    return f"осталось <b>{quota.left} из {settings.FREE_DOWNLOADS_PER_DAY}</b> на сутки"
+
+
+def _quota_line(quota: FreeQuota, has_subscription: bool) -> str:
+    """Одна строка о правах пользователя для приветствия и помощи."""
     if has_subscription:
         return "👑 Подписка активна — скачивай без ограничений."
-    if free_left > 0:
-        return f"🎁 Осталось бесплатных: <b>{free_left} из {settings.FREE_DOWNLOADS}</b>."
-    return "🚫 Бесплатные скачивания закончились — нужна подписка."
+    if quota.left > 0:
+        return f"🎁 Бесплатно: {_free_left_text(quota)}."
+    return (
+        "⏳ Бесплатные на сутки закончились. "
+        f"Следующее — через <b>{_wait_text(quota)}</b>. С подпиской — без ограничений."
+    )
 
 
-def _welcome_text(free_left: int, has_subscription: bool) -> str:
+def _welcome_text(quota: FreeQuota, has_subscription: bool) -> str:
     return (
         "👋 <b>Добро пожаловать!</b>\n\n"
         "Я — бот для скачивания видео из соцсетей.\n\n"
@@ -93,34 +115,40 @@ def _welcome_text(free_left: int, has_subscription: bool) -> str:
         "├ 📘 Facebook\n"
         "├ 📌 Pinterest\n"
         "└ 📺 YouTube\n\n"
-        f"{_quota_line(free_left, has_subscription)}\n\n"
+        f"{_quota_line(quota, has_subscription)}\n\n"
         "Выбери действие 👇"
     )
 
 
-def _help_text(free_left: int, has_subscription: bool) -> str:
+def _help_text(quota: FreeQuota, has_subscription: bool) -> str:
     return (
         "📖 <b>Как пользоваться ботом:</b>\n\n"
         "1️⃣ Нажми <b>«Скачать видео»</b>\n"
         "2️⃣ Отправь ссылку на видео\n"
         "3️⃣ Дождись файла — длинное видео в высоком качестве качается минутами\n\n"
         "🌐 <b>Платформы:</b> Instagram, TikTok, Facebook, Pinterest, YouTube\n\n"
-        f"{_quota_line(free_left, has_subscription)}"
+        f"{_quota_line(quota, has_subscription)}"
     )
 
 
-def _status_text(
-    free_left: int, has_subscription: bool, sub_until, total_downloads: int
-) -> str:
-    if has_subscription and sub_until is not None:
-        sub_text = "✅ до " + sub_until.strftime("%d.%m.%Y")
-    else:
-        sub_text = "❌ Не активна"
+def _status_text(quota: FreeQuota, sub_until: datetime | None, total_downloads: int) -> str:
+    sub_text = "✅ до " + sub_until.strftime("%d.%m.%Y") if sub_until else "❌ Не активна"
+    free_line = f"🎟 Бесплатно: {_free_left_text(quota)}"
+    if quota.left == 0:
+        free_line += f"\n⏳ Следующее — через <b>{_wait_text(quota)}</b>"
     return (
         f"📊 <b>Твой профиль:</b>\n\n"
-        f"🎟 Осталось бесплатных: <b>{free_left} из {settings.FREE_DOWNLOADS}</b>\n"
+        f"{free_line}\n"
         f"👑 Подписка: <b>{sub_text}</b>\n"
         f"📥 Всего скачано: <b>{total_downloads}</b>"
+    )
+
+
+def _limit_reached_text(quota: FreeQuota) -> str:
+    return (
+        "🚫 Бесплатные скачивания на сутки закончились.\n"
+        f"Следующее откроется через <b>{_wait_text(quota)}</b>.\n"
+        "С подпиской — без ограничений 👇"
     )
 
 
@@ -316,42 +344,29 @@ async def _send_with_retry(send_coro_factory):
             await asyncio.sleep(delay)
 
 
-async def _reserve_quota(session, tg_user) -> tuple[int, bool, bool, bool]:
-    """Первый шаг загрузки: пользователь, бан, подписка и резерв единицы квоты.
+async def _reserve_quota(session, tg_user) -> tuple[int, bool, bool, int | None]:
+    """Первый шаг загрузки: пользователь, бан, подписка и бронь бесплатного скачивания.
 
-    Возвращает (user_id, is_banned, has_subscription, reserved). Резервирование
-    делается ЗДЕСЬ ЖЕ, в той же транзакции, что и чтение — иначе между чтением
-    остатка и списанием помещаются параллельные загрузки того же юзера, и с
-    одним оставшимся скачиванием он получает три-семь.
-
-    Забаненному и подписчику единица не резервируется: первому загрузка
-    запрещена, второму квота не нужна.
+    Возвращает (user_id, is_banned, has_subscription, reservation_id). Бронь —
+    в той же транзакции, что и чтение: иначе между чтением и списанием
+    помещаются параллельные загрузки того же юзера. Забаненному и подписчику
+    не бронируется (reservation_id = None): первому нельзя, второму не нужно.
     """
     user = await get_or_create_user(session, tg_user)
-    db_user_id = user.id
-    is_banned = user.is_banned
-
-    sub_until = user.subscription_until
-    if sub_until and sub_until.tzinfo is None:
-        sub_until = sub_until.replace(tzinfo=timezone.utc)
-    has_subscription = bool(sub_until and sub_until > datetime.now(timezone.utc))
-
-    if is_banned or has_subscription:
-        return db_user_id, is_banned, has_subscription, False
-
-    reserved = await reserve_free_download(session, db_user_id)
-    return db_user_id, is_banned, has_subscription, reserved
+    has_subscription = _active_subscription_until(user) is not None
+    if user.is_banned or has_subscription:
+        return user.id, user.is_banned, has_subscription, None
+    reservation_id = await reserve_free_download(session, user.id)
+    return user.id, user.is_banned, has_subscription, reservation_id
 
 
-async def _user_quota_state(tg_user) -> tuple[int, bool]:
-    """(остаток бесплатных, активна ли подписка) — одна короткая транзакция."""
+async def _user_quota_state(tg_user) -> tuple[FreeQuota, bool]:
+    """(бесплатный остаток, активна ли подписка) — одна короткая транзакция."""
     async with async_session() as session, session.begin():
         user = await get_or_create_user(session, tg_user)
-        sub_until = user.subscription_until
-        if sub_until and sub_until.tzinfo is None:
-            sub_until = sub_until.replace(tzinfo=timezone.utc)
-        has_subscription = bool(sub_until and sub_until > datetime.now(timezone.utc))
-        return user.free_downloads_left, has_subscription
+        has_subscription = _active_subscription_until(user) is not None
+        quota = await free_quota_status(session, user.id)
+    return quota, has_subscription
 
 
 def _quota_action(reserved: bool, download_ok: bool, media_sent_count: int) -> str:
@@ -370,25 +385,25 @@ def _quota_action(reserved: bool, download_ok: bool, media_sent_count: int) -> s
     return "keep"
 
 
-async def _refund_quota(db_user_id: int) -> None:
-    """Возврат единицы отдельной короткой транзакцией.
+async def _refund_quota(reservation_id: int) -> None:
+    """Возврат брони отдельной короткой транзакцией.
 
     Падение возврата не должно ронять хендлер: пользователь уже увидел ошибку,
-    а потерянная единица — меньшее зло, чем необработанное исключение.
+    а потерянное скачивание — меньшее зло, чем необработанное исключение.
     """
     try:
         async with async_session() as session, session.begin():
-            await refund_free_download(session, db_user_id)
+            await refund_free_download(session, reservation_id)
     except Exception as exc:
-        logger.error("Не удалось вернуть единицу квоты | user={} error={}", db_user_id, exc)
+        logger.error("Не удалось вернуть бесплатное скачивание | reservation={} error={}", reservation_id, exc)
 
 
 @router.message(Command("start"))
 async def cmd_start(message: Message) -> None:
-    free_left, has_subscription = await _user_quota_state(message.from_user)
+    quota, has_subscription = await _user_quota_state(message.from_user)
     is_admin = _is_admin(message.from_user.id)
     await message.answer(
-        _welcome_text(free_left, has_subscription),
+        _welcome_text(quota, has_subscription),
         reply_markup=get_main_menu_kb(is_admin=is_admin),
     )
 
@@ -397,11 +412,11 @@ async def cmd_start(message: Message) -> None:
 async def cb_main_menu(callback: CallbackQuery) -> None:
     await callback.answer()
     waiting_for_url.pop(callback.from_user.id, None)
-    free_left, has_subscription = await _user_quota_state(callback.from_user)
+    quota, has_subscription = await _user_quota_state(callback.from_user)
     is_admin = _is_admin(callback.from_user.id)
     await _safe_edit(
         callback,
-        _welcome_text(free_left, has_subscription),
+        _welcome_text(quota, has_subscription),
         reply_markup=get_main_menu_kb(is_admin=is_admin),
     )
 
@@ -425,17 +440,12 @@ async def cb_status(callback: CallbackQuery) -> None:
     await callback.answer()
     async with async_session() as session, session.begin():
         user = await get_or_create_user(session, callback.from_user)
-        free_left = user.free_downloads_left
+        sub_until = _active_subscription_until(user)
         total_downloads = user.total_downloads
-        sub_until = user.subscription_until
-
-    if sub_until and sub_until.tzinfo is None:
-        sub_until = sub_until.replace(tzinfo=timezone.utc)
-    has_subscription = bool(sub_until and sub_until > datetime.now(timezone.utc))
-
+        quota = await free_quota_status(session, user.id)
     await _safe_edit(
         callback,
-        _status_text(free_left, has_subscription, sub_until, total_downloads),
+        _status_text(quota, sub_until, total_downloads),
         reply_markup=get_status_kb(is_admin=_is_admin(callback.from_user.id)),
     )
 
@@ -479,10 +489,10 @@ async def cb_support(callback: CallbackQuery) -> None:
 @router.callback_query(F.data == "menu:help")
 async def cb_help(callback: CallbackQuery) -> None:
     await callback.answer()
-    free_left, has_subscription = await _user_quota_state(callback.from_user)
+    quota, has_subscription = await _user_quota_state(callback.from_user)
     await _safe_edit(
         callback,
-        _help_text(free_left, has_subscription),
+        _help_text(quota, has_subscription),
         reply_markup=get_help_kb(is_admin=_is_admin(callback.from_user.id)),
     )
 
@@ -530,9 +540,9 @@ async def _process_download(message: Message, url: str, platform: str) -> None:
     user_id = message.from_user.id
 
     # C-1 шаг 1: одна короткая транзакция читает пользователя И резервирует
-    # единицу квоты. Раньше остаток читался здесь, а списывался после аплоада.
+    # бесплатное скачивание. Раньше остаток читался здесь, а списывался после аплоада.
     async with async_session() as session, session.begin():
-        db_user_id, is_banned, has_subscription, reserved = await _reserve_quota(
+        db_user_id, is_banned, has_subscription, reservation_id = await _reserve_quota(
             session, message.from_user
         )
 
@@ -541,10 +551,10 @@ async def _process_download(message: Message, url: str, platform: str) -> None:
         await message.reply("🚫 Ваш аккаунт заблокирован. Обратитесь к администратору.")
         return
 
-    if not has_subscription and not reserved:
+    if not has_subscription and reservation_id is None:
+        quota, _ = await _user_quota_state(message.from_user)
         await message.answer(
-            "🚫 Бесплатный лимит исчерпан.\n"
-            "Оформи подписку для безлимитного доступа 👇",
+            _limit_reached_text(quota),
             reply_markup=get_paywall_kb(is_admin=_is_admin(message.from_user.id)),
         )
         return
@@ -565,8 +575,8 @@ async def _process_download(message: Message, url: str, platform: str) -> None:
         logger.info(
             "Не удалось отправить статус-сообщение | user={} error={}", user_id, e
         )
-        if _quota_action(reserved, download_ok=False, media_sent_count=0) == "refund":
-            await _refund_quota(db_user_id)
+        if _quota_action(reservation_id is not None, download_ok=False, media_sent_count=0) == "refund":
+            await _refund_quota(reservation_id)
         return
 
     # Fix round 1, п.3 (окно 2/3): download_media НЕ гарантирует возврат
@@ -589,8 +599,8 @@ async def _process_download(message: Message, url: str, platform: str) -> None:
             "download_media упал до собственной обработки ошибок | user={} url={} platform={}",
             db_user_id, _url_for_log(url), platform,
         )
-        if _quota_action(reserved, download_ok=False, media_sent_count=0) == "refund":
-            await _refund_quota(db_user_id)
+        if _quota_action(reservation_id is not None, download_ok=False, media_sent_count=0) == "refund":
+            await _refund_quota(reservation_id)
         try:
             async with async_session() as session, session.begin():
                 await log_download(session, db_user_id, url, platform, "failed")
@@ -613,8 +623,8 @@ async def _process_download(message: Message, url: str, platform: str) -> None:
         # оплаченной попытки; сама транзакция лога дополнительно обёрнута —
         # её падение не должно рушить хендлер после того как возврат уже
         # сделан.
-        if _quota_action(reserved, download_ok=False, media_sent_count=0) == "refund":
-            await _refund_quota(db_user_id)
+        if _quota_action(reservation_id is not None, download_ok=False, media_sent_count=0) == "refund":
+            await _refund_quota(reservation_id)
         try:
             async with async_session() as session, session.begin():
                 await log_download(session, db_user_id, url, platform, "failed")
@@ -817,8 +827,8 @@ async def _process_download(message: Message, url: str, platform: str) -> None:
 
     # Fix round 1, п.3: тот же порядок, что и в ветке выше — возврат единицы
     # ПЕРЕД записью лога, и сама запись лога обёрнута отдельно.
-    if _quota_action(reserved, download_ok=True, media_sent_count=media_sent_count) == "refund":
-        await _refund_quota(db_user_id)
+    if _quota_action(reservation_id is not None, download_ok=True, media_sent_count=media_sent_count) == "refund":
+        await _refund_quota(reservation_id)
     try:
         async with async_session() as session, session.begin():
             await log_download(session, db_user_id, url, platform, "failed")

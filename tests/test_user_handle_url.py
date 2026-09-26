@@ -19,15 +19,17 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timedelta, timezone
 
 import bot.handlers.user as U
 import pytest
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from loguru import logger as loguru_logger
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from bot.db.models import EXTRA_INDEX_DDL, Base, User
+from bot.config import settings
+from bot.db.free_quota import free_quota_status
+from bot.db.models import EXTRA_INDEX_DDL, Base, FreeDownload, User
 from bot.services.downloader import DownloadResult
 from bot.utils.log_guard import setup_logging
 
@@ -131,24 +133,28 @@ class _FakeMessage:
         self.sent_media.extend(["group"] * len(media))
 
 
-async def _seed_user(maker, **overrides) -> None:
+async def _seed_user(maker, *, free_left: int = 3, **overrides) -> None:
+    """Пользователь с остатком free_left: недостающее до лимита занято бронями час назад."""
     fields = dict(
         id=800000001,
         username="tester",
         full_name="Test User",
-        free_downloads_left=3,
         subscription_until=None,
         is_banned=False,
         total_downloads=0,
     )
     fields.update(overrides)
+    used_at = datetime.now(timezone.utc) - timedelta(hours=1)
     async with maker() as session, session.begin():
         session.add(User(**fields))
+        await session.flush()
+        for _ in range(settings.FREE_DOWNLOADS_PER_DAY - free_left):
+            session.add(FreeDownload(user_id=fields["id"], reserved_at=used_at))
 
 
 async def _free_downloads_left(maker, user_id: int) -> int:
     async with maker() as session:
-        return await session.scalar(select(User.free_downloads_left).where(User.id == user_id))
+        return (await free_quota_status(session, user_id)).left
 
 
 async def _make_session_maker(sqlite_engine_factory, tmp_path, name: str):
@@ -169,7 +175,7 @@ async def test_paywall_when_no_free_downloads_left(monkeypatch, sqlite_engine_fa
     maker, engine = await _make_session_maker(sqlite_engine_factory, tmp_path, "paywall.db")
     try:
         uid = 800000001
-        await _seed_user(maker, id=uid, free_downloads_left=0)
+        await _seed_user(maker, id=uid, free_left=0)
         monkeypatch.setattr(U, "async_session", maker)
 
         async def _must_not_be_called(*a, **k):
@@ -181,7 +187,8 @@ async def test_paywall_when_no_free_downloads_left(monkeypatch, sqlite_engine_fa
         await U.handle_url(msg)
 
         assert msg.answer_calls, "paywall must answer, not reply"
-        assert "лимит" in msg.answer_calls[0][0].lower()
+        assert "закончились" in msg.answer_calls[0][0]
+        assert "через" in msg.answer_calls[0][0]
         assert await _free_downloads_left(maker, uid) == 0
     finally:
         await engine.dispose()
@@ -191,7 +198,7 @@ async def test_banned_user_is_not_reserved(monkeypatch, sqlite_engine_factory, t
     maker, engine = await _make_session_maker(sqlite_engine_factory, tmp_path, "banned.db")
     try:
         uid = 800000002
-        await _seed_user(maker, id=uid, free_downloads_left=3, is_banned=True)
+        await _seed_user(maker, id=uid, free_left=3, is_banned=True)
         monkeypatch.setattr(U, "async_session", maker)
 
         async def _must_not_be_called(*a, **k):
@@ -214,7 +221,7 @@ async def test_refund_on_download_failure(monkeypatch, sqlite_engine_factory, tm
     maker, engine = await _make_session_maker(sqlite_engine_factory, tmp_path, "dl_fail.db")
     try:
         uid = 800000003
-        await _seed_user(maker, id=uid, free_downloads_left=1)
+        await _seed_user(maker, id=uid, free_left=1)
         monkeypatch.setattr(U, "async_session", maker)
 
         async def _fail(url, platform):
@@ -238,7 +245,7 @@ async def test_no_refund_on_partial_delivery(monkeypatch, sqlite_engine_factory,
     maker, engine = await _make_session_maker(sqlite_engine_factory, tmp_path, "partial.db")
     try:
         uid = 800000004
-        await _seed_user(maker, id=uid, free_downloads_left=1)
+        await _seed_user(maker, id=uid, free_left=1)
         monkeypatch.setattr(U, "async_session", maker)
 
         # 7 файлов -> два чанка по MEDIA_GROUP_CHUNK_SIZE=5: 5 + 2. Первый
@@ -270,7 +277,7 @@ async def test_refund_when_status_message_send_is_forbidden(monkeypatch, sqlite_
     maker, engine = await _make_session_maker(sqlite_engine_factory, tmp_path, "forbidden_status.db")
     try:
         uid = 800000005
-        await _seed_user(maker, id=uid, free_downloads_left=1)
+        await _seed_user(maker, id=uid, free_left=1)
         monkeypatch.setattr(U, "async_session", maker)
 
         async def _must_not_be_called(*a, **k):
@@ -296,7 +303,7 @@ async def test_refund_when_status_message_send_hits_network_error(monkeypatch, s
     maker, engine = await _make_session_maker(sqlite_engine_factory, tmp_path, "retry_after_status.db")
     try:
         uid = 800000011
-        await _seed_user(maker, id=uid, free_downloads_left=1)
+        await _seed_user(maker, id=uid, free_left=1)
         monkeypatch.setattr(U, "async_session", maker)
 
         async def _must_not_be_called(*a, **k):
@@ -323,7 +330,7 @@ async def test_refund_when_download_media_raises(monkeypatch, sqlite_engine_fact
     maker, engine = await _make_session_maker(sqlite_engine_factory, tmp_path, "dl_raises.db")
     try:
         uid = 800000006
-        await _seed_user(maker, id=uid, free_downloads_left=1)
+        await _seed_user(maker, id=uid, free_left=1)
         monkeypatch.setattr(U, "async_session", maker)
 
         async def _boom(url, platform):
@@ -348,7 +355,7 @@ async def test_refund_survives_log_download_lock_error(monkeypatch, sqlite_engin
     maker, engine = await _make_session_maker(sqlite_engine_factory, tmp_path, "log_locked.db")
     try:
         uid = 800000007
-        await _seed_user(maker, id=uid, free_downloads_left=1)
+        await _seed_user(maker, id=uid, free_left=1)
         monkeypatch.setattr(U, "async_session", maker)
 
         async def _fail(url, platform):
@@ -385,7 +392,7 @@ async def test_success_path_survives_log_download_lock_error(monkeypatch, sqlite
     maker, engine = await _make_session_maker(sqlite_engine_factory, tmp_path, "success_log_locked.db")
     try:
         uid = 800000012
-        await _seed_user(maker, id=uid, free_downloads_left=1)
+        await _seed_user(maker, id=uid, free_left=1)
         monkeypatch.setattr(U, "async_session", maker)
 
         async def _ok(url, platform):
@@ -434,7 +441,7 @@ async def test_success_path_survives_status_delete_forbidden(monkeypatch, sqlite
     maker, engine = await _make_session_maker(sqlite_engine_factory, tmp_path, "delete_forbidden.db")
     try:
         uid = 800000008
-        await _seed_user(maker, id=uid, free_downloads_left=1)
+        await _seed_user(maker, id=uid, free_left=1)
         monkeypatch.setattr(U, "async_session", maker)
 
         async def _ok(url, platform):
@@ -487,7 +494,7 @@ async def test_forbidden_during_send_triggers_refund(monkeypatch, sqlite_engine_
     maker, engine = await _make_session_maker(sqlite_engine_factory, tmp_path, "forbidden_send.db")
     try:
         uid = 800000009
-        await _seed_user(maker, id=uid, free_downloads_left=1)
+        await _seed_user(maker, id=uid, free_left=1)
         monkeypatch.setattr(U, "async_session", maker)
 
         async def _ok(url, platform):
@@ -572,7 +579,7 @@ async def test_handle_url_downloads_link_from_caption_when_text_is_empty(
     maker, engine = await _make_session_maker(sqlite_engine_factory, tmp_path, "caption_link.db")
     try:
         uid = 800000014
-        await _seed_user(maker, id=uid, free_downloads_left=1)
+        await _seed_user(maker, id=uid, free_left=1)
         monkeypatch.setattr(U, "async_session", maker)
 
         download_calls: list[tuple[str, str]] = []
@@ -676,7 +683,7 @@ async def test_download_media_crash_log_does_not_leak_unallowlisted_query_secret
     maker, engine = await _make_session_maker(sqlite_engine_factory, tmp_path, "log_leak.db")
     try:
         uid = 800000013
-        await _seed_user(maker, id=uid, free_downloads_left=1)
+        await _seed_user(maker, id=uid, free_left=1)
         monkeypatch.setattr(U, "async_session", maker)
 
         async def _boom(url, platform):

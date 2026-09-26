@@ -16,6 +16,7 @@ from loguru import logger
 
 from bot.config import settings
 from bot.db.engine import async_session
+from bot.db.free_quota import free_quota_status
 from bot.db.queries import get_stats, get_user_by_id, get_user_by_username, toggle_ban, update_subscription
 from bot.keyboards.inline import get_admin_menu_kb, get_user_card_kb
 from bot.utils.text import esc
@@ -46,7 +47,7 @@ def _format_dt(value: datetime | None) -> str:
     return value.strftime("%d.%m.%Y %H:%M") + " UTC"
 
 
-def _user_card_text(user) -> str:
+def _user_card_text(user, free_left: int) -> str:
     # Всё, что пришло от пользователя, уходит через esc(): parse_mode=HTML
     # задан глобально, и имя вида «Ann <3» раньше роняло отправку карточки.
     status = "🔴 Заблокирован" if user.is_banned else "🟢 Активен"
@@ -55,11 +56,17 @@ def _user_card_text(user) -> str:
         f"🆔 ID: <code>{user.id}</code>\n"
         f"📛 Username: @{esc(user.username) if user.username else 'нет'}\n"
         f"👤 Имя: {esc(user.full_name)}\n"
-        f"🎟 Бесплатных: {user.free_downloads_left}\n"
+        f"🎟 Бесплатно за сутки: осталось {free_left} из {settings.FREE_DOWNLOADS_PER_DAY}\n"
         f"👑 Подписка до: {_format_dt(user.subscription_until)}\n"
         f"📥 Скачано: {user.total_downloads}\n"
         f"📌 Статус: {status}"
     )
+
+
+async def _card_text(session, user) -> str:
+    """Карточка с актуальным бесплатным остатком — его нет в строке users."""
+    quota = await free_quota_status(session, user.id)
+    return _user_card_text(user, quota.left)
 
 
 def _stats_text(stats: dict) -> str:
@@ -167,11 +174,12 @@ async def admin_text_handler(message: Message):
             user = await get_user_by_username(session, arg.lstrip("@"))
         else:
             user = await get_user_by_id(session, user_id)
+        text = await _card_text(session, user) if user else None
 
     if not user:
         await message.answer("❌ Пользователь не найден.", reply_markup=get_admin_menu_kb())
         return
-    await message.answer(_user_card_text(user), reply_markup=get_user_card_kb(user.id))
+    await message.answer(text, reply_markup=get_user_card_kb(user.id))
 
 
 # ── Callback handlers ──
@@ -230,9 +238,10 @@ async def cb_grant(callback: CallbackQuery):
     async with async_session() as session, session.begin():
         await update_subscription(session, user_id, days)
         user = await get_user_by_id(session, user_id)
+        text = await _card_text(session, user) if user else None
     await callback.answer(f"✅ Подписка +{days} дней")
-    if user:
-        await _safe_edit(callback, _user_card_text(user), reply_markup=get_user_card_kb(user.id))
+    if text:
+        await _safe_edit(callback, text, reply_markup=get_user_card_kb(user_id))
 
 
 @router.callback_query(F.data.startswith("admin:ban:"))
@@ -244,6 +253,7 @@ async def cb_ban(callback: CallbackQuery):
     async with async_session() as session, session.begin():
         new_status = await toggle_ban(session, user_id)
         user = await get_user_by_id(session, user_id)
+        text = await _card_text(session, user) if user else None
     await callback.answer("🔴 Заблокирован" if new_status else "🟢 Разблокирован")
-    if user:
-        await _safe_edit(callback, _user_card_text(user), reply_markup=get_user_card_kb(user.id))
+    if text:
+        await _safe_edit(callback, text, reply_markup=get_user_card_kb(user_id))

@@ -176,7 +176,7 @@ async def test_carousel_sends_gif_standalone_and_captions_once(
     maker, engine = await _make_session_maker(sqlite_engine_factory, tmp_path, "carousel_gif.db")
     try:
         uid = 990101
-        await _seed_user(maker, id=uid, free_downloads_left=1)
+        await _seed_user(maker, id=uid, free_left=1)
         monkeypatch.setattr("bot.handlers.user.async_session", maker)
 
         file_paths = [
@@ -218,7 +218,7 @@ async def test_single_animation_uses_reply_animation_with_caption(
     maker, engine = await _make_session_maker(sqlite_engine_factory, tmp_path, "single_gif.db")
     try:
         uid = 990102
-        await _seed_user(maker, id=uid, free_downloads_left=1)
+        await _seed_user(maker, id=uid, free_left=1)
         monkeypatch.setattr("bot.handlers.user.async_session", maker)
 
         async def _ok(url, platform):
@@ -250,7 +250,7 @@ async def test_carousel_all_gifs_skips_media_group(
     maker, engine = await _make_session_maker(sqlite_engine_factory, tmp_path, "all_gifs.db")
     try:
         uid = 990103
-        await _seed_user(maker, id=uid, free_downloads_left=1)
+        await _seed_user(maker, id=uid, free_left=1)
         monkeypatch.setattr("bot.handlers.user.async_session", maker)
 
         file_paths = ["/tmp/does-not-exist-x.gif", "/tmp/does-not-exist-y.gif"]

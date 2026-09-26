@@ -7,7 +7,6 @@ from sqlalchemy import func, select, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from bot.config import settings
 from bot.db.models import DownloadLog, SubscriptionGrant, User
 
 
@@ -18,7 +17,6 @@ async def get_or_create_user(session: AsyncSession, tg_user) -> User:
             id=tg_user.id,
             username=tg_user.username,
             full_name=tg_user.full_name,
-            free_downloads_left=settings.FREE_DOWNLOADS,
         )
         session.add(user)
         await session.flush()
@@ -126,8 +124,9 @@ async def apply_subscription_change(
     применение, а не как дубль.
 
     Идемпотентность — одна условная вставка (`INSERT ... ON CONFLICT
-    (idempotency_key) DO NOTHING`) и вердикт по `rowcount`, тот же приём,
-    что у `reserve_free_download` в этом же файле. Это принципиально, а
+    (idempotency_key) DO NOTHING`) и вердикт по `rowcount`, тот же приём
+    «один оператор + вердикт по результату», что у брони в
+    `bot/db/free_quota.py`. Это принципиально, а
     не «на всякий случай»: у aiogram 3.31 `Dispatcher` нет
     `tasks_concurrency_limit`, а `ThrottleMiddleware` висит только на
     `dp.message` — `dp.callback_query` ничем не троттлится, поэтому
@@ -237,68 +236,6 @@ async def toggle_ban(session: AsyncSession, user_id: int) -> bool:
     user.is_banned = not user.is_banned
     await session.flush()
     return user.is_banned
-
-
-# УСТАРЕЛО. Заменена на reserve_free_download: списание после доставки давало
-# пользователю от трёх до семи скачиваний при одном оставшемся (C-1).
-# Удаляется в Task 37, после того как пакет D перестанет её импортировать.
-async def decrement_free_downloads(session: AsyncSession, user_id: int) -> None:
-    await session.execute(
-        update(User)
-        .where(User.id == user_id, User.free_downloads_left > 0)
-        .values(free_downloads_left=User.free_downloads_left - 1)
-    )
-    await session.flush()
-
-
-async def reserve_free_download(session: AsyncSession, user_id: int) -> bool:
-    """Атомарно занимает одну бесплатную единицу. `True` — заняли.
-
-    Условие `free_downloads_left > 0` проверяет СУБД в том же операторе,
-    который декрементирует, поэтому окна между «проверили остаток» и
-    «списали» больше нет: параллельные загрузки одного пользователя не
-    могут занять одну и ту же единицу дважды.
-
-    Успех определяется по `rowcount == 1`. Раньше `rowcount` не проверялся
-    нигде в репозитории, и «не списалось» было неотличимо от «списалось».
-
-    Подписку и бан НЕ проверяет — только free_downloads_left. Вызывающий
-    обязан сам отсечь подписчиков (`if not has_subscription:`) и забаненных
-    ДО вызова, иначе у них спишется бесплатная единица, хотя им скачивание
-    и так положено/не положено по другой причине. Звать в короткой
-    транзакции ДО скачивания; результат обязателен к проверке.
-    """
-    result = await session.execute(
-        update(User)
-        .where(User.id == user_id, User.free_downloads_left > 0)
-        .values(free_downloads_left=User.free_downloads_left - 1)
-    )
-    await session.flush()
-    return result.rowcount == 1
-
-
-async def refund_free_download(session: AsyncSession, user_id: int) -> None:
-    """Возвращает ровно одну ранее зарезервированную единицу.
-
-    Вызывающий обязан звать это не более одного раза на одно успешное
-    резервирование: верхнего ограничителя здесь нет сознательно — админ
-    может выдать пользователю больше единиц, чем FREE_DOWNLOADS, и упирать
-    возврат в эту константу означало бы молча отнимать выданное.
-
-    Не вызывать, если reserve_free_download вернул `False` (и если он не
-    вызывался вовсе — например, ветка с активной подпиской): возвращать
-    нечего, а вызов всё равно молча начислит единицу. На несуществующем
-    пользователе — тихий no-op, исключение не бросает. Осторожно с формой
-    «try со скачиванием и вложенными ретраями + except»: возврат и в
-    `except`, и в `finally` одновременно даёт двойной refund молча — звать
-    строго в одной точке отказа.
-    """
-    await session.execute(
-        update(User)
-        .where(User.id == user_id)
-        .values(free_downloads_left=User.free_downloads_left + 1)
-    )
-    await session.flush()
 
 
 async def increment_total_downloads(session: AsyncSession, user_id: int) -> None:

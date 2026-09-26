@@ -58,6 +58,7 @@ def get_status_kb(is_admin: bool = False) -> InlineKeyboardMarkup:
 def get_help_kb(is_admin: bool = False) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(text="📥 Скачать видео", callback_data="menu:download")],
+        [InlineKeyboardButton(text="👑 Подписка", callback_data="menu:subscribe")],
         [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:main")],
     ]
     rows.extend(_maybe_admin_row(is_admin))

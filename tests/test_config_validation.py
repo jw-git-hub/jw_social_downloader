@@ -17,7 +17,7 @@ def test_typo_in_a_money_key_is_fatal():
 
 def test_typo_by_a_missing_character_is_fatal():
     with pytest.raises(ValueError):
-        check_env_keys({"FREE_DOWNLOAD": "5"})
+        check_env_keys({"FREE_DOWNLOADS_PER_DY": "5"})
 
 
 def test_typo_by_an_extra_character_is_fatal():

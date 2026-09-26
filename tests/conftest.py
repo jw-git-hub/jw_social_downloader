@@ -101,7 +101,6 @@ def make_user():
             "id": user_id,
             "username": "tester",
             "full_name": "Test User",
-            "free_downloads_left": 3,
             "subscription_until": None,
             "is_banned": False,
             "total_downloads": 0,

@@ -1,4 +1,6 @@
-from bot.utils.text import esc
+from datetime import timedelta
+
+from bot.utils.text import esc, format_wait
 
 
 def test_escapes_html_metacharacters():
@@ -35,4 +37,17 @@ async def test_db_session_fixture_gives_a_working_schema(db_session, make_user):
 
     found = await db_session.scalar(select(User).where(User.username == "Ann"))
     assert found is not None
-    assert found.free_downloads_left == 3
+
+
+def test_format_wait_rounds_up_to_minutes():
+    assert format_wait(timedelta(0)) == "1 мин"
+    assert format_wait(timedelta(seconds=59)) == "1 мин"
+    assert format_wait(timedelta(seconds=61)) == "2 мин"
+    assert format_wait(timedelta(minutes=12)) == "12 мин"
+
+
+def test_format_wait_hours():
+    assert format_wait(timedelta(hours=3)) == "3 ч"
+    assert format_wait(timedelta(hours=5, minutes=12)) == "5 ч 12 мин"
+    assert format_wait(timedelta(hours=24)) == "24 ч"
+    assert format_wait(timedelta(hours=5, minutes=11, seconds=1)) == "5 ч 12 мин"

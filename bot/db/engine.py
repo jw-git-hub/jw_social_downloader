@@ -5,7 +5,7 @@ from sqlalchemy import delete, event, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from bot.config import settings
-from bot.db.models import EXTRA_INDEX_DDL, Base, DownloadLog
+from bot.db.models import EXTRA_INDEX_DDL, LEGACY_FREE_COUNTER_COLUMN, Base, DownloadLog
 
 # Журнал загрузок хранит полные URL с приватными пер-шаринговыми токенами
 # (`?stkn=`, `?igsh=`). Порог заведомо больше самого длинного окна статистики
@@ -38,14 +38,15 @@ if settings.DATABASE_URL.startswith("sqlite"):
     # SQLite: busy_timeout=30s (connect_args timeout) чтобы конкурентные записи
     # ждали снятия блокировки вместо мгновенного "database is locked".
     #
-    # ВАЖНО (C-1, bot/db/queries.py: reserve_free_download): атомарность
+    # ВАЖНО (C-1, bot/db/free_quota.py: reserve_free_download): атомарность
     # резервирования квоты держится на том, что мы НЕ настраиваем здесь
     # "правильный" по рецепту SQLAlchemy режим изоляции pysqlite/aiosqlite
     # (isolation_level=None + явный BEGIN на событии "begin"). Используется
     # дефолтный легаси-режим (isolation_level=""), в котором SELECT не
-    # открывает транзакцию — поэтому UPDATE в reserve_free_download всегда
-    # оказывается ПЕРВЫМ оператором своей write-транзакции, и никакого окна
-    # между чужим SELECT и своим UPDATE не остаётся.
+    # открывает транзакцию — поэтому первый оператор записи (DELETE) в
+    # reserve_free_download всегда оказывается ПЕРВЫМ оператором своей
+    # write-транзакции, и никакого окна между чужим SELECT и своим DELETE
+    # не остаётся.
     #
     # Если это когда-нибудь "исправить" по рецепту SQLAlchemy — проигрыш
     # гонки за последнюю единицу перестанет быть чистым `False` из
@@ -85,8 +86,21 @@ async def _purge_old_download_logs() -> None:
         logger.warning("Download log retention failed: {}", exc)
 
 
+def assert_schema_migrated(sync_conn) -> None:
+    """Отказ стартовать на базе до scripts/migrate_20260926.py.
+
+    На старой базе колонка счётчика — NOT NULL без умолчания в самой базе:
+    новый код её не заполняет, и каждый новый пользователь падал бы на
+    INSERT. Лучше честный отказ при старте, чем бот, работающий наполовину.
+    """
+    columns = {row[1] for row in sync_conn.exec_driver_sql("PRAGMA table_info(users)")}
+    if LEGACY_FREE_COUNTER_COLUMN in columns:
+        raise RuntimeError("База не смигрирована: сначала запусти scripts/migrate_20260926.py")
+
+
 async def init_db() -> None:
     async with async_engine.begin() as conn:
+        await conn.run_sync(assert_schema_migrated)
         await conn.run_sync(Base.metadata.create_all)
         for statement in EXTRA_INDEX_DDL:
             await conn.execute(text(statement))

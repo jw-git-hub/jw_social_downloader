@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import BigInteger, ForeignKey, String, Text, func
+from sqlalchemy import BigInteger, ForeignKey, Index, String, Text, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -15,7 +15,6 @@ class User(Base):
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     username: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     full_name: Mapped[str] = mapped_column(String(255))
-    free_downloads_left: Mapped[int] = mapped_column(default=3)
     subscription_until: Mapped[Optional[datetime]] = mapped_column(nullable=True)
     is_banned: Mapped[bool] = mapped_column(default=False)
     total_downloads: Mapped[int] = mapped_column(default=0)
@@ -33,6 +32,30 @@ class DownloadLog(Base):
     status: Mapped[str] = mapped_column(String(16))
     file_size_mb: Mapped[Optional[float]] = mapped_column(nullable=True)
     created_at: Mapped[datetime] = mapped_column(default=func.now())
+
+
+class FreeDownload(Base):
+    """Одно занятое бесплатное скачивание.
+
+    Строка живёт, пока не выйдет из окна `FREE_WINDOW` (её удаляет следующая
+    бронь того же пользователя — в таблице у него не больше лимита строк) или
+    пока загрузка не провалилась (тогда её удаляют сразу: неудачное скачивание
+    не списывается). `reserved_at` пишет код, а не `func.now()`, — тесты
+    подставляют «сейчас» и проверяют окно в 24 часа.
+    """
+
+    __tablename__ = "free_download"
+    __table_args__ = (Index("ix_free_download_user_reserved", "user_id", "reserved_at"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"))
+    reserved_at: Mapped[datetime]
+
+
+# Пожизненный счётчик бесплатных скачиваний, заменённый журналом `free_download`.
+# Удаляется из боевой базы скриптом scripts/migrate_20260926.py; bot/db/engine.py
+# отказывается стартовать, пока колонка на месте.
+LEGACY_FREE_COUNTER_COLUMN = "free_downloads_left"
 
 
 class SubscriptionGrant(Base):

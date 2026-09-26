@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import html
+import math
+from datetime import timedelta
 
 
 def esc(value: object) -> str:
@@ -24,3 +26,22 @@ def esc(value: object) -> str:
     if value is None:
         return ""
     return html.escape(str(value), quote=False)
+
+
+SECONDS_PER_MINUTE = 60
+MINUTES_PER_HOUR = 60
+
+
+def format_wait(delta: timedelta) -> str:
+    """Сколько ждать, по-человечески: «5 ч 12 мин», «3 ч», «12 мин».
+
+    Округляем ВВЕРХ до минуты: «через 5 ч 11 мин», сказанное за 59 секунд до
+    5 ч 12 мин, обмануло бы человека. Меньше минуты — «1 мин», а не «0 мин».
+    """
+    minutes = max(1, math.ceil(delta.total_seconds() / SECONDS_PER_MINUTE))
+    hours, minutes = divmod(minutes, MINUTES_PER_HOUR)
+    if hours and minutes:
+        return f"{hours} ч {minutes} мин"
+    if hours:
+        return f"{hours} ч"
+    return f"{minutes} мин"

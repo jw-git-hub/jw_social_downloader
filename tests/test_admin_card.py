@@ -13,7 +13,6 @@ def _fake_user(**overrides):
         id=1000000001,
         username="ivan",
         full_name="Ivan Petrov",
-        free_downloads_left=2,
         subscription_until=None,
         total_downloads=5,
         is_banned=False,
@@ -26,38 +25,42 @@ def _fake_user(**overrides):
 
 
 def test_card_escapes_angle_brackets_in_full_name():
-    text = _user_card_text(_fake_user(full_name="Ann <3"))
+    text = _user_card_text(_fake_user(full_name="Ann <3"), 2)
     assert "Ann &lt;3" in text
     assert "Ann <3" not in text
 
 
 def test_card_escapes_ampersand_in_full_name():
     # Латентная денежная ветка того же класса: реквизиты вида «NGUYEN VAN A & CO».
-    text = _user_card_text(_fake_user(full_name="NGUYEN VAN A & CO"))
+    text = _user_card_text(_fake_user(full_name="NGUYEN VAN A & CO"), 2)
     assert "A &amp; CO" in text
 
 
 def test_card_escapes_username():
-    text = _user_card_text(_fake_user(username="a<b>c"))
+    text = _user_card_text(_fake_user(username="a<b>c"), 2)
     assert "a&lt;b&gt;c" in text
     assert "<b>c" not in text
 
 
 def test_card_keeps_its_own_markup():
-    text = _user_card_text(_fake_user())
+    text = _user_card_text(_fake_user(), 2)
     assert text.startswith("👤 <b>Карточка пользователя</b>")
     assert "<code>1000000001</code>" in text
 
 
 def test_card_without_username_keeps_previous_wording():
-    assert "📛 Username: @нет" in _user_card_text(_fake_user(username=None))
+    assert "📛 Username: @нет" in _user_card_text(_fake_user(username=None), 2)
+
+
+def test_card_shows_free_quota_remainder():
+    assert "осталось 2 из 3" in _user_card_text(_fake_user(), 2)
 
 
 # ── таймзона ──
 
 
 def test_card_without_subscription_shows_no_marker():
-    assert "👑 Подписка до: ❌ Нет" in _user_card_text(_fake_user())
+    assert "👑 Подписка до: ❌ Нет" in _user_card_text(_fake_user(), 2)
 
 
 def test_naive_datetime_is_printed_as_utc():
