@@ -85,17 +85,23 @@ def test_youtube_audio_budget_is_capped_share(tmp_path, monkeypatch):
     # audio_cap — доля MAX_FILE_SIZE_MB (YOUTUBE_AUDIO_BUDGET_DIVISOR), но не
     # больше YOUTUBE_AUDIO_BUDGET_MAX_MB — иначе на 1500 видео теряет сотни
     # МиБ бюджета впустую (владелец решил: разрешение важнее резерва аудио).
+    #
+    # Запасная ветка каскада (branch 3) считает видео-бюджет иначе:
+    # fallback_cap = MAX - MAX // YOUTUBE_AUDIO_BUDGET_DIVISOR, БЕЗ потолка
+    # YOUTUBE_AUDIO_BUDGET_MAX_MB. Пока потолок не сработал (50, 100),
+    # fallback_cap совпадает с video_cap веток 1–2 — в селекторе только два
+    # различных числа. Как только потолок срезает audio_cap (1500, 2000),
+    # fallback_cap расходится с video_cap — появляется третье число.
     expected_audio = {50: 10, 100: 20, 1500: 120, 2000: 120}
     for max_size in (50, 100, 1500, 2000):
         monkeypatch.setattr(settings, "MAX_FILE_SIZE_MB", max_size)
         selector = _selector(_youtube_cmd(tmp_path))
         caps = sorted({int(n) for n in re.findall(r"filesize_approx<(\d+)MiB", selector)})
-        # Ровно два различных числа в самом селекторе: аудио-бюджет и
-        # видео-бюджет (video_cap = MAX - audio_cap).
-        assert len(caps) == 2, caps
-        audio_cap, video_cap = caps
-        assert audio_cap + video_cap == max_size
-        assert audio_cap == min(max_size // YOUTUBE_AUDIO_BUDGET_DIVISOR, YOUTUBE_AUDIO_BUDGET_MAX_MB)
+        audio_cap = min(max_size // YOUTUBE_AUDIO_BUDGET_DIVISOR, YOUTUBE_AUDIO_BUDGET_MAX_MB)
+        video_cap = max_size - audio_cap
+        fallback_cap = max_size - max_size // YOUTUBE_AUDIO_BUDGET_DIVISOR
+        expected_caps = sorted({audio_cap, video_cap, fallback_cap})
+        assert caps == expected_caps, (max_size, caps, expected_caps)
         assert audio_cap == expected_audio[max_size], (max_size, audio_cap)
 
 
@@ -170,10 +176,10 @@ def test_youtube_size_filters_are_in_mib(tmp_path):
     assert all(unit == "MiB" for unit in units), units
 
 
-def test_youtube_sort_prefers_resolution_capped_at_4k(tmp_path):
-    # Название теста сохранено для трассировки решения владельца: потолка
-    # 4K больше нет («самый лучший вариант всегда выбираем»), первое поле
-    # сортировки — ровно "res" (без ":2160"), 8K тоже допустим.
+def test_youtube_sort_prefers_resolution_without_cap(tmp_path):
+    # Проверяем именно ОТСУТСТВИЕ потолка 4K (решение владельца — «самый
+    # лучший вариант всегда выбираем»): первое поле сортировки — ровно "res"
+    # (без ":2160"), 8K тоже допустим.
     cmd = _youtube_cmd(tmp_path)
     sort_value = _sort(cmd)
     assert sort_value == YOUTUBE_FORMAT_SORT

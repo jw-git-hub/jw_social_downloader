@@ -325,14 +325,23 @@ def _ephemeral_cookies() -> Iterator[Path | None]:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-def _youtube_budget_mb() -> tuple[int, int]:
-    """Видео- и аудио-бюджет YouTube в МиБ. Читает settings при каждом вызове
-    (не при импорте), чтобы тесты могли подменять MAX_FILE_SIZE_MB.
+def _youtube_budget_mb() -> tuple[int, int, int]:
+    """Видео-, аудио- и запасной видео-бюджет YouTube в МиБ. Читает settings
+    при каждом вызове (не при импорте), чтобы тесты могли подменять
+    MAX_FILE_SIZE_MB.
+
+    `fallback_video_mb` — бюджет видео для запасной ветки каскада (см.
+    `_youtube_format_selector`): она резервирует под аудио ровно пятую часть
+    лимита (`MAX_FILE_SIZE_MB // YOUTUBE_AUDIO_BUDGET_DIVISOR`), БЕЗ потолка
+    `YOUTUBE_AUDIO_BUDGET_MAX_MB` — на длинных роликах самая лёгкая AAC-дорожка
+    сама может быть тяжелее потолка (120 МиБ), и урезанный резерв пустил бы
+    в сумме больше MAX_FILE_SIZE_MB.
     """
     max_mb = settings.MAX_FILE_SIZE_MB
     audio_mb = max(1, min(max_mb // YOUTUBE_AUDIO_BUDGET_DIVISOR, YOUTUBE_AUDIO_BUDGET_MAX_MB))
     video_mb = max_mb - audio_mb
-    return video_mb, audio_mb
+    fallback_video_mb = max_mb - max_mb // YOUTUBE_AUDIO_BUDGET_DIVISOR
+    return video_mb, audio_mb, fallback_video_mb
 
 
 def _youtube_format_selector() -> str:
@@ -344,19 +353,26 @@ def _youtube_format_selector() -> str:
     сумму, поэтому лимит неизбежно делится на видео- и аудио-бюджет.
     Единицы — MiB (двоичные), как `--max-filesize` и гейт `oversized_files`;
     голое `M` в фильтре yt-dlp — это десятичные мегабайты, а не то же самое.
-    Ветка `wa[ext=m4a]` без фильтра размера защищает от обрыва по
-    длительности: на длинном ролике лёгкая m4a-дорожка `wa` по определению
-    уже уложится в бюджет, и её незачем дополнительно фильтровать; `[ext=m4a]`
-    на ней обязателен — без него `wa` может взять HLS-дорожку без кодека
-    и без размера. Терминальная `bv*+ba/b` без фильтров гарантирует
-    непустой выбор — перебор бюджета ловят `--max-filesize` и гейт
-    `oversized_files` дальше по цепочке.
+
+    Запасная ветка `wa[acodec^=mp4a]` (без фильтра размера на аудио) нужна
+    для длинных роликов: на них самая лёгкая AAC-дорожка уже тяжелее бюджета
+    веток 1–2 (`YOUTUBE_AUDIO_BUDGET_MAX_MB`), поэтому обе отваливаются. Она
+    НЕ уложится в бюджет «сама по себе» — вместо фильтра размера на аудио эта
+    ветка резервирует под неё пятую часть лимита на стороне видео
+    (`fallback_video_mb` из `_youtube_budget_mb`), иначе на 10-часовом ролике
+    видео до 1380 МиБ плюс неограниченное аудио превышали MAX_FILE_SIZE_MB
+    (находка ревью). Фильтр `acodec^=mp4a` обязателен: без него `wa` может
+    взять более лёгкий по битрейту, но не AAC трек — HLS-дорожку без кодека,
+    или surround ec-3/ac-3 (5.1) в контейнере m4a, который на части Android
+    воспроизводится без звука. Терминальная `bv*+ba/b` без фильтров
+    гарантирует непустой выбор — перебор бюджета ловят `--max-filesize` и
+    гейт `oversized_files` дальше по цепочке.
     """
-    video_mb, audio_mb = _youtube_budget_mb()
+    video_mb, audio_mb, fallback_video_mb = _youtube_budget_mb()
     return (
         f"bv*[filesize_approx<{video_mb}MiB]+ba[ext=m4a][filesize_approx<{audio_mb}MiB]/"
         f"bv*[filesize_approx<{video_mb}MiB]+ba[filesize_approx<{audio_mb}MiB]/"
-        f"bv*[filesize_approx<{video_mb}MiB]+wa[ext=m4a]/"
+        f"bv*[filesize_approx<{fallback_video_mb}MiB]+wa[acodec^=mp4a]/"
         "bv*+ba/b"
     )
 

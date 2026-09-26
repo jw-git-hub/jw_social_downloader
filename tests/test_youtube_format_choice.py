@@ -165,3 +165,52 @@ def test_video_without_m4a_takes_any_audio(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "MAX_FILE_SIZE_MB", 1500)
     audio = [_audio("251", "opus", "webm", 133, 5)]
     assert _choose(_ladder() + audio, tmp_path) == "315+251"
+
+
+# ── Ревью Important: запасная ветка каскада (branch 3) должна уложить сумму
+# в MAX_FILE_SIZE_MB и не подсовывать surround-дорожку вместо AAC ─────────
+
+
+def test_long_video_total_stays_within_limit(tmp_path, monkeypatch):
+    # 10-часовой ролик: обе AAC-дорожки тяжелее бюджета веток 1–2
+    # (YOUTUBE_AUDIO_BUDGET_MAX_MB=120 из 1500) — обе ветки отваливаются, в
+    # игру вступает запасная ветка (branch 3). Раньше она резервировала под
+    # аудио 0 МиБ (видео-фильтр брался тем же video_mb, что и у веток 1–2) —
+    # 137+139 = 1330+206 = 1536 МиБ превышал MAX_FILE_SIZE_MB. Теперь ветка 3
+    # резервирует под аудио пятую часть лимита на стороне видео.
+    monkeypatch.setattr(settings, "MAX_FILE_SIZE_MB", 1500)
+    video = [
+        _video("137", 1080, "avc1.640028", 1330),
+        _video("248", 1080, "vp9", 925, ext="webm"),
+        _video("136", 720, "avc1.4d401f", 300),
+    ]
+    audio = [
+        _audio("139", "mp4a.40.5", "m4a", 49, 206),
+        _audio("140", "mp4a.40.2", "m4a", 129, 550),
+    ]
+    formats = {f["format_id"]: f for f in video + audio}
+    chosen = _choose(video + audio, tmp_path)
+    assert chosen == "248+139"
+    total_mib = sum(formats[fid]["filesize"] for fid in chosen.split("+")) / MIB
+    assert total_mib <= 1500, total_mib
+
+
+def test_fallback_audio_skips_surround_tracks(tmp_path, monkeypatch):
+    # Облако (лимит 50): все AAC-дорожки тяжелее бюджета веток 1–2
+    # (audio_mb=10 из 50) — обе ветки отваливаются, выбирает запасная ветка.
+    # `380` — surround E-AC-3 (5.1) в контейнере m4a: раньше проходил через
+    # `wa[ext=m4a]` и, из-за сортировки `-S ...,+codec:avc:m4a`, ранжировался
+    # НИЖЕ mp4a, поэтому `wa` («самый худший») выбирал именно его — на части
+    # Android AC-3 в MP4 воспроизводится без звука. Фильтр `acodec^=mp4a`
+    # обязан отсечь его целиком, оставив выбор только между AAC-дорожками.
+    monkeypatch.setattr(settings, "MAX_FILE_SIZE_MB", 50)
+    video = [
+        _video("247", 720, "vp9", 36, ext="webm"),
+        _video("135", 480, "avc1.4d401e", 19),
+    ]
+    audio = [
+        _audio("139", "mp4a.40.5", "m4a", 49, 13.7),
+        _audio("140", "mp4a.40.2", "m4a", 129, 37),
+        _audio("380", "ec-3", "m4a", 384, 110),
+    ]
+    assert _choose(video + audio, tmp_path) == "247+139"
