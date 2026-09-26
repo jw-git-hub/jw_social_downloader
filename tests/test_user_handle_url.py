@@ -113,7 +113,7 @@ class _FakeMessage:
     async def answer(self, text, reply_markup=None):
         self.answer_calls.append((text, reply_markup))
 
-    async def reply_video(self, video, caption=None):
+    async def reply_video(self, video, caption=None, **kwargs):
         if self.reply_video_raises is not None:
             raise self.reply_video_raises
         self.sent_media.append("video")

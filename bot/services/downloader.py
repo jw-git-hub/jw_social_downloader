@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import html
+import math
 import os
 import re
 import shutil
@@ -44,6 +45,14 @@ GALLERY_DL_CAROUSEL_MAX_ITEMS = 20
 TIKTOK_MAX_ATTEMPTS = 2
 TIKTOK_RETRY_DELAY = 5
 TIKTOK_TRANSIENT_MARKERS = ("rehydration", "403", "unable to extract", "unable to download webpage")
+SECONDS_PER_MINUTE = 60
+
+
+def _timeout_message() -> str:
+    """Текст таймаута загрузки. Раньше был захардкожен «120 секунд» — враньё
+    после того, как DOWNLOAD_TIMEOUT подняли до 900с (15 минут)."""
+    minutes = math.ceil(settings.DOWNLOAD_TIMEOUT / SECONDS_PER_MINUTE)
+    return f"⏱ Таймаут: загрузка не уложилась в {minutes} мин"
 
 
 @dataclass
@@ -822,7 +831,7 @@ async def download_media(url: str, platform: str) -> DownloadResult:
                         process.kill()
                     await process.wait()
                     _cleanup_glob(DOWNLOAD_DIR, filename)
-                    return DownloadResult(success=False, error_message="⏱ Таймаут: сервер не ответил за 120 секунд")
+                    return DownloadResult(success=False, error_message=_timeout_message())
 
                 actual_files = _find_downloaded_files(DOWNLOAD_DIR, filename)
 
