@@ -100,6 +100,7 @@ async def test_probably_delivered_is_not_resent_and_quota_is_kept(
         monkeypatch.setattr(U, "download_media", ok)
         monkeypatch.setattr(U, "probe_media", _no_probe)
         monkeypatch.setattr(U, "SEND_RETRY_DELAYS", (0, 0, 0))
+        monkeypatch.setattr(settings, "USE_LOCAL_BOT_API", True)
 
         clock = {"now": 0.0}
         monkeypatch.setattr(U, "time", SimpleNamespace(monotonic=lambda: clock["now"]))
@@ -119,6 +120,49 @@ async def test_probably_delivered_is_not_resent_and_quota_is_kept(
         assert await _free_downloads_left(maker, uid) == 0
         assert msg.status_message is not None
         assert "Telegram ещё обрабатывает" in msg.status_message.edit_calls[-1]
+        assert not any("Готово" in text for text, _ in msg.answer_calls)
+    finally:
+        await engine.dispose()
+
+
+async def test_long_network_failure_in_cloud_mode_refunds_quota(
+    monkeypatch, sqlite_engine_factory, tmp_path
+):
+    """Тот же обрыв на 450с, но в облаке (USE_LOCAL_BOT_API=False, дефолт теста):
+
+    у облачного Bot API нет нашего IDLE_TIMEOUT, поэтому это обычный сетевой
+    сбой, а не «вероятно доставлено» — ретраить бессмысленно (файл уже не
+    придёт), но квоту нужно вернуть и не обещать пользователю доставку.
+    """
+    maker, engine = await _make_session_maker(sqlite_engine_factory, tmp_path, "cloud_long_failure.db")
+    try:
+        uid = 991008
+        video_path = tmp_path / "video.mp4"
+        video_path.write_bytes(b"x" * 1024)
+        ok = await _seeded_video_download(maker, uid, video_path)
+        monkeypatch.setattr(U, "async_session", maker)
+        monkeypatch.setattr(U, "download_media", ok)
+        monkeypatch.setattr(U, "probe_media", _no_probe)
+        monkeypatch.setattr(U, "SEND_RETRY_DELAYS", (0, 0, 0))
+
+        clock = {"now": 0.0}
+        monkeypatch.setattr(U, "time", SimpleNamespace(monotonic=lambda: clock["now"]))
+
+        calls = {"n": 0}
+
+        async def _fail_after_long_wait():
+            calls["n"] += 1
+            clock["now"] += 450  # >= PROBABLY_DELIVERED_AFTER_SEC
+            raise TelegramNetworkError(method=_METHOD, message="idle timeout")
+
+        msg = _FakeSendSafetyMessage(uid, on_reply_video=_fail_after_long_wait)
+
+        await U._process_download(msg, TEST_URL, "tiktok")
+
+        assert calls["n"] == 1
+        assert await _free_downloads_left(maker, uid) == 1
+        assert msg.status_message is not None
+        assert "Telegram ещё обрабатывает" not in msg.status_message.edit_calls[-1]
         assert not any("Готово" in text for text, _ in msg.answer_calls)
     finally:
         await engine.dispose()

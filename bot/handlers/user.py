@@ -322,9 +322,12 @@ def _retry_delay(exc: BaseException, attempt: int) -> float:
 async def _handle_send_failure(exc: BaseException, elapsed: float, attempt: int) -> None:
     """Разбирает вердикт classify_send_failure для одной неудачной попытки.
 
-    RETRY — спит и возвращается (вызывающий цикл повторит попытку). Во всех
-    остальных случаях поднимает исключение: ProbablyDeliveredError для
-    PROBABLY_DELIVERED, иначе исходное исключение как есть (GIVE_UP/TOO_LARGE).
+    RETRY — спит и возвращается (вызывающий цикл повторит попытку). PROBABLY_DELIVERED
+    трактуется как доставка только в локальном режиме — у нашего telegram-bot-api
+    зашит IDLE_TIMEOUT, и обрыв после него бывает уже случившейся отдачей. В
+    облаке такого таймаута нет, там тот же обрыв — обычный сетевой сбой. Во всех
+    остальных случаях (GIVE_UP/TOO_LARGE и облачный PROBABLY_DELIVERED) поднимает
+    исходное исключение как есть.
     """
     verdict = classify_send_failure(exc, elapsed, attempt, MAX_SEND_ATTEMPTS)
     if verdict is SendVerdict.RETRY:
@@ -335,7 +338,7 @@ async def _handle_send_failure(exc: BaseException, elapsed: float, attempt: int)
         )
         await asyncio.sleep(delay)
         return
-    if verdict is SendVerdict.PROBABLY_DELIVERED:
+    if verdict is SendVerdict.PROBABLY_DELIVERED and settings.USE_LOCAL_BOT_API:
         logger.warning(
             "Отправка оборвана после {:.1f}с — файл, скорее всего, доставлен | попытка={}",
             elapsed, attempt + 1,
