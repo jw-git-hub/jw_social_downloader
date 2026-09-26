@@ -18,6 +18,7 @@ backups/
 .claude/
 .superpowers/
 BOT_AUDIT_REPORT.md
+HANDOFF.md
 
 # ── Python ──
 __pycache__/

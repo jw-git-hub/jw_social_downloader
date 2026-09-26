@@ -58,9 +58,10 @@
 ### Возможности для пользователя
 
 - Управление через inline-кнопки, дружелюбное приветственное меню.
-- **3 бесплатных скачивания** для новых пользователей, далее — платная подписка (30 дней, безлимит).
-- Мультивалютная оплата: **USDT (TRC20)**, **VND**, **THB**.
-- Раздел «Профиль»: сколько бесплатных скачиваний осталось, до какой даты активна подписка, сколько всего скачано.
+- **3 бесплатных скачивания в сутки** (скользящие 24 часа); неудачное скачивание не списывается. Когда бесплатные кончились, бот говорит, через сколько откроется следующее.
+- **Подписка за звёзды Telegram** — 250 ⭐ за 30 дней безлимита, продлевается автоматически; отменить можно в настройках Telegram → «Мои звёзды». Оплата прямо в Telegram, без реквизитов и скриншотов.
+- Команды `/terms` (условия), `/support` (поддержка), `/paysupport` (вопросы по оплате и возвратам).
+- Раздел «Профиль»: сколько бесплатных осталось на сутки и через сколько откроется следующее, до какой даты активна подписка, сколько всего скачано.
 - Раздел поддержки — прямая связь с админом, а также раздел с помощью/FAQ по боту.
 
 ### Технические особенности
@@ -79,6 +80,7 @@
 - **Продуманная работа с базой данных**: короткие write-транзакции в SQLAlchemy 2.x (async), чтобы не держать SQLite write-lock во время долгой (до 120 секунд) загрузки и аплоада медиа.
 - **Понятные пользователю сообщения об ошибках**: устаревшие cookies, приватное видео, гео-блокировка, возрастное ограничение, файл слишком большой, рейт-лимит платформы и т.д. — без сырых traceback.
 - **Лимиты и очистка**: лимит размера файла (по умолчанию 50 МБ), таймаут загрузки (120 секунд), немедленная автоочистка временных файлов после отправки плюс периодическая фоновая очистка «зависших» файлов.
+- **Надёжная оплата**: платёж не теряется ни антифлудом, ни перезапуском бота (очередь простоя разбирается — платежи зачисляются, старые ссылки выбрасываются); повторная доставка платежа не продлевает подписку дважды; бесплатный лимит бронируется атомарно одной командой базы.
 
 ### Админ-панель
 
@@ -86,8 +88,10 @@
 
 - Поиск пользователя по ID или @username.
 - Выдача подписки вручную (+N дней).
+- Платежи пользователя звёздами и возврат в два нажатия — возврат сразу отменяет автопродление и снимает подписку.
 - Бан / разбан пользователя.
 - Статистика: всего пользователей, активных подписок, количество скачиваний за 24 часа / 7 дней / 30 дней.
+- Уведомление админу о каждой оплате и продлении.
 
 ### Стек технологий
 
@@ -111,14 +115,18 @@
 
 ```
 bot/
-├── __main__.py        # точка входа: bot/dispatcher, middleware, роутеры, cleanup-task
+├── __main__.py        # точка входа: bot/dispatcher, middleware, роутеры, cleanup-task, разбор очереди простоя
 ├── config.py           # конфиг pydantic-settings (.env)
-├── db/                 # engine.py, models.py (User, DownloadLog), queries.py
+├── db/                 # engine.py, models.py (User, DownloadLog, FreeDownload, StarPayment), queries.py
+│                        # free_quota.py — бронь бесплатных скачиваний, payments.py — платежи звёздами и возвраты
 ├── handlers/           # user.py (флоу пользователя), admin.py (админ-панель)
+│                        # payments.py — экран подписки и оплата звёздами, info.py — /terms, /support, /paysupport
+│                        # admin_payments.py — платежи пользователя и возврат в админке
 ├── keyboards/          # inline.py — inline-клавиатуры
 ├── middlewares/        # throttle.py — анти-флуд
 ├── services/           # downloader.py (yt-dlp/gallery-dl), cleanup.py
 └── utils/              # url_parser.py — ссылка → платформа
+scripts/               # migrate_20260926.py — миграция БД под оплату звёздами и суточный лимит
 Dockerfile
 docker-compose.yml
 requirements.txt
@@ -147,6 +155,10 @@ cp .env.example .env
 python -m bot
 ```
 
+#### Обновление с версии до 2026-09-26
+
+Остановить бота, выполнить `scripts/migrate_20260926.py --database <путь-к-базе> --backup-dir <папка-для-бэкапа>`, запустить снова. Без миграции бот не стартует и прямо об этом пишет.
+
 ### Конфигурация
 
 Все настройки берутся из `.env` (шаблон — `.env.example`). Реальные значения хранятся только в локальном `.env`, который **не коммитится в репозиторий**.
@@ -159,7 +171,8 @@ python -m bot
 | `ADMIN_ID` | Telegram ID администратора |
 | `ADMIN_USERNAME` | Username администратора для раздела поддержки |
 | `DATABASE_URL` | Строка подключения к БД (SQLite/aiosqlite) |
-| Платёжные реквизиты | Адреса/реквизиты для приёма USDT (TRC20), VND, THB |
+| `FREE_DOWNLOADS_PER_DAY` | Бесплатных скачиваний за скользящие сутки (по умолчанию 3) |
+| `SUBSCRIPTION_PRICE_STARS` | Цена подписки на 30 дней в звёздах (по умолчанию 250) |
 | `COOKIES_FILE` | Путь к файлу cookies для приватного/возрастного контента |
 | `TIKTOK_PROXY` | Прокси для обхода транзиторного TikTok WAF (опционально) |
 
@@ -205,9 +218,10 @@ python -m bot
 ### User Features
 
 - Inline-button navigation with a friendly welcome menu.
-- **3 free downloads** for new users, then a paid subscription (30 days, unlimited).
-- Multi-currency payments: **USDT (TRC20)**, **VND**, **THB**.
-- A "Profile" section: remaining free downloads, subscription expiry date, total downloads to date.
+- **3 free downloads per day** (rolling 24 hours); a failed download is not counted. Once the free downloads run out, the bot tells you when the next one opens up.
+- **Subscription paid in Telegram Stars** — 250 ⭐ for 30 days of unlimited downloads, auto-renewing; cancel any time in Telegram Settings → My Stars. Payment happens right inside Telegram, no payment details or screenshots involved.
+- Commands `/terms` (terms of use), `/support` (support), `/paysupport` (payment and refund questions).
+- A "Profile" section: remaining free downloads for the day and when the next one opens up, subscription expiry date, total downloads to date.
 - A support section for direct contact with the admin, plus a help/FAQ section.
 
 ### Technical Highlights
@@ -226,6 +240,7 @@ This is the core engineering showcase of the project:
 - **Careful database design**: short write transactions in SQLAlchemy 2.x (async) so the SQLite write lock is never held during a long (up to 120s) download/upload operation.
 - **User-friendly error messages**: stale cookies, private videos, geo-blocks, age restrictions, oversized files, platform rate limits, and more — no raw tracebacks shown to the user.
 - **Limits and cleanup**: configurable file-size limit (50 MB by default), download timeout (120s), immediate temp-file cleanup after sending plus a periodic background sweep for any leftover files.
+- **Reliable payments**: a payment is never lost to anti-flood or a bot restart (the queue built up while the bot was down is replayed on startup — payments are credited, everything else is dropped); a redelivered payment doesn't extend the subscription twice; the free-quota reservation is a single atomic database statement.
 
 ### Admin Panel
 
@@ -233,8 +248,10 @@ Available only to the administrator (`ADMIN_ID` from configuration) via the `/ad
 
 - Look up a user by ID or @username.
 - Grant a subscription manually (+N days).
+- View a user's Stars payments and refund one in two taps — a refund immediately cancels auto-renewal and removes the subscription.
 - Ban / unban a user.
 - Statistics: total users, active subscriptions, downloads over the last 24h / 7d / 30d.
+- A notification to the admin on every payment and renewal.
 
 ### Tech Stack
 
@@ -258,14 +275,18 @@ Available only to the administrator (`ADMIN_ID` from configuration) via the `/ad
 
 ```
 bot/
-├── __main__.py        # entry point: bot/dispatcher, middleware, routers, cleanup task
+├── __main__.py        # entry point: bot/dispatcher, middleware, routers, cleanup task, replaying the downtime queue
 ├── config.py           # pydantic-settings config (.env)
-├── db/                 # engine.py, models.py (User, DownloadLog), queries.py
+├── db/                 # engine.py, models.py (User, DownloadLog, FreeDownload, StarPayment), queries.py
+│                        # free_quota.py — free-download reservation, payments.py — Stars payments and refunds
 ├── handlers/           # user.py (user flow), admin.py (admin panel)
+│                        # payments.py — subscription screen and Stars checkout, info.py — /terms, /support, /paysupport
+│                        # admin_payments.py — a user's payments and refunds in the admin panel
 ├── keyboards/          # inline.py — inline keyboards
 ├── middlewares/         # throttle.py — anti-flood
 ├── services/           # downloader.py (yt-dlp/gallery-dl), cleanup.py
 └── utils/               # url_parser.py — link → platform
+scripts/               # migrate_20260926.py — database migration for Stars payments and the daily limit
 Dockerfile
 docker-compose.yml
 requirements.txt
@@ -294,6 +315,10 @@ cp .env.example .env
 python -m bot
 ```
 
+#### Upgrading from a version older than 2026-09-26
+
+Stop the bot, run `scripts/migrate_20260926.py --database <path-to-database> --backup-dir <backup-folder>`, then start it again. The bot refuses to start without the migration and says so directly.
+
 ### Configuration
 
 All settings are sourced from `.env` (template: `.env.example`). Real values live only in a local `.env` file, which **is not committed to the repository**.
@@ -306,7 +331,8 @@ Key variables:
 | `ADMIN_ID` | Administrator's Telegram ID |
 | `ADMIN_USERNAME` | Administrator's username for the support section |
 | `DATABASE_URL` | Database connection string (SQLite/aiosqlite) |
-| Payment details | Addresses/details for accepting USDT (TRC20), VND, THB |
+| `FREE_DOWNLOADS_PER_DAY` | Free downloads per rolling 24 hours (default 3) |
+| `SUBSCRIPTION_PRICE_STARS` | 30-day subscription price in Stars (default 250) |
 | `COOKIES_FILE` | Path to a cookies file for private/age-restricted content |
 | `TIKTOK_PROXY` | Proxy to work around transient TikTok WAF challenges (optional) |
 
