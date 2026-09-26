@@ -9,7 +9,7 @@ from loguru import logger
 
 from bot.config import settings
 from bot.db.engine import init_db
-from bot.handlers import admin_router, info_router, payments_router, user_router
+from bot.handlers import admin_payments_router, admin_router, info_router, payments_router, user_router
 from bot.middlewares.throttle import ThrottleMiddleware
 from bot.services.cleanup import EFFECTIVE_CLEANUP_MAX_AGE_MIN, periodic_cleanup
 from bot.utils.log_guard import setup_logging
@@ -126,6 +126,7 @@ async def main() -> None:
     dp.callback_query.middleware(ThrottleMiddleware(rate_limit=0.7, notify=True))
 
     dp.include_router(admin_router)
+    dp.include_router(admin_payments_router)
     dp.include_router(payments_router)
     dp.include_router(info_router)
     dp.include_router(user_router)

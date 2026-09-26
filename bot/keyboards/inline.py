@@ -88,7 +88,29 @@ def get_user_card_kb(user_id: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="📅 +7 дней", callback_data=f"admin:grant:{user_id}:7"),
             InlineKeyboardButton(text="📅 +30 дней", callback_data=f"admin:grant:{user_id}:30"),
         ],
+        [InlineKeyboardButton(text="💸 Платежи", callback_data=f"admin:payments:{user_id}")],
         [InlineKeyboardButton(text="🔨 Бан/Разбан", callback_data=f"admin:ban:{user_id}")],
         [InlineKeyboardButton(text="🔍 Найти другого", callback_data="admin:search")],
         [InlineKeyboardButton(text="⚙️  Админ-панель", callback_data="admin:panel")],
+    ])
+
+
+def get_payments_kb(user_id: int, payments) -> InlineKeyboardMarkup:
+    """Кнопка возврата — только у невозвращённых платежей."""
+    rows = [
+        [InlineKeyboardButton(
+            text=f"↩️ Вернуть {p.amount} ⭐ от {p.created_at:%d.%m}",
+            callback_data=f"admin:refund_ask:{p.id}",
+        )]
+        for p in payments
+        if p.refunded_at is None
+    ]
+    rows.append([InlineKeyboardButton(text="👤 Карточка", callback_data=f"admin:card:{user_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def get_refund_confirm_kb(payment_id: int, user_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Вернуть", callback_data=f"admin:refund_do:{payment_id}")],
+        [InlineKeyboardButton(text="↩️ Назад", callback_data=f"admin:payments:{user_id}")],
     ])
