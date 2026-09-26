@@ -54,7 +54,7 @@
 | TikTok | Видео, слайдшоу-фото | Приоритет H.264, ретрай транзиторного WAF-челленджа, учёт watermark-версий; слайдшоу `/photo/` — через gallery-dl |
 | Facebook | Видео | Приоритет H.264/avc1 над AV1 (иначе «звук без картинки»), size-aware выбор DASH-потоков под лимит размера |
 | Pinterest | Картинки, доски | Полностью через gallery-dl (yt-dlp не умеет корректно тянуть картинки/доски) |
-| YouTube | Видео | Клиенты web_safari/android_vr/tv, avc1/mp4, `manifest-filesize-approx`, плавная деградация качества |
+| YouTube | Видео | Максимальное разрешение без потолка в любом кодеке (при равном разрешении H.264 → VP9 → AV1), SDR вместо HDR, ступенька вниз по разрешению под лимит размера |
 
 ### Возможности для пользователя
 
@@ -72,7 +72,7 @@
 - **Полностью асинхронная архитектура** на aiogram 3.x: ограничение параллелизма загрузок через семафор (по умолчанию 3 одновременных загрузки) плюс throttle-мидлварь против флуда от одного пользователя.
 - **Платформо-специфичный подбор форматов** — ключевая борьба с типичной проблемой «видео пришло, но звук без картинки» в Telegram-плеере:
   - *Facebook*: приоритет кодека H.264/avc1 над AV1 (Telegram-плеер на многих клиентах не проигрывает AV1 корректно), size-aware выбор DASH-потока с учётом лимита размера файла.
-  - *YouTube*: перебор клиентов `web_safari` → `android_vr` → `tv` для получения H.264/mp4-потоков, использование `manifest-filesize-approx` для оценки размера без полной загрузки манифеста, плавная деградация качества при превышении лимита.
+  - *YouTube*: максимальное доступное разрешение без потолка в любом кодеке (8K у YouTube бывает только в AV1; владелец выбрал всегда лучшее доступное) — при равном разрешении предпочитается H.264, затем VP9 и AV1, звук AAC; если разрешение не влезает в лимит размера, берётся следующее по убыванию, а не отказ. Дорожки склеиваются в MP4 без перекодирования.
   - *TikTok*: приоритет H.264, ретрай при транзиторном WAF-челлендже (rehydration/403 — платформа флапает, а не банит по IP), учёт видео с водяным знаком и без.
   - *Instagram*: селектор `bv*+ba` для получения максимального доступного разрешения из DASH-потоков.
 - **gallery-dl как fallback** там, где yt-dlp принципиально не справляется: доски и картинки Pinterest, смешанные карусели Instagram (`/p/`), слайдшоу-фото TikTok (`/photo/`).
@@ -106,7 +106,7 @@
 | ORM / БД | SQLAlchemy 2.x (async) + aiosqlite (SQLite) |
 | Конфигурация | pydantic-settings (`.env`) |
 | Логирование | loguru (ротация 10 МБ, хранение 7 дней) |
-| JS-рантайм | Deno (для YouTube web_safari, H.264) |
+| JS-рантайм | Deno (решение JS-челленджей YouTube для yt-dlp) |
 | HTTP-impersonation | curl-cffi (TikTok, Instagram) |
 | Деплой | Docker + docker-compose, host-network, tmpfs 200 МБ |
 
@@ -225,7 +225,7 @@ python -m bot
 | TikTok | Videos, photo slideshows | H.264 priority, retry on transient WAF challenges, handles both watermarked and clean versions; `/photo/` slideshows go through gallery-dl |
 | Facebook | Videos | H.264/avc1 prioritized over AV1 (otherwise "video with no picture"), size-aware DASH stream selection against the size limit |
 | Pinterest | Images, boards | Handled entirely via gallery-dl (yt-dlp cannot correctly pull images/boards) |
-| YouTube | Videos | web_safari/android_vr/tv clients, avc1/mp4, `manifest-filesize-approx`, graceful quality degradation |
+| YouTube | Videos | Highest resolution with no cap in any codec (H.264 → VP9 → AV1 at equal resolution), SDR over HDR, steps down in resolution to fit the size limit |
 
 ### User Features
 
@@ -243,7 +243,7 @@ This is the core engineering showcase of the project:
 - **Fully asynchronous architecture** on aiogram 3.x: download concurrency is capped with a semaphore (3 concurrent downloads by default), plus a throttle middleware guarding against flooding from a single user.
 - **Platform-specific format selection** — the key fix for the classic Telegram-player problem of "video plays with no picture, audio only":
   - *Facebook*: H.264/avc1 is prioritized over AV1 (many Telegram clients fail to render AV1 correctly), with size-aware DASH stream selection against the file-size limit.
-  - *YouTube*: falls through `web_safari` → `android_vr` → `tv` clients to obtain H.264/mp4 streams, uses `manifest-filesize-approx` to estimate size without downloading the full manifest, and degrades quality gracefully when the size limit would otherwise be exceeded.
+  - *YouTube*: highest available resolution with no cap in any codec (YouTube's 8K is AV1-only; the owner chose to always take the best available) — at equal resolution H.264 is preferred, then VP9 and AV1, with AAC audio; if the resolution does not fit the size limit, the next one down is taken instead of failing. Tracks are merged into MP4 without re-encoding.
   - *TikTok*: H.264 priority, automatic retry on transient WAF challenges (rehydration/403 — the platform is rate-sensitive and flaky rather than IP-blocking), correct handling of both watermarked and watermark-free video versions.
   - *Instagram*: a `bv*+ba` selector to pull the highest resolution available from DASH streams.
 - **gallery-dl as a fallback** wherever yt-dlp fundamentally cannot cope: Pinterest boards and images, mixed Instagram `/p/` carousels, TikTok `/photo/` slideshows.
@@ -277,7 +277,7 @@ Available only to the administrator (`ADMIN_ID` from configuration) via the `/ad
 | ORM / database | SQLAlchemy 2.x (async) + aiosqlite (SQLite) |
 | Configuration | pydantic-settings (`.env`) |
 | Logging | loguru (10 MB rotation, 7-day retention) |
-| JS runtime | Deno (for YouTube web_safari, H.264) |
+| JS runtime | Deno (solves YouTube JS challenges for yt-dlp) |
 | HTTP impersonation | curl-cffi (TikTok, Instagram) |
 | Deployment | Docker + docker-compose, host network, 200 MB tmpfs |
 

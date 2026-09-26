@@ -1,19 +1,27 @@
-"""H-1: пин клиентов YouTube (player_client=web_safari,android_vr,tv) снят —
-живой замер показал, что он ограничивал выдачу до 360p (itag 18), а не давал
-предсклеенные HLS avc1 1080p/720p, как утверждал старый комментарий. См.
-downloader.py, ветка platform == "youtube" в `_build_command`.
+"""YouTube-селектор: максимальное доступное разрешение в ЛЮБОМ кодеке, без
+потолка (решение владельца 2026-09-26 — «самый лучший вариант всегда
+выбираем», 8K включительно). Совместимость с плеерами обеспечивает не запрет
+кодека в `-f`, а порядок сортировки `-S`: при равном разрешении H.264
+предпочитается VP9 и AV1, поэтому до 1080p включительно файл остаётся
+H.264+AAC, как раньше. Бюджеты размера — в MiB (как `--max-filesize` и гейт
+`oversized_files`), аудио-бюджет — доля лимита с потолком в МБ (см.
+`YOUTUBE_AUDIO_BUDGET_DIVISOR`/`YOUTUBE_AUDIO_BUDGET_MAX_MB`).
 
-Ревью-раунд (C-1/I-1/I-4): терминальная ветка без ограничения кодека
-пропускала av01 (плеер Telegram его не показывает — «звук без картинки»),
-а фиксированный аудио-бюджет (5M, потом 15M) рвал каскад по длительности
-ролика на любом фиксированном числе. Тесты ниже стерегут оба фикса.
+История: пин клиентов YouTube (player_client=web_safari,android_vr,tv) снят —
+живой замер показал, что он ограничивал выдачу до 360p (itag 18), а не давал
+предсклеенные HLS avc1 1080p/720p, как утверждал старый комментарий.
 """
 
 import re
 from pathlib import Path
 
 from bot.config import settings
-from bot.services.downloader import _build_command
+from bot.services.downloader import (
+    YOUTUBE_AUDIO_BUDGET_DIVISOR,
+    YOUTUBE_AUDIO_BUDGET_MAX_MB,
+    YOUTUBE_FORMAT_SORT,
+    _build_command,
+)
 
 
 def _youtube_cmd(tmp_path: Path, url: str = "https://www.youtube.com/watch?v=aaaaaaaaaaa") -> list[str]:
@@ -22,6 +30,10 @@ def _youtube_cmd(tmp_path: Path, url: str = "https://www.youtube.com/watch?v=aaa
 
 def _selector(cmd: list[str]) -> str:
     return cmd[cmd.index("-f") + 1]
+
+
+def _sort(cmd: list[str]) -> str:
+    return cmd[cmd.index("-S") + 1]
 
 
 def test_youtube_client_pin_is_removed(tmp_path):
@@ -42,21 +54,18 @@ def test_youtube_cascade_starts_with_bv_plus_ba(tmp_path):
 
 
 def test_youtube_size_filter_derived_from_settings(tmp_path, monkeypatch):
-    # Видео-часть лимита обязана меняться вслед за MAX_FILE_SIZE_MB (а не
-    # быть захардкожена на старые константы 48/35, как в прежнем
-    # селекторе) — проверяем на двух разных значениях настройки, что
-    # числа в селекторе действительно разные и соответствуют формуле
-    # (MAX_FILE_SIZE_MB - audio_cap, audio_cap = MAX_FILE_SIZE_MB // 5).
+    # Видео-часть лимита обязана меняться вслед за MAX_FILE_SIZE_MB, единицы —
+    # MiB (двоичные мегабайты), как у --max-filesize и гейта oversized_files.
     monkeypatch.setattr(settings, "MAX_FILE_SIZE_MB", 50)
     selector_50 = _selector(_youtube_cmd(tmp_path))
-    assert "filesize_approx<40M" in selector_50
-    assert "filesize_approx<10M" in selector_50
+    assert "filesize_approx<40MiB" in selector_50
+    assert "filesize_approx<10MiB" in selector_50
 
     monkeypatch.setattr(settings, "MAX_FILE_SIZE_MB", 100)
     selector_100 = _selector(_youtube_cmd(tmp_path))
-    assert "filesize_approx<80M" in selector_100
-    assert "filesize_approx<20M" in selector_100
-    assert "filesize_approx<40M" not in selector_100
+    assert "filesize_approx<80MiB" in selector_100
+    assert "filesize_approx<20MiB" in selector_100
+    assert "filesize_approx<40MiB" not in selector_100
 
 
 def test_youtube_cascade_has_final_branch_without_size_filter(tmp_path):
@@ -69,69 +78,32 @@ def test_youtube_cascade_has_final_branch_without_size_filter(tmp_path):
     assert "filesize" not in branches[-2]
 
 
-# ── Ревью C-1: AV1 допустим только самым последним шансом ───────────────
-
-
-def test_youtube_only_terminal_branch_allows_any_codec(tmp_path):
-    selector = _selector(_youtube_cmd(tmp_path))
-    branches = selector.split("/")
-    # Терминальная ветка — буквально "bv*+ba/b" (два последних элемента
-    # после общего split по "/"): она специально не ограничивает кодек,
-    # чтобы гарантировать непустой результат.
-    terminal, guarded = branches[-2:], branches[:-2]
-    assert terminal == ["bv*+ba", "b"]
-    # Все ветки ДО терминальной обязаны явно называть кодек (avc1/vp9) —
-    # иначе дефолтная сортировка форматов у yt-dlp подставит av01 раньше,
-    # чем каскад дойдёт до терминальной ветки, и Telegram получит
-    # непроигрываемое видео (та же проблема, что была у Facebook).
-    for branch in guarded:
-        assert "vcodec~=" in branch, f"ветка без явного кодека: {branch!r}"
-        assert "av01" not in branch
-
-
-def test_youtube_has_unfiltered_avc1_guard_before_terminal(tmp_path):
-    # Явный "предохранитель" C-1: ветка avc1+m4a без фильтров размера,
-    # которая должна сработать раньше терминальной bv*+ba/b — только если
-    # у ролика вообще нет ни одного avc1-трека, каскад дойдёт до av01.
-    selector = _selector(_youtube_cmd(tmp_path))
-    assert "bv*[vcodec~='^avc1']+ba[ext=m4a]/bv*+ba/b" in selector
-
-
 # ── Ревью I-1: аудио-бюджет не должен рвать каскад по длительности ──────
 
 
-def test_youtube_audio_budget_scales_with_settings(tmp_path, monkeypatch):
-    # audio_cap — доля MAX_FILE_SIZE_MB, а не магическая константа (5M/15M
-    # из предыдущих раундов): сумма video_cap и audio_cap не должна
-    # превышать MAX_FILE_SIZE_MB на любом значении настройки, включая
-    # будущий локальный Bot API (1500).
-    audio_caps = []
-    for max_size in (50, 100, 1500):
+def test_youtube_audio_budget_is_capped_share(tmp_path, monkeypatch):
+    # audio_cap — доля MAX_FILE_SIZE_MB (YOUTUBE_AUDIO_BUDGET_DIVISOR), но не
+    # больше YOUTUBE_AUDIO_BUDGET_MAX_MB — иначе на 1500 видео теряет сотни
+    # МиБ бюджета впустую (владелец решил: разрешение важнее резерва аудио).
+    expected_audio = {50: 10, 100: 20, 1500: 120, 2000: 120}
+    for max_size in (50, 100, 1500, 2000):
         monkeypatch.setattr(settings, "MAX_FILE_SIZE_MB", max_size)
         selector = _selector(_youtube_cmd(tmp_path))
-        caps = sorted({int(n) for n in re.findall(r"filesize_approx<(\d+)M", selector)})
+        caps = sorted({int(n) for n in re.findall(r"filesize_approx<(\d+)MiB", selector)})
+        # Ровно два различных числа в самом селекторе: аудио-бюджет и
+        # видео-бюджет (video_cap = MAX - audio_cap).
         assert len(caps) == 2, caps
         audio_cap, video_cap = caps
-        # Сама по себе эта сумма верна почти "по построению" (video_cap
-        # выводится как MAX - audio_cap) — ловит только полностью
-        # оторванные от settings числа, поэтому дополнительно ниже
-        # проверяем, что САМ audio_cap меняется вместе с MAX_FILE_SIZE_MB
-        # (магическая константа 15M не изменилась бы).
-        assert video_cap + audio_cap == max_size
-        audio_caps.append(audio_cap)
-
-    # audio_cap обязан расти вместе с MAX_FILE_SIZE_MB — если бы это была
-    # константа (старые 5M/15M), три значения совпали бы.
-    assert len(set(audio_caps)) == 3, audio_caps
-    assert audio_caps[0] < audio_caps[1] < audio_caps[2]
+        assert audio_cap + video_cap == max_size
+        assert audio_cap == min(max_size // YOUTUBE_AUDIO_BUDGET_DIVISOR, YOUTUBE_AUDIO_BUDGET_MAX_MB)
+        assert audio_cap == expected_audio[max_size], (max_size, audio_cap)
 
 
 def test_youtube_has_worst_audio_fallback_without_size_filter(tmp_path):
     # `wa` (worst audio) — самый лёгкий доступный трек по определению
     # yt-dlp, фильтр размера ему не нужен. Эта ветка обязана существовать
-    # ДО vp9-фолбэка и до терминальной ветки, иначе длинные ролики (аудио
-    # тяжелее бюджета при коротком видео) будут падать в av01/terminal —
-    # именно так был найден I-1 (F6TRAYUUDcQ, 42 мин).
+    # ДО терминальной, иначе длинные ролики (аудио тяжелее бюджета при
+    # коротком видео) будут падать в терминальную ветку без разбора.
     selector = _selector(_youtube_cmd(tmp_path))
     branches = selector.split("/")
     wa_branches = [b for b in branches if b.startswith("wa") or "+wa" in b]
@@ -179,3 +151,34 @@ def test_youtube_keeps_manifest_filesize_approx_compat_option(tmp_path):
 def test_youtube_no_playlist_still_set(tmp_path):
     cmd = _youtube_cmd(tmp_path)
     assert "--no-playlist" in cmd
+
+
+# ── Решение владельца 2026-09-26: любой кодек, единицы MiB, сортировка ──
+
+
+def test_youtube_selector_does_not_restrict_codec(tmp_path):
+    # Кодековых фильтров в -f больше нет вообще: совместимость обеспечивает
+    # порядок -S, а не запрет vp9/av01 в селекторе.
+    selector = _selector(_youtube_cmd(tmp_path))
+    assert "vcodec" not in selector
+
+
+def test_youtube_size_filters_are_in_mib(tmp_path):
+    selector = _selector(_youtube_cmd(tmp_path))
+    units = re.findall(r"filesize_approx<\d+([A-Za-z]+)", selector)
+    assert units, selector
+    assert all(unit == "MiB" for unit in units), units
+
+
+def test_youtube_sort_prefers_resolution_capped_at_4k(tmp_path):
+    # Название теста сохранено для трассировки решения владельца: потолка
+    # 4K больше нет («самый лучший вариант всегда выбираем»), первое поле
+    # сортировки — ровно "res" (без ":2160"), 8K тоже допустим.
+    cmd = _youtube_cmd(tmp_path)
+    sort_value = _sort(cmd)
+    assert sort_value == YOUTUBE_FORMAT_SORT
+    fields = sort_value.split(",")
+    assert fields[0] == "res"
+    assert "hdr:sdr" in fields
+    assert "+codec:avc:m4a" in fields
+    assert fields.index("hdr:sdr") < fields.index("+codec:avc:m4a")
