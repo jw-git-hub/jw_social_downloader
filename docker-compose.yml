@@ -40,6 +40,73 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  # Свой Bot API-сервер: снимает облачный потолок 50 МБ на файл (см.
+  # USE_LOCAL_BOT_API в bot/config.py). Сервис bot к нему НЕ привязан
+  # (нет depends_on) — в облачном режиме бот не должен от него зависеть.
+  telegram-bot-api:
+    # :latest невоспроизводим: дайджест менялся без коммитов в апстриме.
+    image: aiogram/telegram-bot-api:10.3
+    container_name: jw_telegram_bot_api
+    restart: always
+    # Файлы в Telegram теперь заливает он, а Docker NAT на этом хосте роняет
+    # аплоады больше ~1.5 МБ (path MTU 1280) — та же причина, что у bot.
+    network_mode: host
+    environment:
+      # Ключи приложения с my.telegram.org, только из .env.
+      TELEGRAM_API_ID: "${TELEGRAM_API_ID}"
+      TELEGRAM_API_HASH: "${TELEGRAM_API_HASH}"
+      # --local: файлы до 2000 МБ.
+      TELEGRAM_LOCAL: "1"
+      # Host-сеть, поэтому слушать только loopback.
+      TELEGRAM_HTTP_IP_ADDRESS: "127.0.0.1"
+      # Совпадает с TELEGRAM_API_BASE.
+      TELEGRAM_HTTP_PORT: "8081"
+      # Нет переменной, включающей стат-порт, и нет ports ниже: тот порт
+      # отдаёт полный токен бота открытым текстом, а ?v= меняет verbosity —
+      # не включать.
+    volumes:
+      # Внутри лежит папка, названная ПОЛНЫМ ТОКЕНОМ бота: каталог секретный,
+      # вне репозитория, бэкапов и syncthing-папок jw_sync_*.
+      - /mnt/storage/jw_tg_api/data:/var/lib/telegram-bot-api
+      # multipart пишет тело запроса целиком в temp-dir; по умолчанию он в
+      # слое контейнера на eMMC (свободно всего несколько ГБ).
+      - /mnt/storage/jw_tg_api/temp:/tmp/telegram-bot-api
+      # Каталог загрузок сюда НЕ монтируется: отдача идёт через multipart,
+      # серверу эти файлы не нужны, а TDLib GC держим подальше от них.
+    mem_limit: 512m
+    memswap_limit: 512m
+    pids_limit: 128
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Тестовый бот для смоука на отдельном токене, пока боевой бот остаётся на
+  # облачном транспорте. Выключен по умолчанию (профиль smoke):
+  #   docker compose --profile smoke up -d --build bot-smoke
+  bot-smoke:
+    profiles: ["smoke"]
+    extends:
+      service: bot
+    container_name: jw_downloader_bot_smoke
+    restart: "no"
+    environment:
+      # ":-", а не ":?": форма ":?" сломала бы любые compose-команды, если
+      # переменной ещё нет в .env (до того как владелец заведёт тестового
+      # бота). Боевой BOT_TOKEN сюда не подставляется.
+      BOT_TOKEN: "${TEST_BOT_TOKEN:-}"
+      USE_LOCAL_BOT_API: "true"
+      MAX_FILE_SIZE_MB: "1500"
+      # У админа в свежей тестовой базе нет подписки.
+      FREE_DOWNLOADS_PER_DAY: "1000"
+      # Вторая страховка от записи в боевую базу (первая — отдельный том ниже).
+      DATABASE_URL: "sqlite+aiosqlite:///data/smoke.db"
+    volumes:
+      # При extends тома сливаются по целевому пути — эта строка заменяет
+      # bot_data из наследуемого сервиса bot.
+      - bot_smoke_data:/app/data
+
 volumes:
   # Именованный том с базой. Docker наследует владельца из образа только при
   # ПЕРВОМ создании тома — это работает для новых развёртываний. Уже
@@ -48,3 +115,5 @@ volumes:
   # запуском этой версии образа на существующем томе выполнить разово:
   #   docker run --rm -v jw_downloader_bot_data:/data alpine chown -R 1000:1000 /data
   bot_data:
+  # База смоук-бота (см. сервис bot-smoke) — отдельно от bot_data.
+  bot_smoke_data:

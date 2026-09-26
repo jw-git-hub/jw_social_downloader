@@ -12,3 +12,6 @@ backups/
 .superpowers/
 docs/
 BOT_AUDIT_REPORT.md
+# Рабочий каталог telegram-bot-api содержит папку с полным токеном бота;
+# даже случайно не коммитить и не класть в образ.
+jw_tg_api/

@@ -39,6 +39,7 @@
 - [Структура проекта](#структура-проекта)
 - [Установка и запуск](#установка-и-запуск)
 - [Конфигурация](#конфигурация)
+- [Локальный Bot API](#локальный-bot-api)
 - [Портфолио](#портфолио)
 
 ### О проекте
@@ -79,7 +80,7 @@
 - **Сетевая устойчивость**: повторная отправка с экспоненциальным backoff, корректная обработка `TelegramRetryAfter` (учёт `retry_after` от Telegram API).
 - **Продуманная работа с базой данных**: короткие write-транзакции в SQLAlchemy 2.x (async), чтобы не держать SQLite write-lock во время долгой (до 120 секунд) загрузки и аплоада медиа.
 - **Понятные пользователю сообщения об ошибках**: устаревшие cookies, приватное видео, гео-блокировка, возрастное ограничение, файл слишком большой, рейт-лимит платформы и т.д. — без сырых traceback.
-- **Лимиты и очистка**: лимит размера файла (по умолчанию 50 МБ), таймаут загрузки (120 секунд), немедленная автоочистка временных файлов после отправки плюс периодическая фоновая очистка «зависших» файлов.
+- **Лимиты и очистка**: лимит размера файла (до 50 МБ на облачном Bot API, до `MAX_FILE_SIZE_MB` на своём — см. «Локальный Bot API»), таймаут загрузки 15 минут, немедленная автоочистка временных файлов после отправки плюс периодическая фоновая очистка «зависших» файлов.
 - **Надёжная оплата**: платёж не теряется ни антифлудом, ни перезапуском бота (очередь простоя разбирается — платежи зачисляются, старые ссылки выбрасываются); повторная доставка платежа не продлевает подписку дважды; бесплатный лимит бронируется атомарно одной командой базы.
 
 ### Админ-панель
@@ -178,6 +179,16 @@ python -m bot
 
 Пример значений — плейсхолдеры вида `YOUR_BOT_TOKEN`, `123456789`, `@your_admin_username`.
 
+### Локальный Bot API
+
+Облачный `api.telegram.org` режет отправляемые файлы на 50 МБ. Чтобы отдавать файлы крупнее, `docker-compose.yml` поднимает собственный сервер `telegram-bot-api` (официальный образ, режим `--local`), и бот подключается к нему вместо облака.
+
+- `USE_LOCAL_BOT_API=false` (по умолчанию) — облако, файлы до 50 МБ, значение `MAX_FILE_SIZE_MB` выше 50 автоматически урезается в коде. `USE_LOCAL_BOT_API=true` — свой сервер, файлы до `MAX_FILE_SIZE_MB`.
+- Серверу `telegram-bot-api` в `.env` нужны `TELEGRAM_API_ID` и `TELEGRAM_API_HASH` с https://my.telegram.org (вкладка «API development tools»). Это ключи ПРИЛОЖЕНИЯ, не бота: выдаются один раз на аккаунт разработчика, отдельно от `BOT_TOKEN`.
+- Каталог `/mnt/storage/jw_tg_api/data` — секретный: внутри лежит папка, названная полным токеном бота. Не должен попадать в бэкапы и синхронизируемые папки.
+- Потолок размера файла — 1500 МБ, а не 2000 (доступные в режиме `--local`): на реальной скорости соединения 2 ГБ не укладываются в серверный `IDLE_TIMEOUT=500` секунд, после которого сервер обрывает соединение.
+- Новую версию сервера или конфигурацию можно проверить на отдельном тестовом боте, не трогая боевой: указать `TEST_BOT_TOKEN` в `.env` и выполнить `docker compose --profile smoke up -d --build bot-smoke`.
+
 ### Портфолио
 
 Этот репозиторий — часть портфолио. Автор разрабатывает Telegram-ботов и сайты под заказ: от простых ботов-помощников до сложных систем с платными подписками, админ-панелями и интеграциями с внешними сервисами.
@@ -199,6 +210,7 @@ python -m bot
 - [Project Structure](#project-structure)
 - [Installation & Running](#installation--running)
 - [Configuration](#configuration)
+- [Local Bot API](#local-bot-api)
 - [Portfolio](#portfolio)
 
 ### About
@@ -239,7 +251,7 @@ This is the core engineering showcase of the project:
 - **Network resilience**: retried sends with exponential backoff, and correct handling of `TelegramRetryAfter` (honoring the Telegram API's `retry_after` value).
 - **Careful database design**: short write transactions in SQLAlchemy 2.x (async) so the SQLite write lock is never held during a long (up to 120s) download/upload operation.
 - **User-friendly error messages**: stale cookies, private videos, geo-blocks, age restrictions, oversized files, platform rate limits, and more — no raw tracebacks shown to the user.
-- **Limits and cleanup**: configurable file-size limit (50 MB by default), download timeout (120s), immediate temp-file cleanup after sending plus a periodic background sweep for any leftover files.
+- **Limits and cleanup**: configurable file-size limit (up to 50 MB on the cloud Bot API, up to `MAX_FILE_SIZE_MB` on a self-hosted one — see "Local Bot API"), a 15-minute download timeout, immediate temp-file cleanup after sending plus a periodic background sweep for any leftover files.
 - **Reliable payments**: a payment is never lost to anti-flood or a bot restart (the queue built up while the bot was down is replayed on startup — payments are credited, everything else is dropped); a redelivered payment doesn't extend the subscription twice; the free-quota reservation is a single atomic database statement.
 
 ### Admin Panel
@@ -337,6 +349,16 @@ Key variables:
 | `TIKTOK_PROXY` | Proxy to work around transient TikTok WAF challenges (optional) |
 
 Example values are placeholders such as `YOUR_BOT_TOKEN`, `123456789`, `@your_admin_username`.
+
+### Local Bot API
+
+The cloud `api.telegram.org` caps outgoing files at 50 MB. To send larger files, `docker-compose.yml` runs a self-hosted `telegram-bot-api` server (the official image, `--local` mode), and the bot connects to it instead of the cloud.
+
+- `USE_LOCAL_BOT_API=false` (default) — cloud, files up to 50 MB; any `MAX_FILE_SIZE_MB` above 50 is automatically capped in code. `USE_LOCAL_BOT_API=true` — the self-hosted server, files up to `MAX_FILE_SIZE_MB`.
+- The `telegram-bot-api` server needs `TELEGRAM_API_ID` and `TELEGRAM_API_HASH` in `.env`, obtained from https://my.telegram.org (the "API development tools" tab). These are APPLICATION keys, not the bot's: issued once per developer account, separate from `BOT_TOKEN`.
+- The `/mnt/storage/jw_tg_api/data` directory is secret: it holds a folder literally named after the bot's full token. Keep it out of backups and synced folders.
+- The file-size ceiling is 1500 MB, not the 2000 MB available in `--local` mode: at real-world connection speed, a 2 GB file doesn't fit inside the server's `IDLE_TIMEOUT=500` seconds, after which the server closes the connection.
+- A new server version or config can be tried on a separate test bot without touching the production one: set `TEST_BOT_TOKEN` in `.env` and run `docker compose --profile smoke up -d --build bot-smoke`.
 
 ### Portfolio
 
