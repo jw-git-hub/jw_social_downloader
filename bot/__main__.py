@@ -27,11 +27,12 @@ PUBLIC_COMMANDS = [
 async def replay_pending_payments(bot, dp) -> None:
     """Очередь, накопившаяся за простой: платежи обработать, остальное выбросить.
 
-    Раньше очередь сбрасывалась целиком (`drop_pending_updates=True`), чтобы
-    ссылки из простоя не качались заново со списанием квоты. Но продление
-    подписки Telegram списывает сам в любой момент, и известие, пришедшее
-    во время перезапуска, терялось бы вместе со ссылками. Запрос с
-    `offset = последний + 1` подтверждает выброс остального.
+    Раньше вызывался `start_polling(drop_pending_updates=True)`, но в aiogram 3
+    такого параметра нет — он молча уходит в **kwargs, `delete_webhook` не
+    вызывается. Значит очередь простоя на деле переигрывалась целиком: старые
+    ссылки качались заново, съедая бесплатные скачивания. Выбрасывает её
+    именно этот разбор — запрос с `offset = последний + 1` подтверждает
+    выброс остального.
     """
     await bot.delete_webhook(drop_pending_updates=False)
     allowed = dp.resolve_used_update_types()
@@ -51,15 +52,13 @@ async def replay_pending_payments(bot, dp) -> None:
 async def run_polling(dp, bot) -> None:
     """Запуск лонг-поллинга после разбора очереди простоя.
 
-    Если разбор не удался (сеть), ведём себя как раньше — сбрасываем очередь
-    целиком: старые ссылки качать нельзя, а упасть на старте хуже.
+    Разбор не удался (сеть) → исключение наружу, процесс падает, перезапуск
+    контейнера (`restart: always` в docker-compose.yml) повторит разбор.
+    Запасного «сброса» нет сознательно: он либо переигрывал бы старые ссылки
+    (drop_pending_updates всё равно игнорируется aiogram 3), либо выбрасывал
+    бы непрочитанные платежи.
     """
-    try:
-        await replay_pending_payments(bot, dp)
-    except Exception as exc:
-        logger.warning("Разбор очереди простоя не удался, сбрасываем её | error={}", exc)
-        await dp.start_polling(bot, drop_pending_updates=True)
-        return
+    await replay_pending_payments(bot, dp)
     await dp.start_polling(bot)
 
 

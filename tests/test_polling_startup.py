@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import pytest
+
 from bot import __main__ as entrypoint
 
 
@@ -54,13 +56,14 @@ async def test_backlog_replays_only_payments_and_confirms_offset():
 async def test_polling_starts_without_dropping_after_replay():
     dp = FakeDispatcher()
     await entrypoint.run_polling(dp, FakeBot([]))
-    assert dp.polling_kwargs.get("drop_pending_updates") in (None, False)
+    assert dp.polling_kwargs == {}
 
 
-async def test_replay_failure_falls_back_to_dropping_backlog():
+async def test_replay_failure_propagates_and_polling_does_not_start():
     dp = FakeDispatcher()
-    await entrypoint.run_polling(dp, FakeBot([], fail=True))
-    assert dp.polling_kwargs.get("drop_pending_updates") is True
+    with pytest.raises(RuntimeError):
+        await entrypoint.run_polling(dp, FakeBot([], fail=True))
+    assert dp.polling_kwargs is None
     assert dp.fed == []
 
 
