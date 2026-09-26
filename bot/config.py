@@ -1,8 +1,12 @@
 import os
 from typing import Mapping
 
-from pydantic import Field
+from loguru import logger
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings
+
+# Жёсткий потолок облачного api.telegram.org на отправляемый файл.
+CLOUD_BOT_API_MAX_FILE_MB = 50
 
 
 class Settings(BaseSettings):
@@ -20,6 +24,9 @@ class Settings(BaseSettings):
     TIKTOK_PROXY: str = ""  # опционально: http(s)/socks-прокси для обхода анти-бота TikTok; пусто = напрямую
 
     # ── Локальный Bot API ──
+    # False — облако (потолок 50 МБ), True — свой сервер по TELEGRAM_API_BASE,
+    # переключается одной строкой в .env.
+    USE_LOCAL_BOT_API: bool = False
     # Адрес самостоятельно поднятого telegram-bot-api (см. docker-compose.yml).
     TELEGRAM_API_BASE: str = "http://127.0.0.1:8081"
     # Таймаут HTTP-запроса к нему. Заведомо больше серверного IDLE_TIMEOUT=500,
@@ -44,6 +51,24 @@ class Settings(BaseSettings):
     # Settings не объявляет, а источник dotenv подаёт в валидацию ВСЕ непустые
     # ключи файла. Опечатки в СВОИХ ключах ловит check_env_keys ниже.
     model_config = {"env_file": ".env", "extra": "ignore"}
+
+    @model_validator(mode="after")
+    def _cap_file_size_for_cloud(self) -> "Settings":
+        """Облачный api.telegram.org режет файлы жёстко на 50 МБ: значение
+        MAX_FILE_SIZE_MB выше этого потолка на облачном транспорте всё равно
+        не сработает, а забытая строка в .env при откате с локального
+        сервера на облако раньше приводила к тому, что бот качал гигабайты и
+        падал на отправке. Теперь предохранитель встроен в код и не зависит
+        от .env."""
+        if not self.USE_LOCAL_BOT_API and self.MAX_FILE_SIZE_MB > CLOUD_BOT_API_MAX_FILE_MB:
+            configured = self.MAX_FILE_SIZE_MB
+            self.MAX_FILE_SIZE_MB = CLOUD_BOT_API_MAX_FILE_MB
+            logger.info(
+                "облачный Bot API: потолок файла 50 МБ, MAX_FILE_SIZE_MB={} "
+                "действует только с USE_LOCAL_BOT_API=true",
+                configured,
+            )
+        return self
 
 
 def _within_one_edit(a: str, b: str) -> bool:

@@ -3,6 +3,7 @@ import asyncio
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.client.telegram import PRODUCTION, TelegramAPIServer
 from aiogram.enums import ParseMode
 from aiogram.types import BotCommand
 from loguru import logger
@@ -62,14 +63,26 @@ async def run_polling(dp, bot) -> None:
     await dp.start_polling(bot)
 
 
+def _api_server() -> TelegramAPIServer:
+    """Сервер Bot API, к которому подключается сессия.
+
+    USE_LOCAL_BOT_API=true — свой telegram-bot-api по TELEGRAM_API_BASE
+    (docker-compose.yml), иначе облачный api.telegram.org.
+    """
+    if settings.USE_LOCAL_BOT_API:
+        return TelegramAPIServer.from_base(settings.TELEGRAM_API_BASE, is_local=True)
+    return PRODUCTION
+
+
 def build_session() -> AiohttpSession:
     """HTTP-сессия к Bot API.
 
     Таймаут берётся из настроек и заведомо больше серверного IDLE_TIMEOUT=500:
     соединение должен закрывать сервер, а не мы. Зашитые 180 секунд не
-    покрывали отдачу крупного файла даже теоретически.
+    покрывали отдачу крупного файла даже теоретически. Сервер — облачный или
+    локальный — выбирает _api_server() по флагу USE_LOCAL_BOT_API.
     """
-    return AiohttpSession(timeout=settings.TELEGRAM_REQUEST_TIMEOUT)
+    return AiohttpSession(api=_api_server(), timeout=settings.TELEGRAM_REQUEST_TIMEOUT)
 
 
 UNHANDLED_ERROR_TEXT = "⚠️ Что-то пошло не так. Попробуй ещё раз."
@@ -162,6 +175,11 @@ async def main() -> None:
     except Exception:
         pass
 
+    logger.info(
+        "Bot API transport | mode={} max_file_mb={}",
+        "local" if settings.USE_LOCAL_BOT_API else "cloud",
+        settings.MAX_FILE_SIZE_MB,
+    )
     logger.info("Bot started")
     await run_polling(dp, bot)
 

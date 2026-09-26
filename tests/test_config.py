@@ -14,10 +14,13 @@ def test_new_transport_settings_have_expected_defaults():
 
 
 def test_size_and_timeout_raised_for_local_api():
-    from bot.config import settings
+    from bot.config import Settings, settings
 
     # Стартовое значение; поднимается до 1900 только после замера (Задача 13).
-    assert settings.MAX_FILE_SIZE_MB == 1500
+    # Не settings.MAX_FILE_SIZE_MB: облачный режим (дефолт в тестах) урезает
+    # рабочее значение до CLOUD_BOT_API_MAX_FILE_MB, а здесь фиксируется
+    # именно дефолт поля в коде.
+    assert Settings.model_fields["MAX_FILE_SIZE_MB"].default == 1500
     # 2 ГБ на ~10 МБ/с не укладываются в прежние 120 секунд.
     assert settings.DOWNLOAD_TIMEOUT == 900
 
@@ -82,49 +85,56 @@ def test_downloader_and_cleanup_use_the_configured_download_root():
 
 
 def test_max_file_size_env_var_overrides_the_code_default(monkeypatch):
-    """Предохранитель (владелец, 2026-09-15): пока транспорт — облачный Bot
-    API с потолком 50 МБ, .env на хосте временно выставляет
-    MAX_FILE_SIZE_MB=50 поверх целевого дефолта 1500 из bot/config.py
-    (тот дефолт поднят заранее под Tasks 12/13 и пином отдельным тестом
-    test_size_and_timeout_raised_for_local_api — трогать его нельзя).
-
-    .env — вне git и не копируется в тестовый образ (.dockerignore), поэтому
-    сам файл здесь не проверить. Но docker-compose подаёт его строки как
-    ОБЫЧНЫЕ переменные окружения процесса (env_file), и именно этот механизм
-    здесь проверяется по факту прогона Settings, а не предполагается."""
+    """MAX_FILE_SIZE_MB настраивается через .env поверх дефолта 1500 из
+    bot/config.py. Проверяется на локальном транспорте (USE_LOCAL_BOT_API=true):
+    на облачном транспорте автопредохранитель урезал бы любое значение до
+    CLOUD_BOT_API_MAX_FILE_MB ещё до сравнения с переопределением из .env,
+    и тест доказывал бы не то поведение."""
+    monkeypatch.setenv("USE_LOCAL_BOT_API", "true")
     monkeypatch.delenv("MAX_FILE_SIZE_MB", raising=False)
     from bot.config import Settings
 
     assert Settings().MAX_FILE_SIZE_MB == 1500
 
-    monkeypatch.setenv("MAX_FILE_SIZE_MB", "50")
-    assert Settings().MAX_FILE_SIZE_MB == 50
+    monkeypatch.setenv("MAX_FILE_SIZE_MB", "800")
+    assert Settings().MAX_FILE_SIZE_MB == 800
 
 
-def test_cloud_api_safety_valve_stays_until_local_bot_api_migration():
-    """Тройной предохранитель Task 2/12/13 на время переходного периода:
-    MAX_FILE_SIZE_MB в коде уже поднят до 1500 (целевое значение под
-    локальный telegram-bot-api), но транспорт всё ещё ОБЛАЧНЫЙ Bot API с
-    жёстким потолком 50 МБ. Пока bot/__main__.py не строит клиента к
-    локальному серверу (TelegramAPIServer / Bot(..., api=...) — Tasks
-    12/13), .env обязан держать временное значение 50, и это отражено в
-    .env.example.
+def test_transport_defaults_to_cloud():
+    from bot.config import Settings
 
-    Тест ЕСТЕСТВЕННО покраснеет, когда Tasks 12/13 добавят локальный Bot API
-    в __main__.py — это СИГНАЛ снять предохранитель (вернуть .env
-    MAX_FILE_SIZE_MB на 1500) и обновить/удалить сам тест, а не поломка,
-    которую нужно чинить в коде.
-    """
-    main_source = (ROOT / "bot" / "__main__.py").read_text(encoding="utf-8")
-    migrated = "TelegramAPIServer" in main_source or re.search(r"\bapi\s*=\s*\w", main_source)
-    assert not migrated, (
-        "локальный Bot API уже подключен в __main__.py — самое время убрать "
-        "временный предохранитель MAX_FILE_SIZE_MB=50 из .env (вернуть 1500) "
-        "и актуализировать/удалить этот тест"
-    )
+    assert Settings.model_fields["USE_LOCAL_BOT_API"].default is False
 
+
+def test_cloud_transport_caps_file_size_at_cloud_limit(monkeypatch):
+    monkeypatch.delenv("USE_LOCAL_BOT_API", raising=False)
+    monkeypatch.delenv("MAX_FILE_SIZE_MB", raising=False)
+    from bot.config import CLOUD_BOT_API_MAX_FILE_MB, Settings
+
+    assert Settings().MAX_FILE_SIZE_MB == CLOUD_BOT_API_MAX_FILE_MB
+
+    monkeypatch.setenv("MAX_FILE_SIZE_MB", "1500")
+    assert Settings().MAX_FILE_SIZE_MB == CLOUD_BOT_API_MAX_FILE_MB
+
+
+def test_cloud_transport_keeps_a_smaller_limit(monkeypatch):
+    monkeypatch.delenv("USE_LOCAL_BOT_API", raising=False)
+    monkeypatch.setenv("MAX_FILE_SIZE_MB", "30")
+    from bot.config import Settings
+
+    assert Settings().MAX_FILE_SIZE_MB == 30
+
+
+def test_local_transport_keeps_configured_limit(monkeypatch):
+    monkeypatch.setenv("USE_LOCAL_BOT_API", "true")
+    monkeypatch.setenv("MAX_FILE_SIZE_MB", "1500")
+    from bot.config import Settings
+
+    assert Settings().MAX_FILE_SIZE_MB == 1500
+
+
+def test_env_example_documents_transport_switch():
     example = (ROOT / ".env.example").read_text(encoding="utf-8")
-    assert "MAX_FILE_SIZE_MB=50" in example, (
-        "временное значение предохранителя (50) должно быть видно в "
-        ".env.example, пока транспорт — облачный Bot API"
-    )
+    assert "USE_LOCAL_BOT_API=false" in example
+    assert not re.search(r"^MAX_FILE_SIZE_MB=", example, re.M)
+    assert "TEST_BOT_TOKEN=" in example
