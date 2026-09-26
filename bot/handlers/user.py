@@ -11,6 +11,7 @@ import aiohttp
 from aiogram import F, Router
 from aiogram.exceptions import (
     TelegramBadRequest,
+    TelegramEntityTooLarge,
     TelegramForbiddenError,
     TelegramNetworkError,
     TelegramRetryAfter,
@@ -42,8 +43,10 @@ from bot.keyboards.inline import (
     get_subscribe_kb,
 )
 from bot.services.cleanup import remove_file
-from bot.services.downloader import ANIMATION_EXTS, IMAGE_EXTS, download_media
-from bot.services.media_probe import probe_media
+from bot.services.disk_space import has_free_space
+from bot.services.downloader import ANIMATION_EXTS, DownloadResult, IMAGE_EXTS, download_media
+from bot.services.media_probe import MediaInfo, probe_media
+from bot.services.sending import ProbablyDeliveredError, SendVerdict, classify_send_failure, oversized_files
 from bot.utils.text import esc, format_wait
 from bot.utils.url_parser import parse_url
 
@@ -295,35 +298,73 @@ async def _safe_edit(callback: CallbackQuery, text: str, reply_markup=None) -> N
         )
 
 
+MAX_SEND_ATTEMPTS = len(SEND_RETRY_DELAYS) + 1
+
+# Что вообще может случиться при отправке и стоит разбирать через
+# classify_send_failure. TelegramEntityTooLarge — подкласс TelegramNetworkError,
+# но перечислен явно для читаемости except-кортежа.
+_RETRYABLE_SEND_ERRORS = (
+    TelegramEntityTooLarge,
+    TelegramRetryAfter,
+    TelegramNetworkError,
+    asyncio.TimeoutError,
+    aiohttp.ClientError,
+)
+
+
+def _retry_delay(exc: BaseException, attempt: int) -> float:
+    """Пауза перед повтором: у TelegramRetryAfter Telegram сам называет её."""
+    if isinstance(exc, TelegramRetryAfter):
+        return exc.retry_after
+    return SEND_RETRY_DELAYS[attempt]
+
+
+async def _handle_send_failure(exc: BaseException, elapsed: float, attempt: int) -> None:
+    """Разбирает вердикт classify_send_failure для одной неудачной попытки.
+
+    RETRY — спит и возвращается (вызывающий цикл повторит попытку). Во всех
+    остальных случаях поднимает исключение: ProbablyDeliveredError для
+    PROBABLY_DELIVERED, иначе исходное исключение как есть (GIVE_UP/TOO_LARGE).
+    """
+    verdict = classify_send_failure(exc, elapsed, attempt, MAX_SEND_ATTEMPTS)
+    if verdict is SendVerdict.RETRY:
+        delay = _retry_delay(exc, attempt)
+        logger.warning(
+            "Сбой при отправке медиа, повтор через {}с | попытка={}/{} error={}",
+            delay, attempt + 1, MAX_SEND_ATTEMPTS, exc,
+        )
+        await asyncio.sleep(delay)
+        return
+    if verdict is SendVerdict.PROBABLY_DELIVERED:
+        logger.warning(
+            "Отправка оборвана после {:.1f}с — файл, скорее всего, доставлен | попытка={}",
+            elapsed, attempt + 1,
+        )
+        raise ProbablyDeliveredError() from exc
+    raise exc
+
+
 async def _send_with_retry(send_coro_factory):
     """Выполняет send_coro_factory() с ретраем при временных сетевых сбоях.
 
-    Ретраятся только TelegramNetworkError, TelegramRetryAfter (спим retry_after
-    вместо фиксированного backoff), asyncio.TimeoutError и aiohttp.ClientError —
-    то есть сетевые/временные проблемы связи с Telegram API. Остальные ошибки
-    (например TelegramBadRequest — слишком большой файл, битое медиа) пробрасываются
-    сразу, без ретрая, чтобы вызывающий код обработал их как раньше.
+    Классификация исхода — bot.services.sending.classify_send_failure:
+    TelegramEntityTooLarge никогда не ретраится, а обрыв дольше
+    PROBABLY_DELIVERED_AFTER_SEC считается вероятной доставкой (сервер сам
+    закрывает соединение по серверному IDLE_TIMEOUT, но файл мог полностью
+    уйти получателю) — повтор в этом случае дал бы дубль в чате.
     """
-    for attempt in range(len(SEND_RETRY_DELAYS) + 1):
+    for attempt in range(MAX_SEND_ATTEMPTS):
+        started = time.monotonic()
         try:
-            return await send_coro_factory()
-        except TelegramRetryAfter as e:
-            if attempt == len(SEND_RETRY_DELAYS):
-                raise
-            logger.warning(
-                f"Telegram просит подождать перед повтором отправки | "
-                f"retry_after={e.retry_after}s попытка={attempt + 1}/{len(SEND_RETRY_DELAYS) + 1}"
-            )
-            await asyncio.sleep(e.retry_after)
-        except (TelegramNetworkError, asyncio.TimeoutError, aiohttp.ClientError) as e:
-            if attempt == len(SEND_RETRY_DELAYS):
-                raise
-            delay = SEND_RETRY_DELAYS[attempt]
-            logger.warning(
-                f"Сетевая ошибка при отправке медиа, повтор через {delay}с | "
-                f"попытка={attempt + 1}/{len(SEND_RETRY_DELAYS) + 1} error={e}"
-            )
-            await asyncio.sleep(delay)
+            result = await send_coro_factory()
+        except _RETRYABLE_SEND_ERRORS as e:
+            await _handle_send_failure(e, time.monotonic() - started, attempt)
+            continue
+        logger.info(
+            "Отправка в Telegram завершена | elapsed={:.1f}s attempt={}",
+            time.monotonic() - started, attempt + 1,
+        )
+        return result
 
 
 async def _reserve_quota(session, tg_user) -> tuple[int, bool, bool, int | None]:
@@ -378,6 +419,117 @@ async def _refund_quota(reservation_id: int) -> None:
             await refund_free_download(session, reservation_id)
     except Exception as exc:
         logger.error("Не удалось вернуть бесплатное скачивание | reservation={} error={}", reservation_id, exc)
+
+
+LOW_DISK_TEXT = "⚠️ Бот временно не может скачивать. Попробуй через несколько минут."
+TOO_LARGE_FOR_TELEGRAM_TEXT = "📦 Telegram не принял файл: он слишком большой."
+PROBABLY_DELIVERED_TEXT = (
+    "📤 <b>Файл большой — Telegram ещё обрабатывает его.</b>\n"
+    "Скорее всего, он появится в этом чате в ближайшие минуты. "
+    "Если через 15 минут его нет — пришли ссылку ещё раз."
+)
+
+
+def _result_paths(dl_result: DownloadResult) -> list[str]:
+    """Все пути результата без дублей — та же логика, что раньше собиралась
+    прямо в `finally` (и отправленные, и отклонённые файлы)."""
+    paths = list(dl_result.file_paths or [])
+    if dl_result.file_path and dl_result.file_path not in paths:
+        paths.append(dl_result.file_path)
+    return paths
+
+
+async def _record_failure(db_user_id: int, url: str, platform: str, reservation_id: int | None) -> None:
+    """Возврат брони и запись неуспеха в лог — тот же порядок, что в трёх
+    старых копиях этой логики выше по файлу (Этап 2 их не трогает)."""
+    if _quota_action(reservation_id is not None, download_ok=False, media_sent_count=0) == "refund":
+        await _refund_quota(reservation_id)
+    try:
+        async with async_session() as session, session.begin():
+            await log_download(session, db_user_id, url, platform, "failed")
+    except Exception as log_exc:
+        logger.error("Не удалось записать лог загрузки | user={} error={}", db_user_id, log_exc)
+
+
+def _oversize_text(actual_mb: float, limit_mb: int) -> str:
+    return (
+        "📦 <b>Файл слишком большой</b>\n"
+        f"Получилось {actual_mb:.0f} МБ, а отправить можно до {limit_mb} МБ. "
+        "Попробуй видео покороче."
+    )
+
+
+async def _show_status(status_msg, text: str) -> None:
+    """Best-effort правка статус-сообщения: любой сбой не должен мешать
+    отправке — тесты нарочно подсовывают статусы, у которых edit_text падает."""
+    try:
+        await status_msg.edit_text(text)
+    except Exception as exc:
+        logger.debug("Не удалось обновить статус-сообщение | error={}", exc)
+
+
+async def _reject_oversized(
+    status_msg, dl_result: DownloadResult, oversized: list[tuple[str, float]]
+) -> None:
+    """Отказ по размеру: статус пользователю и уборка всех путей результата."""
+    actual_mb = max(size for _, size in oversized)
+    await _show_status(status_msg, _oversize_text(actual_mb, settings.MAX_FILE_SIZE_MB))
+    for path in _result_paths(dl_result):
+        await remove_file(path)
+
+
+def _sending_text(size_mb: float | None) -> str:
+    """Статус перед отправкой. Размер показывается только если он известен."""
+    size_part = f" ({size_mb:.0f} МБ)" if size_mb else ""
+    return (
+        f"📤 <b>Отправляю в Telegram{size_part}…</b>\n"
+        "Большой файл может идти несколько минут — бот не завис."
+    )
+
+
+def _video_meta(info: MediaInfo | None) -> dict[str, int]:
+    """width/height/duration для reply_video — только положительные значения.
+
+    Без этого 1.5-гигабайтное видео нельзя смотреть, пока оно не скачается
+    целиком: supports_streaming нужен вместе с этими тремя полями.
+    """
+    if info is None:
+        return {}
+    meta: dict[str, int] = {}
+    if info.width > 0:
+        meta["width"] = info.width
+    if info.height > 0:
+        meta["height"] = info.height
+    if info.duration > 0:
+        meta["duration"] = round(info.duration)
+    return meta
+
+
+async def _record_success(db_user_id: int, url: str, platform: str, size_mb: float | None) -> None:
+    """Инкремент счётчика и success-лог одной транзакцией.
+
+    Вынесено из успешной ветки `_process_download` без изменения поведения —
+    её теперь вызывает и обычный успех, и «вероятно доставлено».
+    """
+    try:
+        async with async_session() as session, session.begin():
+            await increment_total_downloads(session, db_user_id)
+            await log_download(session, db_user_id, url, platform, "success", size_mb)
+    except Exception as log_exc:
+        logger.error("Не удалось записать успешную загрузку | user={} error={}", db_user_id, log_exc)
+
+
+async def _finish_probably_delivered(
+    status_msg, db_user_id: int, url: str, platform: str, size_mb: float | None
+) -> None:
+    """Сервер оборвал соединение после долгой отдачи: файл, скорее всего, уже
+    у пользователя. Квота не возвращается — повтор был бы дублем, а не помощью."""
+    await _record_success(db_user_id, url, platform, size_mb)
+    await _show_status(status_msg, PROBABLY_DELIVERED_TEXT)
+    logger.warning(
+        "Вероятно доставлено, повтор не выполняется | user={} url={}",
+        db_user_id, _url_for_log(url),
+    )
 
 
 @router.message(Command("start"))
@@ -536,6 +688,21 @@ async def handle_url(message: Message) -> None:
 async def _process_download(message: Message, url: str, platform: str) -> None:
     user_id = message.from_user.id
 
+    if not has_free_space(Path(settings.DOWNLOAD_ROOT), settings.MIN_FREE_DISK_GB):
+        # Раньше отвалившийся USB-диск ловился только на записи файла: Docker
+        # успевал создать каталог загрузок на eMMC (свободно 3.9 ГБ), и одна
+        # гигабайтная загрузка укладывала весь хост вместе с базой. Квоту не
+        # трогаем — до неё дело ещё не дошло.
+        logger.error(
+            "Недостаточно места на диске, загрузка отклонена | user={} path={}",
+            user_id, settings.DOWNLOAD_ROOT,
+        )
+        try:
+            await message.reply(LOW_DISK_TEXT)
+        except Exception as exc:
+            logger.info("Не удалось предупредить о нехватке места | user={} error={}", user_id, exc)
+        return
+
     # C-1 шаг 1: одна короткая транзакция читает пользователя И резервирует
     # бесплатное скачивание. Раньше остаток читался здесь, а списывался после аплоада.
     async with async_session() as session, session.begin():
@@ -635,9 +802,22 @@ async def _process_download(message: Message, url: str, platform: str) -> None:
             pass
         return
 
+    # Гейт размера: `--max-filesize` внутри yt-dlp проверяет дорожки по
+    # отдельности, и склейка может выйти больше лимита. Ловим ПОСЛЕ загрузки,
+    # по фактическому размеру готового файла — до отправки, чтобы не тратить
+    # минуты на заведомо отклоняемую отдачу.
+    oversized = oversized_files(_result_paths(dl_result), settings.MAX_FILE_SIZE_MB)
+    if oversized:
+        await _record_failure(db_user_id, url, platform, reservation_id)
+        await _reject_oversized(status_msg, dl_result, oversized)
+        return
+
     media_total_count = len(dl_result.file_paths) if dl_result.file_paths else 1
     media_sent_count = 0
     send_error: Exception | None = None
+    probably_delivered = False
+
+    await _show_status(status_msg, _sending_text(dl_result.file_size_mb))
 
     # C-1 шаг 2: внутри try остаются ТОЛЬКО вызовы отправки в Telegram.
     # Записи в БД и ответы пользователю вынесены наружу: раньше транзакция
@@ -762,12 +942,18 @@ async def _process_download(message: Message, url: str, platform: str) -> None:
                         )
                     )
                 else:
+                    video_meta = _video_meta(probe_info)
                     await _send_with_retry(
                         lambda: message.reply_video(
-                            video=media, caption=_media_caption(platform, "video")
+                            video=media,
+                            caption=_media_caption(platform, "video"),
+                            supports_streaming=True,
+                            **video_meta,
                         )
                     )
             media_sent_count = 1
+    except ProbablyDeliveredError:
+        probably_delivered = True
     except (TelegramNetworkError, TelegramRetryAfter, asyncio.TimeoutError, aiohttp.ClientError) as e:
         send_error = e
         logger.error(
@@ -783,11 +969,15 @@ async def _process_download(message: Message, url: str, platform: str) -> None:
         send_error = e
         logger.error(f"Failed to send file: {e}")
     finally:
-        paths_to_remove = dl_result.file_paths or []
-        if dl_result.file_path and dl_result.file_path not in paths_to_remove:
-            paths_to_remove.append(dl_result.file_path)
-        for p in paths_to_remove:
+        for p in _result_paths(dl_result):
             await remove_file(p)
+
+    if probably_delivered:
+        # При multipart у сервера уже своя копия файла (finally выше
+        # отработал), поэтому удалять наш экземпляр можно без риска оборвать
+        # ещё идущую отдачу.
+        await _finish_probably_delivered(status_msg, db_user_id, url, platform, dl_result.file_size_mb)
+        return
 
     if send_error is None:
         # Fix round 2, N2: третий (последний) незащищённый сайт log_download —
@@ -797,16 +987,7 @@ async def _process_download(message: Message, url: str, platform: str) -> None:
         # уже списана (деньги не теряются), но пользователь не видит "Готово",
         # статус-сообщение "Скачиваю..." остаётся висеть навсегда, и в
         # диспетчер летит необработанное исключение.
-        try:
-            async with async_session() as session, session.begin():
-                await increment_total_downloads(session, db_user_id)
-                await log_download(
-                    session, db_user_id, url, platform, "success", dl_result.file_size_mb
-                )
-        except Exception as log_exc:
-            logger.error(
-                "Не удалось записать успешную загрузку | user={} error={}", db_user_id, log_exc
-            )
+        await _record_success(db_user_id, url, platform, dl_result.file_size_mb)
         try:
             await status_msg.delete()
         except (TelegramBadRequest, TelegramForbiddenError):
@@ -833,6 +1014,15 @@ async def _process_download(message: Message, url: str, platform: str) -> None:
         logger.error(
             "Не удалось записать лог загрузки | user={} error={}", db_user_id, log_exc
         )
+
+    if isinstance(send_error, TelegramEntityTooLarge):
+        # Раньше проходил как обычная сетевая ошибка («попробуй ещё раз»),
+        # хотя повтор был бы бессмысленным: файл не влезает в лимит.
+        try:
+            await status_msg.edit_text(TOO_LARGE_FOR_TELEGRAM_TEXT)
+        except (TelegramBadRequest, TelegramForbiddenError):
+            pass
+        return
 
     is_network_error = isinstance(
         send_error,

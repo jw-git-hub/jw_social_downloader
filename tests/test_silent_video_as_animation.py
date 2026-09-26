@@ -57,7 +57,7 @@ class _FakeMediaMessage:
     async def reply_photo(self, photo, caption=None):
         self.photo_calls.append((str(photo.path), caption))
 
-    async def reply_video(self, video, caption=None):
+    async def reply_video(self, video, caption=None, **kwargs):
         self.video_calls.append((str(video.path), caption))
 
     async def reply_document(self, document, caption=None):

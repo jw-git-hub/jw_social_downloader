@@ -14,6 +14,22 @@ def anyio_backend():
     return "asyncio"
 
 
+@pytest.fixture(autouse=True)
+def _plenty_of_disk_space(monkeypatch):
+    """Тестовый контейнер живёт на eMMC хоста, где часто свободно меньше
+    MIN_FREE_DISK_GB=5. Без этой подмены проверка места из
+    bot/services/disk_space.py заваливала бы существующие тесты хендлера,
+    которым до диска дела нет — поэтому подменяем disk_usage автоматически
+    для каждого теста. tests/test_disk_space.py подменяет disk_usage сам,
+    поверх этой фикстуры, чтобы проверить саму проверку места.
+    """
+    from types import SimpleNamespace
+
+    from bot.services import disk_space
+
+    monkeypatch.setattr(disk_space, "disk_usage", lambda path: SimpleNamespace(free=10**15))
+
+
 def _prod_like_sqlite_engine(db_path):
     """Движок SQLite с той же конфигурацией блокировок, что и боевой
     `bot/db/engine.py`: `connect_args={"timeout": 30}` + PRAGMA из
