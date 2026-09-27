@@ -1,3 +1,4 @@
+import asyncio
 import sys
 from pathlib import Path
 
@@ -60,8 +61,17 @@ async def test_download_media_reports_failure_when_files_vanish(tmp_path, monkey
     class FakeProcess:
         returncode = 0
 
-        async def communicate(self):
-            return b"", b""
+        def __init__(self):
+            # download_media теперь читает stdout/stderr через
+            # communicate_streaming (построчное чтение), а не communicate() —
+            # нужны настоящие asyncio.StreamReader, а не пара байтовых строк.
+            self.stdout = asyncio.StreamReader()
+            self.stdout.feed_eof()
+            self.stderr = asyncio.StreamReader()
+            self.stderr.feed_eof()
+
+        async def wait(self):
+            return 0
 
     async def fake_exec(*args, **kwargs):
         return FakeProcess()

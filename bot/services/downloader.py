@@ -8,7 +8,7 @@ import os
 import re
 import shutil
 import tempfile
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from uuid import uuid4
@@ -16,6 +16,8 @@ from uuid import uuid4
 from loguru import logger
 
 from bot.config import settings
+from bot.services.process_stream import STREAM_LINE_LIMIT_BYTES, communicate_streaming
+from bot.services.ytdlp_progress import YTDLP_PROGRESS_ARGS, DownloadStatus, DownloadTracker
 from bot.utils.log_guard import mask_secrets
 
 DOWNLOAD_DIR = Path(settings.DOWNLOAD_ROOT)
@@ -67,6 +69,11 @@ YOUTUBE_FORMAT_SORT = "res,fps,hdr:sdr,+codec:avc:m4a"
 YOUTUBE_EXTRACTOR_ARGS = "youtube:formats=dashy;skip=hls"
 # -N: сколько DASH-фрагментов качать параллельно одного формата.
 YOUTUBE_CONCURRENT_FRAGMENTS = 8
+# На таймауте stderr раньше не логировался вовсе (communicate() отбрасывался
+# вместе с исключением). Построчное чтение (communicate_streaming) позволяет
+# забрать то, что процесс успел написать в stderr до kill() — храним только
+# хвост, чтобы не раздувать лог длинными списками форматов/ретраев.
+TIMEOUT_STDERR_TAIL_LINES = 20
 
 
 def _timeout_message() -> str:
@@ -532,6 +539,10 @@ def _build_command(url: str, platform: str, output_path: Path, cookies_path: Pat
         cmd.extend(["--no-playlist", "-f", "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b"])
         cmd.extend(["--merge-output-format", "mp4"])
 
+    # Флаги плана формата и прогресса — на всех платформах, прямо перед URL
+    # (см. докстринг bot/services/ytdlp_progress.py: --no-quiet обязателен,
+    # иначе --print молча включает --quiet и глушит строку про max-filesize).
+    cmd.extend(YTDLP_PROGRESS_ARGS)
     cmd.append(url)
     return cmd
 
@@ -680,6 +691,41 @@ def _build_gallery_dl_cmd(url: str, platform: str, prefix: str, cookies_path: Pa
     return cmd
 
 
+def _status_line_handler(
+    tracker: DownloadTracker, on_status: Callable[[DownloadStatus], None] | None
+) -> Callable[[str], bool]:
+    """Мост между построчным чтением stdout и колбэком вызывающего.
+
+    Скармливает строку трекеру; если строка служебная (JWPLAN/JWPROG/JWPP) и
+    задан `on_status`, отдаёт ему снимок состояния. Исключения колбэка
+    глотаются: сбой в отображении статуса не должен ронять саму загрузку.
+    """
+    def handle(line: str) -> bool:
+        consumed = tracker.feed(line)
+        if consumed and on_status is not None:
+            try:
+                on_status(tracker.snapshot())
+            except Exception as exc:
+                logger.debug("on_status callback failed: {}", exc)
+        return consumed
+    return handle
+
+
+def _stderr_tail(buffer: bytes) -> str:
+    """Последние `TIMEOUT_STDERR_TAIL_LINES` строк уже накопленного stderr.
+
+    `buffer` — внешний `bytearray`, который `communicate_streaming` наполняет
+    по мере чтения (см. `stderr_sink`). Читать `process.stderr` заново после
+    отмены `wait_for` НЕЛЬЗЯ: `StreamReader.read()` без размера потребляет
+    внутренний буфер частями через ЛОКАЛЬНЫЕ переменные — при отмене
+    корутины уже прочитанные, но не возвращённые байты пропадают безвозвратно,
+    а не остаются доступны для повторного чтения. `stderr_sink` — отдельный
+    объект, и не теряется вместе с отменённой корутиной.
+    """
+    lines = bytes(buffer).decode(errors="replace").strip().splitlines()
+    return "\n".join(lines[-TIMEOUT_STDERR_TAIL_LINES:])
+
+
 async def _try_gallery_dl(url: str, platform: str, filename: str) -> GalleryDlRun:
     with _ephemeral_cookies() as cookies_path:
         cmd = _build_gallery_dl_cmd(url, platform, filename, cookies_path)
@@ -786,7 +832,18 @@ async def _try_gallery_dl_fallback(
     )
 
 
-async def download_media(url: str, platform: str) -> DownloadResult:
+async def download_media(
+    url: str, platform: str, on_status: Callable[[DownloadStatus], None] | None = None
+) -> DownloadResult:
+    """Скачивает медиа по `url`.
+
+    `on_status` — необязательный синхронный колбэк: вызывается из цикла
+    построчного чтения stdout yt-dlp (см. `_status_line_handler`) с текущим
+    `DownloadStatus` (план формата, фаза, процент, ETA). На пути gallery-dl
+    не вызывается ни разу. Исключения колбэка глотаются — сбой отображения
+    прогресса никогда не должен ронять саму загрузку. Без колбэка поведение
+    (таймаут, kill, уборка, ретраи TikTok, тексты ошибок) не меняется.
+    """
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
     filename = uuid4().hex
@@ -831,6 +888,12 @@ async def download_media(url: str, platform: str) -> DownloadResult:
         # (rehydration / 403) часто проходит со второй попытки. Для остальных платформ
         # max_attempts=1 — поведение полностью прежнее.
         max_attempts = TIKTOK_MAX_ATTEMPTS if platform == "tiktok" else 1
+        # Один трекер на весь download_media: TikTok-ретраи (max_attempts>1)
+        # переиспользуют его так же, как раньше переиспользовали stdout/stderr
+        # переменные — новая попытка просто продолжает копить состояние
+        # (в худшем случае план от неудачной попытки виден недолго, пока
+        # следующая попытка не пришлёт свой before_dl).
+        tracker = DownloadTracker()
 
         try:
             stdout = b""
@@ -840,12 +903,20 @@ async def download_media(url: str, platform: str) -> DownloadResult:
             for attempt in range(1, max_attempts + 1):
                 process = await asyncio.create_subprocess_exec(
                     *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                    limit=STREAM_LINE_LIMIT_BYTES,
                 )
+                line_handler = _status_line_handler(tracker, on_status)
+                # Внешний буфер: communicate_streaming наполняет его по мере
+                # чтения stderr, поэтому хвост доступен, даже если саму
+                # корутину отменит wait_for на таймауте (см. _stderr_tail).
+                stderr_tail_buffer = bytearray()
 
                 try:
-                    stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=settings.DOWNLOAD_TIMEOUT)
+                    stdout, stderr = await asyncio.wait_for(
+                        communicate_streaming(process, line_handler, stderr_sink=stderr_tail_buffer),
+                        timeout=settings.DOWNLOAD_TIMEOUT,
+                    )
                 except asyncio.TimeoutError:
-                    logger.warning("Download timeout | url={}", mask_secrets(url))
                     # Та же гонка asyncio.wait_for, что и в gallery-dl-ветке
                     # (см. _try_gallery_dl): процесс может успеть завершиться
                     # сам между истечением таймаута и этим вызовом — kill()
@@ -855,6 +926,13 @@ async def download_media(url: str, platform: str) -> DownloadResult:
                     with contextlib.suppress(ProcessLookupError):
                         process.kill()
                     await process.wait()
+                    # Раньше stderr на таймауте пропадал целиком вместе с
+                    # отменённым communicate() — построчное чтение позволяет
+                    # забрать то, что процесс успел написать до kill().
+                    logger.warning(
+                        "Download timeout | url={} stderr_tail=\n{}",
+                        mask_secrets(url), mask_secrets(_stderr_tail(stderr_tail_buffer)),
+                    )
                     _cleanup_glob(DOWNLOAD_DIR, filename)
                     return DownloadResult(success=False, error_message=_timeout_message())
 
