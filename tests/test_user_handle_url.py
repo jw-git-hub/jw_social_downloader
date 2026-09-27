@@ -224,7 +224,7 @@ async def test_refund_on_download_failure(monkeypatch, sqlite_engine_factory, tm
         await _seed_user(maker, id=uid, free_left=1)
         monkeypatch.setattr(U, "async_session", maker)
 
-        async def _fail(url, platform):
+        async def _fail(url, platform, **_kwargs):
             return DownloadResult(success=False, error_message="boom")
 
         monkeypatch.setattr(U, "download_media", _fail)
@@ -252,7 +252,7 @@ async def test_no_refund_on_partial_delivery(monkeypatch, sqlite_engine_factory,
         # чанк уходит успешно (media_sent_count=5), второй падает.
         file_paths = [f"/tmp/does-not-exist-{i}.mp4" for i in range(7)]
 
-        async def _ok(url, platform):
+        async def _ok(url, platform, **_kwargs):
             return DownloadResult(success=True, file_paths=file_paths, media_type="video")
 
         monkeypatch.setattr(U, "download_media", _ok)
@@ -333,7 +333,7 @@ async def test_refund_when_download_media_raises(monkeypatch, sqlite_engine_fact
         await _seed_user(maker, id=uid, free_left=1)
         monkeypatch.setattr(U, "async_session", maker)
 
-        async def _boom(url, platform):
+        async def _boom(url, platform, **_kwargs):
             raise OSError("No space left on device")
 
         monkeypatch.setattr(U, "download_media", _boom)
@@ -358,7 +358,7 @@ async def test_refund_survives_log_download_lock_error(monkeypatch, sqlite_engin
         await _seed_user(maker, id=uid, free_left=1)
         monkeypatch.setattr(U, "async_session", maker)
 
-        async def _fail(url, platform):
+        async def _fail(url, platform, **_kwargs):
             return DownloadResult(success=False, error_message="boom")
 
         monkeypatch.setattr(U, "download_media", _fail)
@@ -395,7 +395,7 @@ async def test_success_path_survives_log_download_lock_error(monkeypatch, sqlite
         await _seed_user(maker, id=uid, free_left=1)
         monkeypatch.setattr(U, "async_session", maker)
 
-        async def _ok(url, platform):
+        async def _ok(url, platform, **_kwargs):
             return DownloadResult(
                 success=True,
                 file_path="/tmp/does-not-exist.mp4",
@@ -444,7 +444,7 @@ async def test_success_path_survives_status_delete_forbidden(monkeypatch, sqlite
         await _seed_user(maker, id=uid, free_left=1)
         monkeypatch.setattr(U, "async_session", maker)
 
-        async def _ok(url, platform):
+        async def _ok(url, platform, **_kwargs):
             return DownloadResult(
                 success=True,
                 file_path="/tmp/does-not-exist.mp4",
@@ -497,7 +497,7 @@ async def test_forbidden_during_send_triggers_refund(monkeypatch, sqlite_engine_
         await _seed_user(maker, id=uid, free_left=1)
         monkeypatch.setattr(U, "async_session", maker)
 
-        async def _ok(url, platform):
+        async def _ok(url, platform, **_kwargs):
             return DownloadResult(
                 success=True,
                 file_path="/tmp/does-not-exist.mp4",
@@ -584,7 +584,7 @@ async def test_handle_url_downloads_link_from_caption_when_text_is_empty(
 
         download_calls: list[tuple[str, str]] = []
 
-        async def _ok(url, platform):
+        async def _ok(url, platform, **_kwargs):
             download_calls.append((url, platform))
             return DownloadResult(
                 success=True,
@@ -686,7 +686,7 @@ async def test_download_media_crash_log_does_not_leak_unallowlisted_query_secret
         await _seed_user(maker, id=uid, free_left=1)
         monkeypatch.setattr(U, "async_session", maker)
 
-        async def _boom(url, platform):
+        async def _boom(url, platform, **_kwargs):
             raise OSError("No space left on device")
 
         monkeypatch.setattr(U, "download_media", _boom)

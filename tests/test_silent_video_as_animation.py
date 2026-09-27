@@ -80,7 +80,7 @@ async def test_silent_short_video_is_sent_as_animation(monkeypatch, sqlite_engin
         await _seed_user(maker, id=uid, free_left=1)
         monkeypatch.setattr("bot.handlers.user.async_session", maker)
 
-        async def _ok(url, platform):
+        async def _ok(url, platform, **_kwargs):
             return DownloadResult(
                 success=True, file_path="/tmp/does-not-exist-silent.mp4", media_type="video"
             )
@@ -111,7 +111,7 @@ async def test_video_with_audio_is_sent_as_video(monkeypatch, sqlite_engine_fact
         await _seed_user(maker, id=uid, free_left=1)
         monkeypatch.setattr("bot.handlers.user.async_session", maker)
 
-        async def _ok(url, platform):
+        async def _ok(url, platform, **_kwargs):
             return DownloadResult(
                 success=True, file_path="/tmp/does-not-exist-audio.mp4", media_type="video"
             )
@@ -142,7 +142,7 @@ async def test_silent_video_over_duration_cap_is_sent_as_video(monkeypatch, sqli
         await _seed_user(maker, id=uid, free_left=1)
         monkeypatch.setattr("bot.handlers.user.async_session", maker)
 
-        async def _ok(url, platform):
+        async def _ok(url, platform, **_kwargs):
             return DownloadResult(
                 success=True, file_path="/tmp/does-not-exist-long.mp4", media_type="video"
             )
@@ -173,7 +173,7 @@ async def test_unreadable_file_probe_none_falls_back_to_video(monkeypatch, sqlit
         await _seed_user(maker, id=uid, free_left=1)
         monkeypatch.setattr("bot.handlers.user.async_session", maker)
 
-        async def _ok(url, platform):
+        async def _ok(url, platform, **_kwargs):
             return DownloadResult(
                 success=True, file_path="/tmp/does-not-exist-unreadable.mp4", media_type="video"
             )
@@ -211,7 +211,7 @@ async def test_probe_media_raising_falls_back_to_video_without_crashing(
         await _seed_user(maker, id=uid, free_left=1)
         monkeypatch.setattr("bot.handlers.user.async_session", maker)
 
-        async def _ok(url, platform):
+        async def _ok(url, platform, **_kwargs):
             return DownloadResult(
                 success=True, file_path="/tmp/does-not-exist-crash.mp4", media_type="video"
             )
@@ -244,7 +244,7 @@ async def test_silent_short_webm_is_sent_as_video(monkeypatch, sqlite_engine_fac
         await _seed_user(maker, id=uid, free_left=1)
         monkeypatch.setattr("bot.handlers.user.async_session", maker)
 
-        async def _ok(url, platform):
+        async def _ok(url, platform, **_kwargs):
             return DownloadResult(
                 success=True, file_path="/tmp/does-not-exist-silent.webm", media_type="video"
             )
@@ -275,7 +275,7 @@ async def test_image_media_type_never_calls_probe_media(monkeypatch, sqlite_engi
         await _seed_user(maker, id=uid, free_left=1)
         monkeypatch.setattr("bot.handlers.user.async_session", maker)
 
-        async def _ok(url, platform):
+        async def _ok(url, platform, **_kwargs):
             return DownloadResult(
                 success=True, file_path="/tmp/does-not-exist.jpg", media_type="image"
             )

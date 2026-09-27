@@ -11,6 +11,7 @@ from bot.handlers.user import (
     _status_text,
     _welcome_text,
 )
+from bot.services.progress_texts import format_size
 
 LIMIT = settings.FREE_DOWNLOADS_PER_DAY
 
@@ -78,6 +79,18 @@ def test_limit_reached_text_says_when_and_offers_subscription():
     assert "закончились" in text
     assert "через <b>5 ч 12 мин</b>" in text
     assert "подпиской" in text
+
+
+def test_welcome_mentions_the_size_limit():
+    text = _welcome_text(FreeQuota(left=3, next_at=None), has_subscription=False)
+    assert format_size(settings.MAX_FILE_SIZE_MB) in text
+    assert "лучшем качестве" in text
+
+
+def test_help_mentions_limits_block_with_the_same_limit():
+    text = _help_text(FreeQuota(left=3, next_at=None), has_subscription=False)
+    assert "Ограничения" in text
+    assert format_size(settings.MAX_FILE_SIZE_MB) in text
 
 
 def test_incoming_text_prefers_text_then_caption():

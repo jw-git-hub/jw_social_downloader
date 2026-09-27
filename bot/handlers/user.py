@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import time
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
@@ -46,12 +47,26 @@ from bot.services.cleanup import remove_file
 from bot.services.disk_space import has_free_space
 from bot.services.downloader import ANIMATION_EXTS, DownloadResult, IMAGE_EXTS, download_media
 from bot.services.media_probe import MediaInfo, probe_media
+from bot.services.progress_texts import (
+    PREPARING_TEXT,
+    QUEUED_TEXT,
+    download_status_text,
+    limit_line,
+    limits_block,
+    upload_status_text,
+)
 from bot.services.sending import ProbablyDeliveredError, SendVerdict, classify_send_failure, oversized_files
+from bot.services.status_board import StatusBoard
+from bot.services.upload_estimate import UploadRateTracker
+from bot.services.ytdlp_progress import DownloadStatus, FormatPlan
 from bot.utils.text import esc, format_wait
 from bot.utils.url_parser import parse_url
 
 router = Router(name="user")
 download_semaphore = asyncio.Semaphore(3)
+upload_rate = UploadRateTracker()
+# Меньше — отправка занимает секунды, полоска прогресса не успевает быть полезной.
+UPLOAD_PROGRESS_MIN_MB = 50
 
 # Один пользователь — одна загрузка одновременно. Общего семафора на три слота
 # мало: троттл в 3 с позволяет занять все три за девять секунд на всю длину
@@ -120,6 +135,7 @@ def _welcome_text(quota: FreeQuota, has_subscription: bool) -> str:
         "├ 📘 Facebook\n"
         "├ 📌 Pinterest\n"
         "└ 📺 YouTube\n\n"
+        f"{limit_line(settings.MAX_FILE_SIZE_MB)}\n\n"
         f"{_quota_line(quota, has_subscription)}\n\n"
         "Выбери действие 👇"
     )
@@ -130,8 +146,9 @@ def _help_text(quota: FreeQuota, has_subscription: bool) -> str:
         "📖 <b>Как пользоваться ботом:</b>\n\n"
         "1️⃣ Нажми <b>«Скачать видео»</b>\n"
         "2️⃣ Отправь ссылку на видео\n"
-        "3️⃣ Дождись файла — длинное видео в высоком качестве качается минутами\n\n"
+        "3️⃣ Дождись файла — бот покажет, сколько осталось\n\n"
         "🌐 <b>Платформы:</b> Instagram, TikTok, Facebook, Pinterest, YouTube\n\n"
+        f"{limits_block(settings.MAX_FILE_SIZE_MB)}\n\n"
         f"{_quota_line(quota, has_subscription)}"
     )
 
@@ -481,13 +498,61 @@ async def _reject_oversized(
         await remove_file(path)
 
 
-def _sending_text(size_mb: float | None) -> str:
-    """Статус перед отправкой. Размер показывается только если он известен."""
-    size_part = f" ({size_mb:.0f} МБ)" if size_mb else ""
+async def _download_with_progress(
+    board: StatusBoard, url: str, platform: str
+) -> tuple[DownloadResult, FormatPlan | None]:
+    """Скачивает медиа, показывая план формата и проценты на доске статуса.
+
+    Последний статус от `download_media` хранится в замыкании — рендер,
+    вызываемый тикером доски, каждый раз читает именно его, а не спрашивает
+    yt-dlp напрямую (обновления приходят синхронно из цикла чтения stdout).
+    """
+    latest: DownloadStatus | None = None
+
+    def remember(status: DownloadStatus) -> None:
+        nonlocal latest
+        latest = status
+
+    if download_semaphore.locked():
+        await board.show(QUEUED_TEXT)
+
+    def render() -> str:
+        return download_status_text(latest, settings.MAX_FILE_SIZE_MB)
+
+    async with download_semaphore:
+        async with board.ticking(render):
+            dl_result = await download_media(url, platform, on_status=remember)
+
+    return dl_result, latest.plan if latest else None
+
+
+def _wants_upload_progress(dl_result: DownloadResult) -> bool:
+    """Полоска отправки — только для одиночного видео от UPLOAD_PROGRESS_MIN_MB:
+    альбомы и мелкие файлы уходят за секунды, полоска не успевает пригодиться."""
+    is_single = not dl_result.file_paths or len(dl_result.file_paths) <= 1
     return (
-        f"📤 <b>Отправляю в Telegram{size_part}…</b>\n"
-        "Большой файл может идти несколько минут — бот не завис."
+        is_single
+        and dl_result.media_type == "video"
+        and (dl_result.file_size_mb or 0) >= UPLOAD_PROGRESS_MIN_MB
     )
+
+
+def _upload_renderer(dl_result: DownloadResult, plan: FormatPlan | None) -> Callable[[], str]:
+    """Рендер статуса отправки. Часы — модульный `time.monotonic` (не
+    захваченный на момент вызова объект): тесты подменяют `U.time` целиком."""
+    limit_mb = settings.MAX_FILE_SIZE_MB
+    size_mb = dl_result.file_size_mb
+    if not _wants_upload_progress(dl_result):
+        return lambda: upload_status_text(plan, size_mb, None, None, limit_mb)
+
+    expected = upload_rate.expected_seconds(size_mb)
+    started = time.monotonic()
+
+    def render() -> str:
+        elapsed = time.monotonic() - started
+        return upload_status_text(plan, size_mb, elapsed, expected, limit_mb)
+
+    return render
 
 
 def _video_meta(info: MediaInfo | None) -> dict[str, int]:
@@ -729,9 +794,7 @@ async def _process_download(message: Message, url: str, platform: str) -> None:
     # Fix round 1, п.3 (окно 1/3): между резервированием и этим вызовом юзер
     # мог заблокировать бота в ту же секунду — раньше единица терялась молча.
     try:
-        status_msg = await message.reply(
-            "⏳ <b>Скачиваю медиа...</b>\nБольшой файл может качаться несколько минут"
-        )
+        status_msg = await message.reply(PREPARING_TEXT)
     except Exception as e:
         # Fix round 2, N1: было (TelegramBadRequest, TelegramForbiddenError)
         # — узкий except пропускал TelegramNetworkError/TelegramRetryAfter
@@ -746,6 +809,8 @@ async def _process_download(message: Message, url: str, platform: str) -> None:
             await _refund_quota(reservation_id)
         return
 
+    board = StatusBoard(status_msg)
+
     # Fix round 1, п.3 (окно 2/3): download_media НЕ гарантирует возврат
     # DownloadResult при любом исходе — до её собственного try (downloader.py)
     # успевают отработать mkdir/gallery-dl fallback/ephemeral cookies, и там
@@ -753,8 +818,7 @@ async def _process_download(message: Message, url: str, platform: str) -> None:
     # Скачивание — БЕЗ открытой db-сессии, чтобы не держать SQLite write-lock
     # на всю длину download+upload.
     try:
-        async with download_semaphore:
-            dl_result = await download_media(url, platform)
+        dl_result, plan = await _download_with_progress(board, url, platform)
     except Exception:
         # Fix round 2, N4: logger.exception (не .error) — тянет traceback, а
         # не только str(e); на программной ошибке из глубины downloader.py
@@ -820,7 +884,10 @@ async def _process_download(message: Message, url: str, platform: str) -> None:
     send_error: Exception | None = None
     probably_delivered = False
 
-    await _show_status(status_msg, _sending_text(dl_result.file_size_mb))
+    upload_render = _upload_renderer(dl_result, plan)
+    await board.show(upload_render())
+    await board.start_ticking(upload_render)
+    send_started = time.monotonic()
 
     # C-1 шаг 2: внутри try остаются ТОЛЬКО вызовы отправки в Telegram.
     # Записи в БД и ответы пользователю вынесены наружу: раньше транзакция
@@ -972,8 +1039,12 @@ async def _process_download(message: Message, url: str, platform: str) -> None:
         send_error = e
         logger.error(f"Failed to send file: {e}")
     finally:
+        await board.stop_ticking()
         for p in _result_paths(dl_result):
             await remove_file(p)
+
+    if send_error is None and not probably_delivered and _wants_upload_progress(dl_result):
+        upload_rate.record(dl_result.file_size_mb, time.monotonic() - send_started)
 
     if probably_delivered:
         # При multipart у сервера уже своя копия файла (finally выше

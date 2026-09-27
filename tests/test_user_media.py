@@ -185,7 +185,7 @@ async def test_carousel_sends_gif_standalone_and_captions_once(
             "/tmp/does-not-exist-c.mp4",
         ]
 
-        async def _ok(url, platform):
+        async def _ok(url, platform, **_kwargs):
             return DownloadResult(success=True, file_paths=file_paths, media_type="video")
 
         monkeypatch.setattr("bot.handlers.user.download_media", _ok)
@@ -221,7 +221,7 @@ async def test_single_animation_uses_reply_animation_with_caption(
         await _seed_user(maker, id=uid, free_left=1)
         monkeypatch.setattr("bot.handlers.user.async_session", maker)
 
-        async def _ok(url, platform):
+        async def _ok(url, platform, **_kwargs):
             return DownloadResult(
                 success=True,
                 file_path="/tmp/does-not-exist-single.gif",
@@ -255,7 +255,7 @@ async def test_carousel_all_gifs_skips_media_group(
 
         file_paths = ["/tmp/does-not-exist-x.gif", "/tmp/does-not-exist-y.gif"]
 
-        async def _ok(url, platform):
+        async def _ok(url, platform, **_kwargs):
             return DownloadResult(success=True, file_paths=file_paths, media_type="video")
 
         monkeypatch.setattr("bot.handlers.user.download_media", _ok)

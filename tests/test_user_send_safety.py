@@ -81,7 +81,7 @@ class _FakeSendSafetyMessage:
 async def _seeded_video_download(maker, uid: int, video_path, *, free_left: int = 1):
     await _seed_user(maker, id=uid, free_left=free_left)
 
-    async def _ok(url, platform):
+    async def _ok(url, platform, **_kwargs):
         return DownloadResult(success=True, file_path=str(video_path), media_type="video")
 
     return _ok
