@@ -225,3 +225,24 @@ def test_youtube_aborts_on_unavailable_fragment(tmp_path):
     # ошибку вместо дыры.
     cmd = _youtube_cmd(tmp_path)
     assert "--abort-on-unavailable-fragments" in cmd
+
+
+# ── Бот-чек по IPv6-адресу хоста (2026-09-27) ────────────────────────────
+
+
+def test_youtube_forces_ipv4(tmp_path):
+    # С 2026-09-27 YouTube отвечает «Sign in to confirm you're not a bot» на
+    # запросы с IPv6-адреса хоста (бот в host-сети, у хоста глобальный IPv6,
+    # yt-dlp уходит по нему первым). Живая проба на том же хосте:
+    # `yt-dlp --force-ipv4 --simulate` — ok, без флага — бот-чек. Подробности
+    # в .superpowers/sdd/2026-09-27-youtube-botcheck/research.md.
+    cmd = _youtube_cmd(tmp_path)
+    assert "--force-ipv4" in cmd
+
+
+def test_other_platforms_do_not_force_ipv4(tmp_path):
+    # Обход узкий — только YouTube попал под бот-чек по IPv6, остальные
+    # платформы это не затрагивает.
+    for platform in ("instagram", "tiktok", "pinterest", "facebook"):
+        cmd = _build_command("https://example.invalid/x", platform, tmp_path / "o.%(ext)s", None)
+        assert "--force-ipv4" not in cmd, platform

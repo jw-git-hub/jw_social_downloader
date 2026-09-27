@@ -427,6 +427,14 @@ def _youtube_args() -> list[str]:
     (10) неудач подряд молча пропускает — в дорожке остаётся дыра ~10 МиБ,
     ffmpeg склеивает битое видео, бот отправляет его и списывает квоту вместо
     честной ошибки с возвратом квоты (находка ревью).
+
+    `--force-ipv4` — с 2026-09-27 YouTube отвечает «Sign in to confirm you're
+    not a bot» на запросы с IPv6-адреса хоста (бот сидит в host-сети, у хоста
+    глобальный IPv6, yt-dlp по умолчанию уходит по нему первым). Живая проба
+    `yt-dlp --force-ipv4 --simulate` с того же хоста бот-чек не ловит, без
+    флага — ловит. IPv4 этого хоста под бот-чек не попадал. Если провайдер
+    сменит IPv4-адрес или YouTube начнёт бот-чекать и его — смотреть
+    `.superpowers/sdd/2026-09-27-youtube-botcheck/research.md`.
     """
     return [
         "--no-playlist",
@@ -437,6 +445,7 @@ def _youtube_args() -> list[str]:
         "--extractor-args", YOUTUBE_EXTRACTOR_ARGS,
         "--concurrent-fragments", str(YOUTUBE_CONCURRENT_FRAGMENTS),
         "--abort-on-unavailable-fragments",
+        "--force-ipv4",
     ]
 
 

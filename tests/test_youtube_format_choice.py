@@ -265,6 +265,9 @@ def test_dashy_extractor_args_and_concurrency_reach_yt_dlp(tmp_path):
     # после fragment_retries неудач, оставляя в дорожке дыру, — команда должна
     # переключать это на честный обрыв закачки (--abort-on-unavailable-fragments).
     assert opts["skip_unavailable_fragments"] is False
+    # --force-ipv4 (бот-чек YouTube по IPv6-адресу хоста с 2026-09-27) yt-dlp
+    # кодирует как source_address="0.0.0.0", а не отдельным булевым ключом.
+    assert opts["source_address"] == "0.0.0.0"
 
 
 @pytest.mark.parametrize("protocol", ["https", "http_dash_segments"])
