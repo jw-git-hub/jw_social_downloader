@@ -43,10 +43,10 @@ def test_quality_short_and_label():
 
 
 def test_progress_bar_fills_by_tens():
-    assert progress_bar(0.52) == "▓▓▓▓▓░░░░░"
-    assert progress_bar(0.99) == "▓▓▓▓▓▓▓▓▓░"
-    assert progress_bar(0.0) == "░░░░░░░░░░"
-    assert progress_bar(1.0) == "▓▓▓▓▓▓▓▓▓▓"
+    assert progress_bar(0.52) == "▰▰▰▰▰▱▱▱▱▱"
+    assert progress_bar(0.99) == "▰▰▰▰▰▰▰▰▰▱"
+    assert progress_bar(0.0) == "▱▱▱▱▱▱▱▱▱▱"
+    assert progress_bar(1.0) == "▰▰▰▰▰▰▰▰▰▰"
 
 
 def test_format_eta_examples():
@@ -104,7 +104,7 @@ def test_download_status_text_preparing_with_plan_shows_zero_percent():
     status = DownloadStatus(phase=DownloadPhase.PREPARING, plan=FOUR_K_PLAN)
     text = download_status_text(status, limit_mb=1500)
     assert "⬇️" in text
-    assert "░░░░░░░░░░ 0%" in text
+    assert "▱▱▱▱▱▱▱▱▱▱  0%" in text
 
 
 def test_download_status_text_4k_fits_no_note():
@@ -115,8 +115,7 @@ def test_download_status_text_4k_fits_no_note():
     assert "⬇️" in text
     assert "4K · 2160p" in text
     assert "904 МБ" in text
-    assert "▓▓▓▓▓░░░░░ 52%" in text
-    assert "осталось ~1 мин" in text
+    assert "▰▰▰▰▰▱▱▱▱▱  52% · осталось ~1 мин" in text
     assert "ℹ️" not in text
 
 
@@ -137,7 +136,7 @@ def test_download_status_text_without_eta():
         phase=DownloadPhase.DOWNLOADING, plan=FOUR_K_PLAN, fraction=0.27, downloaded_mb=240.0, eta_sec=None,
     )
     text = download_status_text(status, limit_mb=1500)
-    assert "▓▓░░░░░░░░ 27%" in text
+    assert "▰▰▱▱▱▱▱▱▱▱  27%" in text
     assert "осталось" not in text
 
 
@@ -161,7 +160,7 @@ def test_download_status_text_merging_shows_eta():
 
 def test_upload_status_text_in_progress():
     text = upload_status_text(FOUR_K_PLAN, size_mb=904.1, elapsed_sec=60, expected_sec=188, limit_mb=1500)
-    assert "▓▓▓░░░░░░░ ≈31%" in text
+    assert "▰▰▰▱▱▱▱▱▱▱  ≈31%" in text
     assert "осталось ~2 мин" in text
 
 
@@ -173,8 +172,8 @@ def test_upload_status_text_past_expected_shows_almost_done():
 
 def test_upload_status_text_without_expected_has_no_bar():
     text = upload_status_text(FOUR_K_PLAN, size_mb=904.1, elapsed_sec=None, expected_sec=None, limit_mb=1500)
-    assert "▓" not in text
-    assert "░" not in text
+    assert "▰" not in text
+    assert "▱" not in text
     assert "4K · 2160p" in text
     assert "904 МБ" in text
 

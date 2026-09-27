@@ -16,8 +16,9 @@ from bot.services.ytdlp_progress import DownloadPhase, DownloadStatus, FormatPla
 GIB_DISPLAY_FROM_MB = 1000  # от этого порога размер показываем в ГиБ, а не в МиБ
 MIB_PER_GIB = 1024
 BAR_CELLS = 10
-BAR_FILLED = "▓"
-BAR_EMPTY = "░"
+BAR_FILLED = "▰"
+BAR_EMPTY = "▱"
+BAR_PERCENT_GAP = "  "  # два пробела между шкалой и процентом — для воздуха
 PERCENT = 100
 SECONDS_PER_MINUTE = 60
 UPLOAD_FRACTION_CAP = 0.95  # дальше — «почти готово», без конкретного процента
@@ -56,7 +57,7 @@ def quality_label(height: int) -> str:
 
 
 def progress_bar(fraction: float) -> str:
-    """0.52 → «▓▓▓▓▓░░░░░» (BAR_CELLS ячеек, дробная часть отбрасывается)."""
+    """0.52 → «▰▰▰▰▰▱▱▱▱▱» (BAR_CELLS ячеек, дробная часть отбрасывается)."""
     clamped = max(0.0, min(1.0, fraction))
     filled = math.floor(clamped * BAR_CELLS)
     return BAR_FILLED * filled + BAR_EMPTY * (BAR_CELLS - filled)
@@ -108,13 +109,13 @@ def _append_note(text: str, plan: FormatPlan | None, limit_mb: int) -> str:
 def _download_progress_line(status: DownloadStatus) -> str:
     if status.fraction is not None:
         pct = int(status.fraction * PERCENT)
-        line = f"{progress_bar(status.fraction)} {pct}%"
+        line = f"{progress_bar(status.fraction)}{BAR_PERCENT_GAP}{pct}%"
         if status.eta_sec is not None:
             line += f" · осталось {format_eta(status.eta_sec)}"
         return line
     if status.downloaded_mb > 0:
         return f"Скачано {format_size(status.downloaded_mb)}"
-    return f"{progress_bar(0.0)} 0%"
+    return f"{progress_bar(0.0)}{BAR_PERCENT_GAP}0%"
 
 
 def download_status_text(status: DownloadStatus | None, limit_mb: int) -> str:
@@ -132,7 +133,7 @@ def download_status_text(status: DownloadStatus | None, limit_mb: int) -> str:
 
     if status.phase is DownloadPhase.PREPARING:
         title = _title(DOWNLOAD_ICON_VERB, height, size_mb)
-        body = f"{progress_bar(0.0)} 0%"
+        body = f"{progress_bar(0.0)}{BAR_PERCENT_GAP}0%"
     elif status.phase is DownloadPhase.DOWNLOADING:
         title = _title(DOWNLOAD_ICON_VERB, height, size_mb)
         body = _download_progress_line(status)
@@ -149,7 +150,7 @@ def _upload_progress_line(elapsed_sec: float, expected_sec: float) -> str:
         fraction = min(elapsed_sec / expected_sec, UPLOAD_FRACTION_CAP)
         pct = int(fraction * PERCENT)
         remaining = expected_sec - elapsed_sec
-        return f"{progress_bar(fraction)} ≈{pct}% · осталось {format_eta(remaining)}"
+        return f"{progress_bar(fraction)}{BAR_PERCENT_GAP}≈{pct}% · осталось {format_eta(remaining)}"
     return f"{progress_bar(UPLOAD_FRACTION_CAP)} почти готово — Telegram принимает файл…"
 
 
