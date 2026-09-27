@@ -261,6 +261,10 @@ def test_dashy_extractor_args_and_concurrency_reach_yt_dlp(tmp_path):
     opts = yt_dlp.parse_options(cmd[1:-1] + ["-q", "--no-warnings"]).ydl_opts
     assert opts["concurrent_fragment_downloads"] == 8
     assert opts["extractor_args"] == {"youtube": {"formats": ["dashy"], "skip": ["hls"]}}
+    # По умолчанию yt-dlp пропускает недоступный фрагмент (кроме фрагмента 0)
+    # после fragment_retries неудач, оставляя в дорожке дыру, — команда должна
+    # переключать это на честный обрыв закачки (--abort-on-unavailable-fragments).
+    assert opts["skip_unavailable_fragments"] is False
 
 
 @pytest.mark.parametrize("protocol", ["https", "http_dash_segments"])

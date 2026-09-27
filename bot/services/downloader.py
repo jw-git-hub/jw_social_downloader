@@ -421,6 +421,12 @@ def _youtube_args() -> list[str]:
     только терминальной ветки каскада `bv*+ba/b` (остальные уже отфильтрованы
     по filesize_approx до выбора) — превышение лимита на ней ловит гейт
     `oversized_files` уже после закачки, не до неё.
+
+    `--abort-on-unavailable-fragments` обязателен для `dashy`: по умолчанию
+    yt-dlp фатален только на фрагменте 0, а остальные после `fragment_retries`
+    (10) неудач подряд молча пропускает — в дорожке остаётся дыра ~10 МиБ,
+    ffmpeg склеивает битое видео, бот отправляет его и списывает квоту вместо
+    честной ошибки с возвратом квоты (находка ревью).
     """
     return [
         "--no-playlist",
@@ -430,6 +436,7 @@ def _youtube_args() -> list[str]:
         "--merge-output-format", "mp4",
         "--extractor-args", YOUTUBE_EXTRACTOR_ARGS,
         "--concurrent-fragments", str(YOUTUBE_CONCURRENT_FRAGMENTS),
+        "--abort-on-unavailable-fragments",
     ]
 
 

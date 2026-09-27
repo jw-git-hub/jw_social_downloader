@@ -215,3 +215,13 @@ def test_youtube_extractor_args_appears_exactly_once(tmp_path):
     # эту же строку через ";", а не добавлять отдельным вхождением.
     cmd = _youtube_cmd(tmp_path)
     assert cmd.count("--extractor-args") == 1
+
+
+def test_youtube_aborts_on_unavailable_fragment(tmp_path):
+    # По умолчанию у yt-dlp skip_unavailable_fragments=True: фатален только
+    # фрагмент 0, остальные после fragment_retries=10 неудач молча
+    # пропускаются, и в дорожке остаётся дыра ~10 МиБ — ffmpeg склеивает
+    # битое видео, бот его отправляет и списывает квоту. Флаг требует честную
+    # ошибку вместо дыры.
+    cmd = _youtube_cmd(tmp_path)
+    assert "--abort-on-unavailable-fragments" in cmd
