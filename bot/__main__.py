@@ -9,13 +9,21 @@ from aiogram.types import BotCommand
 from loguru import logger
 
 from bot.config import settings
-from bot.db.engine import init_db
+from bot.db.engine import async_session, init_db
 from bot.handlers import admin_payments_router, admin_router, info_router, payments_router, user_router
 from bot.middlewares.throttle import ThrottleMiddleware
 from bot.services.cleanup import EFFECTIVE_CLEANUP_MAX_AGE_MIN, periodic_cleanup
+from bot.services.download_queue import MAX_LINKS_PER_USER
+from bot.services.interrupted_downloads import notify_interrupted_downloads
 from bot.utils.log_guard import setup_logging
 
 BACKLOG_BATCH = 100
+
+# Д8 плана .superpowers/sdd/2026-09-27-queue/plan.md: пачка из MAX_LINKS_PER_USER
+# ссылок отдельными сообщениями должна пройти целиком, ещё столько же лишних —
+# получить понятный отказ очереди, а не молча потеряться в троттлинге. Дальше
+# действует прежний темп в rate_limit секунд на сообщение.
+MESSAGE_BURST = 2 * MAX_LINKS_PER_USER
 
 PUBLIC_COMMANDS = [
     BotCommand(command="start", description="🏠 Главное меню"),
@@ -134,7 +142,7 @@ async def main() -> None:
     # Разные лимиты и раздельное состояние: сообщение — это загрузка,
     # колбэк — навигация по меню. Общий лимит в три секунды сделал бы
     # меню неюзабельным.
-    dp.message.middleware(ThrottleMiddleware(rate_limit=3.0, notify=True))
+    dp.message.middleware(ThrottleMiddleware(rate_limit=3.0, burst=MESSAGE_BURST, notify=True))
     dp.callback_query.middleware(ThrottleMiddleware(rate_limit=0.7, notify=True))
 
     dp.include_router(admin_router)
@@ -181,6 +189,7 @@ async def main() -> None:
         settings.MAX_FILE_SIZE_MB,
     )
     logger.info("Bot started")
+    await notify_interrupted_downloads(bot, async_session)
     await run_polling(dp, bot)
 
 

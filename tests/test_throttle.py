@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import pytest
 
 from bot.middlewares.throttle import ThrottleMiddleware
@@ -80,7 +82,7 @@ async def test_stale_entries_are_evicted():
     for user_id in range(1000000001, 1000000021):
         await mw(_passthrough, FakeEvent(user_id=user_id), {})
     # rate_limit=0 означает, что все прошлые отметки протухли сразу.
-    assert len(mw.user_timestamps) <= 1
+    assert len(mw.full_burst_at) <= 1
     assert len(mw.notified_at) == 0
 
 
@@ -97,3 +99,49 @@ async def test_payment_is_never_throttled():
     event = FakePaymentEvent()
     assert await mw(_passthrough, event, {}) == "handled"
     assert event.answers == []
+
+
+# ── burst (ведро с запасом, Д8 плана .superpowers/sdd/2026-09-27-queue) ───
+
+
+def _fake_clock(monkeypatch, start: float = 0.0) -> dict:
+    """Подменяет `bot.middlewares.throttle.time` целиком управляемыми часами."""
+    state = {"now": start}
+    monkeypatch.setattr(
+        "bot.middlewares.throttle.time", SimpleNamespace(monotonic=lambda: state["now"])
+    )
+    return state
+
+
+async def test_burst_allows_configured_number_of_events_before_refusing(monkeypatch):
+    _fake_clock(monkeypatch)
+    mw = ThrottleMiddleware(rate_limit=3.0, burst=3)
+
+    for _ in range(3):
+        assert await mw(_passthrough, FakeEvent(), {}) == "handled"
+    assert await mw(_passthrough, FakeEvent(), {}) is None
+
+
+async def test_exactly_one_event_passes_once_rate_limit_elapses(monkeypatch):
+    state = _fake_clock(monkeypatch)
+    mw = ThrottleMiddleware(rate_limit=3.0, burst=3)
+    for _ in range(3):
+        await mw(_passthrough, FakeEvent(), {})
+    assert await mw(_passthrough, FakeEvent(), {}) is None  # запас исчерпан
+
+    state["now"] += 3.0
+    assert await mw(_passthrough, FakeEvent(), {}) == "handled"
+    assert await mw(_passthrough, FakeEvent(), {}) is None  # и ровно одно
+
+
+async def test_burst_does_not_accumulate_beyond_its_configured_size(monkeypatch):
+    state = _fake_clock(monkeypatch)
+    mw = ThrottleMiddleware(rate_limit=3.0, burst=3)
+    for _ in range(3):
+        await mw(_passthrough, FakeEvent(), {})
+
+    state["now"] += 10 * 3.0  # долгий простой — запас не должен копиться сверх burst
+
+    for _ in range(3):
+        assert await mw(_passthrough, FakeEvent(), {}) == "handled"
+    assert await mw(_passthrough, FakeEvent(), {}) is None

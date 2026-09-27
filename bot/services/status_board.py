@@ -11,7 +11,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
@@ -33,12 +32,16 @@ class StatusBoard:
         *,
         interval: float = PROGRESS_EDIT_INTERVAL_SEC,
         clock: Callable[[], float] = time.monotonic,
+        initial_text: str | None = None,
     ) -> None:
         self._message = message
         self._interval = interval
         self._clock = clock
         self._enabled = True
-        self._last_text: str | None = None
+        # Сообщение уже отправлено с этим текстом (см. `message.reply(text)`
+        # у вызывающего) — первый `show(initial_text)` не должен слать
+        # лишнюю правку тем же текстом (M-7, ревью очереди 2026-09-27).
+        self._last_text: str | None = initial_text
         self._silenced_until = 0.0
         self._tick_task: asyncio.Task | None = None
 
@@ -89,8 +92,14 @@ class StatusBoard:
         if task is None:
             return
         task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
+        # `await task` напрямую (старый код) неотличим от отмены САМОГО
+        # вызывающего: оба CancelledError всплывают на одной и той же
+        # await-точке, и `suppress(CancelledError)` глотал оба разом — если
+        # вызывающего отменяли (например, `_process_download` при остановке
+        # бота), эта отмена терялась молча (M-3, ревью очереди 2026-09-27).
+        # `asyncio.wait` ждёт завершения задачи, но не пробрасывает её
+        # исключение в текущую корутину — отмену вызывающего он не глотает.
+        await asyncio.wait([task])
 
     @asynccontextmanager
     async def ticking(self, render: Callable[[], str]) -> AsyncIterator[None]:

@@ -10,7 +10,7 @@ network_mode: host, поэтому "127.0.0.1" изнутри него — эт�
 
 import pytest
 
-from bot.utils.url_parser import parse_url
+from bot.utils.url_parser import parse_url, parse_urls
 
 
 # ── Позитив: по одной ссылке на каждую поддерживаемую платформу ──────────
@@ -318,3 +318,58 @@ def test_backslash_outside_authority_does_not_trigger_rejection():
     result = parse_url("https://www.instagram.com/p/a\\b/")
     assert result is not None
     assert result[1] == "instagram"
+
+
+# ── parse_urls: несколько ссылок в одном сообщении (Задача 1, очередь) ────
+
+
+def test_parse_urls_returns_all_matches_in_order():
+    text = "Смотри https://youtu.be/aaaaaaaaaaa и https://www.pinterest.com/pin/123456789012345678/"
+    result = parse_urls(text)
+    assert result == [
+        ("https://youtu.be/aaaaaaaaaaa", "youtube"),
+        ("https://www.pinterest.com/pin/123456789012345678/", "pinterest"),
+    ]
+
+
+def test_parse_urls_skips_unsupported_domain_between_supported_ones():
+    # vk.com не в аллоулисте — не матчится вовсе, youtu.be остаётся один.
+    assert parse_urls("https://vk.com/x https://youtu.be/abc") == [
+        ("https://youtu.be/abc", "youtube")
+    ]
+
+
+def test_parse_urls_keeps_duplicates():
+    # Схлопывание дублей — забота вызывающего (DownloadQueue.admit), не парсера.
+    text = "https://youtu.be/aaaaaaaaaaa https://youtu.be/aaaaaaaaaaa"
+    assert parse_urls(text) == [
+        ("https://youtu.be/aaaaaaaaaaa", "youtube"),
+        ("https://youtu.be/aaaaaaaaaaa", "youtube"),
+    ]
+
+
+def test_parse_urls_returns_empty_list_for_text_without_links():
+    assert parse_urls("просто текст без ссылки") == []
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # Первый кандидат — SSRF-подделка через бэкслэш в authority (I-2),
+        # второй — настоящая ссылка: подделка отсеивается, youtu.be остаётся.
+        r"https://127.0.0.1\@pinterest.com/pin/1/ https://youtu.be/abc",
+        # Первый кандидат — неподдерживаемый хост (лукбихайнд не даёт
+        # "notpinterest.com" сматчиться как "pinterest.com"), второй — youtu.be.
+        "notpinterest.com/pin/1 youtu.be/abc",
+    ],
+)
+def test_parse_urls_skips_hostile_or_unsupported_candidates(text):
+    assert parse_urls(text) == [("https://youtu.be/abc", "youtube")]
+
+
+def test_parse_urls_trims_trailing_punctuation_from_each_candidate():
+    result = parse_urls("https://youtu.be/a, https://pin.it/b.")
+    assert result == [
+        ("https://youtu.be/a", "youtube"),
+        ("https://pin.it/b", "pinterest"),
+    ]

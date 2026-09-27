@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 
 import bot.services.status_board as status_board_module
 import pytest
@@ -27,6 +28,7 @@ class _FakeMessage:
         self.attempts: list[str] = []
         self._raise_queue: list[Exception] = []
         self._hang_once = False
+        self._slow_cancel_event: asyncio.Event | None = None
 
     def queue_raise(self, exc: Exception) -> None:
         self._raise_queue.append(exc)
@@ -34,11 +36,23 @@ class _FakeMessage:
     def hang_once(self) -> None:
         self._hang_once = True
 
+    def slow_cancel(self, event: asyncio.Event) -> None:
+        """Симулирует медленную отмену: `edit_text` не умирает сразу по
+        `CancelledError`, а сперва ждёт внешний `event` (как реальная
+        отмена сетевого запроса могла бы ждать закрытия соединения)."""
+        self._slow_cancel_event = event
+
     async def edit_text(self, text: str, reply_markup=None) -> None:
         self.attempts.append(text)
         if self._hang_once:
             self._hang_once = False
             await asyncio.Event().wait()
+        if self._slow_cancel_event is not None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await self._slow_cancel_event.wait()
+                raise
         if self._raise_queue:
             raise self._raise_queue.pop(0)
 
@@ -190,3 +204,61 @@ async def test_ticking_context_manager_starts_and_stops():
     attempts_after_exit = len(msg.attempts)
     await asyncio.sleep(0.05)
     assert len(msg.attempts) == attempts_after_exit
+
+
+# ── M-7: initial_text не должен провоцировать лишнюю первую правку ────────
+
+
+async def test_initial_text_suppresses_the_first_identical_show():
+    msg = _FakeMessage()
+    board = StatusBoard(msg, initial_text="A")
+
+    await board.show("A")
+    assert msg.attempts == []
+
+    await board.show("B")
+    assert msg.attempts == ["B"]
+
+
+async def test_without_initial_text_the_first_show_still_edits():
+    msg = _FakeMessage()
+    board = StatusBoard(msg)
+
+    await board.show("A")
+    assert msg.attempts == ["A"]
+
+
+# ── M-3: stop_ticking не должен глотать отмену ВЫЗЫВАЮЩЕГО ────────────────
+
+
+async def test_stop_ticking_lets_the_callers_own_cancellation_through():
+    """На старом коде (`with suppress(CancelledError): await task`) этот тест
+    красный: оба CancelledError — тикера и вызывающего — всплывают на одной
+    и той же await-точке, и `suppress` глотает их неразличимо. `outer`
+    тогда тихо завершается вместо того, чтобы остаться отменённым.
+    """
+    msg = _FakeMessage()
+    release = asyncio.Event()
+    msg.slow_cancel(release)
+    board = StatusBoard(msg, interval=0.01)
+
+    await board.start_ticking(lambda: "tick")
+    tick_task = board._tick_task
+    for _ in range(200):
+        if msg.attempts:
+            break
+        await asyncio.sleep(0.005)
+    assert msg.attempts  # правка стартовала и зависла внутри edit_text
+
+    outer = asyncio.create_task(board.stop_ticking())
+    await asyncio.sleep(0.01)  # дать outer сделать task.cancel() и дойти до asyncio.wait
+
+    outer.cancel()
+    release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await outer
+    assert outer.cancelled()
+
+    with contextlib.suppress(asyncio.CancelledError):
+        await tick_task

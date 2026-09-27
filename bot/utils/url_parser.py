@@ -160,12 +160,8 @@ def _detect_platform(host: str | None) -> str | None:
     return None
 
 
-def parse_url(text: str) -> tuple[str, str] | None:
-    match = _URL_RE.search(text)
-    if not match:
-        return None
-
-    url = _trim_trailing(match.group(0))
+def _parse_candidate(raw: str) -> tuple[str, str] | None:
+    url = _trim_trailing(raw)
     if not url:
         return None
 
@@ -199,3 +195,21 @@ def parse_url(text: str) -> tuple[str, str] | None:
         return None
 
     return normalized, platform
+
+
+def parse_url(text: str) -> tuple[str, str] | None:
+    match = _URL_RE.search(text)
+    if not match:
+        return None
+    return _parse_candidate(match.group(0))
+
+
+def parse_urls(text: str) -> list[tuple[str, str]]:
+    """Все распознанные ссылки в тексте по порядку появления.
+
+    Каждый кандидат проходит ту же проверку, что и в `parse_url`
+    (неподдерживаемые адреса молча пропускаются). Дубликаты не схлопывает —
+    это решает вызывающий (`bot/services/download_queue.py`).
+    """
+    candidates = (_parse_candidate(match.group(0)) for match in _URL_RE.finditer(text))
+    return [candidate for candidate in candidates if candidate is not None]

@@ -52,6 +52,31 @@ class FreeDownload(Base):
     reserved_at: Mapped[datetime]
 
 
+class PendingDownload(Base):
+    """Ссылка, принятая в очередь, но ещё не докачанная.
+
+    Строка пишется при постановке в очередь (`add_pending`) и удаляется по
+    окончании загрузки на любом исходе, КРОМЕ отмены задачи при остановке
+    бота (`bot/handlers/user.py::_run_job`). Если бот перезапустился, пока
+    строка на месте, `release_interrupted` при следующем старте (Д11 плана
+    `.superpowers/sdd/2026-09-27-queue/plan.md`) возвращает бронь и удаляет
+    строку — без журнала бронь активной загрузки терялась бы молча, а статус
+    замерзал бы навсегда до следующего деплоя.
+
+    `reservation_id` — id строки `free_download`, `None` у подписчика (у
+    него нет брони, которую нужно было бы возвращать).
+    """
+
+    __tablename__ = "pending_download"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"))
+    chat_id: Mapped[int] = mapped_column(BigInteger)
+    url: Mapped[str] = mapped_column(Text)
+    reservation_id: Mapped[Optional[int]] = mapped_column(nullable=True)
+    created_at: Mapped[datetime]
+
+
 class StarPayment(Base):
     """Одно списание звёзд: первый платёж подписки или её продление.
 
