@@ -20,7 +20,7 @@ from types import SimpleNamespace
 import bot.handlers.user as U
 from sqlalchemy import select
 
-from bot.db.models import PendingDownload
+from bot.db.models import PendingDownload, User
 from bot.services.download_queue import DownloadQueue
 from bot.services.downloader import DownloadResult
 from bot.services.progress_texts import PREPARING_TEXT
@@ -656,5 +656,45 @@ async def test_unexpected_exception_in_one_job_does_not_stop_the_queue(
         assert msg.status_messages[0].edit_calls[-1] == U.INTERNAL_ERROR_TEXT
         assert downloader.calls == [urls[1]]
         assert queue.line_length(uid) == 0
+    finally:
+        await engine.dispose()
+
+
+# ── 11. Новый пользователь, гонка на создании строки в users ──
+
+
+async def test_new_user_burst_of_messages_all_links_are_queued(
+    monkeypatch, sqlite_engine_factory, tmp_path
+):
+    """У пользователя ещё нет строки в `users` (новый, или её выбило —
+    неважно), и три его сообщения со ссылками обрабатываются конкурентно,
+    как реальные апдейты Aiogram (`handle_as_tasks=True`). Каждое сообщение
+    открывает свою транзакцию и зовёт `get_or_create_user`: до фикса
+    SELECT-then-INSERT в `bot/db/queries.py` это `IntegrityError`, который
+    `_enqueue_links` глотает — ссылка пропадает без ответа. Никого не
+    сидируем через `_seed_user` — строки в `users` нет вообще."""
+    maker, engine = await _make_session_maker(sqlite_engine_factory, tmp_path, "new_user_burst.db")
+    try:
+        uid = 994016
+        monkeypatch.setattr(U, "async_session", maker)
+        _install_queue(monkeypatch)
+        downloader = _FakeDownloader()
+        monkeypatch.setattr(U, "download_media", downloader)
+
+        urls = [f"https://youtu.be/newuser{i}" for i in range(3)]
+        for url in urls:
+            downloader.gate_for(url).set()
+        messages = [_FakeMessage(uid, url) for url in urls]
+
+        await asyncio.wait_for(
+            asyncio.gather(*(U.handle_url(msg) for msg in messages)), WAIT_TIMEOUT
+        )
+
+        assert [len(msg.status_messages) for msg in messages] == [1, 1, 1]
+        assert sorted(downloader.calls) == sorted(urls)
+        assert await _pending_rows(maker) == []
+        async with maker() as session:
+            user = await session.get(User, uid)
+        assert user is not None
     finally:
         await engine.dispose()

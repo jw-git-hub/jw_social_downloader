@@ -11,23 +11,40 @@ from bot.db.models import DownloadLog, SubscriptionGrant, User
 
 
 async def get_or_create_user(session: AsyncSession, tg_user) -> User:
+    """Читает пользователя или заводит нового.
+
+    Aiogram обрабатывает апдейты конкурентно (`handle_as_tasks=True`), а
+    очередь ссылок (`_enqueue_links`) даёт нескольким сообщениям одного
+    НОВОГО пользователя параллельно дойти сюда раньше, чем кто-то из них
+    успеет закоммитить свою строку. `INSERT ... ON CONFLICT DO NOTHING`
+    в `_insert_new_user` переживает эту гонку так же, как бронь квоты в
+    `free_quota.reserve_free_download` и грант подписки в
+    `apply_subscription_change` — вместо неотловленного `IntegrityError`,
+    который раньше ронял `_enqueue_links` и терял ссылку молча.
+    """
     user = await session.get(User, tg_user.id)
     if user is None:
-        user = User(
-            id=tg_user.id,
-            username=tg_user.username,
-            full_name=tg_user.full_name,
-        )
-        session.add(user)
-        await session.flush()
-    else:
-        # F10: пишем только при реальном изменении, иначе каждая сессия грязнит
-        # строку и вызывает UPDATE (write-lock) даже когда ничего не поменялось.
-        if user.username != tg_user.username:
-            user.username = tg_user.username
-        if user.full_name != tg_user.full_name:
-            user.full_name = tg_user.full_name
+        return await _insert_new_user(session, tg_user)
+    # F10: пишем только при реальном изменении, иначе каждая сессия грязнит
+    # строку и вызывает UPDATE (write-lock) даже когда ничего не поменялось.
+    if user.username != tg_user.username:
+        user.username = tg_user.username
+    if user.full_name != tg_user.full_name:
+        user.full_name = tg_user.full_name
     return user
+
+
+async def _insert_new_user(session: AsyncSession, tg_user) -> User:
+    """Вставляет нового пользователя, переживая параллельную вставку того же
+    id. Проигравший гонку не получает `IntegrityError`: `DO NOTHING` делает
+    его INSERT пустым, а последующий `get` читает строку победителя."""
+    insert_stmt = (
+        sqlite_insert(User.__table__)
+        .values(id=tg_user.id, username=tg_user.username, full_name=tg_user.full_name)
+        .on_conflict_do_nothing(index_elements=["id"])
+    )
+    await session.execute(insert_stmt)
+    return await session.get(User, tg_user.id)
 
 
 async def get_user_by_id(session: AsyncSession, user_id: int) -> User | None:
