@@ -59,7 +59,7 @@ def test_welcome_and_help_do_not_promise_seconds():
 def test_status_text_uses_remainder_wording():
     text = _status_text(FreeQuota(left=2, next_at=None), None, 7)
     assert f"осталось <b>2 из {LIMIT}</b> на сутки" in text
-    assert "❌ Не активна" in text
+    assert "не активна" in text
     assert "<b>7</b>" in text
 
 

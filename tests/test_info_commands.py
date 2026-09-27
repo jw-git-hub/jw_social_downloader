@@ -6,7 +6,7 @@ def test_terms_names_price_renewal_refund_rule_and_contacts(monkeypatch):
     monkeypatch.setattr(settings, "SUBSCRIPTION_PRICE_STARS", 250)
     monkeypatch.setattr(settings, "ADMIN_USERNAME", "@owner")
     text = terms_text()
-    assert "250 ⭐" in text
+    assert "250 звёзд" in text
     assert "3 скачивания за любые 24 часа" in text
     assert "автоматически" in text
     assert "Мои звёзды" in text

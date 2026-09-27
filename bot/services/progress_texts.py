@@ -3,8 +3,8 @@
 Модуль чистый (без I/O): собирает готовые строки для `bot/handlers/user.py`
 из `DownloadStatus`/`FormatPlan` (Задача 1, `bot/services/ytdlp_progress.py`)
 и оценки скорости отправки (`bot/services/upload_estimate.py`). Тексты — ровно
-из брифа (`.superpowers/sdd/2026-09-27-progress/plan.md`, раздел «3. Тексты»),
-их формулировки менять нельзя без ведома владельца.
+из плана (`.superpowers/sdd/2026-09-27-ecosystem-style/texts-plan.md`, раздел
+«4. Готовые тексты для бота»), их формулировки менять нельзя без ведома владельца.
 """
 
 from __future__ import annotations
@@ -26,17 +26,17 @@ SECONDS_PER_MINUTE = 60
 UPLOAD_FRACTION_CAP = 0.95  # дальше — «почти готово», без конкретного процента
 _TIER_NAMES = {4320: "8K", 2160: "4K"}
 
-DOWNLOAD_ICON_VERB = "⬇️ Скачиваю видео"
-MERGE_ICON_VERB = "🎬 Собираю видео и звук"
-UPLOAD_ICON_VERB = "📤 Отправляю в Telegram"
+DOWNLOAD_TITLE = "Скачиваю видео"
+MERGE_TITLE = "Собираю видео и звук"
+UPLOAD_TITLE = "Отправляю в Telegram"
 
 PREPARING_TEXT = (
-    "⏳ <b>Готовлю загрузку…</b>\n"
-    "Большое видео качается несколько минут — я покажу, сколько осталось."
+    "<b>Готовлю загрузку…</b>\n"
+    "Большое видео качается несколько минут — покажу, сколько осталось."
 )
 QUEUED_TEXT = (
-    "⏳ <b>Жду своей очереди</b>\n"
-    "Бот сейчас качает другие ролики — начну, как только освободится место."
+    "<b>Жду своей очереди</b>\n"
+    "Сейчас качаю другие ролики — начну, как только освободится место."
 )
 
 
@@ -88,15 +88,15 @@ def downgrade_note(plan: FormatPlan | None, limit_mb: int) -> str | None:
     if plan.best_height <= plan.chosen_height or plan.best_mb <= limit_mb:
         return None
     return (
-        f"ℹ️ В {quality_short(plan.best_height)} ролик весит от {format_size(plan.best_mb)}, "
-        f"а бот может отправить файл до {format_size(limit_mb)}, поэтому пришлю лучшее, "
+        f"В {quality_short(plan.best_height)} ролик весит от {format_size(plan.best_mb)}, "
+        f"а отправить я могу файл до {format_size(limit_mb)}, поэтому пришлю лучшее, "
         f"что помещается, — {quality_short(plan.chosen_height)}."
     )
 
 
-def _title(icon_verb: str, height: int | None, size_mb: float | None) -> str:
+def _title(title: str, height: int | None, size_mb: float | None) -> str:
     """Заголовок статуса, пропуская неизвестные качество/размер."""
-    parts = [icon_verb]
+    parts = [title]
     if height is not None:
         parts.append(quality_label(height))
     if size_mb is not None:
@@ -135,13 +135,13 @@ def download_status_text(status: DownloadStatus | None, limit_mb: int) -> str:
     size_mb = plan.chosen_mb if plan else None
 
     if status.phase is DownloadPhase.PREPARING:
-        title = _title(DOWNLOAD_ICON_VERB, height, size_mb)
+        title = _title(DOWNLOAD_TITLE, height, size_mb)
         body = f"{progress_bar(0.0)}{BAR_PERCENT_GAP}0%"
     elif status.phase is DownloadPhase.DOWNLOADING:
-        title = _title(DOWNLOAD_ICON_VERB, height, size_mb)
+        title = _title(DOWNLOAD_TITLE, height, size_mb)
         body = _download_progress_line(status)
     else:  # MERGING
-        title = _title(MERGE_ICON_VERB, height, size_mb)
+        title = _title(MERGE_TITLE, height, size_mb)
         body = f"Ещё {format_eta(status.eta_sec)}." if status.eta_sec is not None else ""
 
     text = f"{title}\n{body}" if body else title
@@ -166,7 +166,7 @@ def upload_status_text(
 ) -> str:
     """Текст статуса при отправке в Telegram: полоска — только оценка."""
     height = plan.chosen_height if plan else None
-    title = _title(UPLOAD_ICON_VERB, height, size_mb)
+    title = _title(UPLOAD_TITLE, height, size_mb)
     if expected_sec is None or elapsed_sec is None:
         return _append_note(title, plan, limit_mb)
     body = _upload_progress_line(elapsed_sec, expected_sec)

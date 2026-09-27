@@ -231,7 +231,7 @@ async def test_entity_too_large_is_not_retried(monkeypatch, sqlite_engine_factor
         assert calls["n"] == 1
         assert await _free_downloads_left(maker, uid) == 1
         assert msg.status_message is not None
-        assert "📦" in msg.status_message.edit_calls[-1]
+        assert "слишком большой" in msg.status_message.edit_calls[-1]
     finally:
         await engine.dispose()
 
@@ -307,7 +307,7 @@ async def test_sending_status_is_shown_before_upload(monkeypatch, sqlite_engine_
 
         await U._process_download(msg, [(TEST_URL, "tiktok")])
 
-        sending_events = [e for e in events if e.startswith("edit:") and "📤" in e]
+        sending_events = [e for e in events if e.startswith("edit:") and "Отправляю в Telegram" in e]
         assert sending_events
         assert events.index(sending_events[0]) < events.index("reply_video")
     finally:

@@ -211,7 +211,7 @@ async def test_banned_user_is_not_reserved(monkeypatch, sqlite_engine_factory, t
         msg = _FakeMessage(TEST_URL, uid)
         await U.handle_url(msg)
 
-        assert msg.reply_calls == ["🚫 Ваш аккаунт заблокирован. Обратитесь к администратору."]
+        assert msg.reply_calls == ["Ваш аккаунт заблокирован. Если это ошибка — напишите в /support."]
         assert await _free_downloads_left(maker, uid) == 3
     finally:
         await engine.dispose()

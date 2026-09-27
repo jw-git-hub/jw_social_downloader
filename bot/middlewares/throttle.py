@@ -3,7 +3,7 @@ from typing import Any, Awaitable, Callable, Dict
 
 from aiogram import BaseMiddleware
 
-THROTTLE_NOTICE = "⏳ Слишком часто. Подожди пару секунд."
+THROTTLE_NOTICE = "Слишком часто — подождите пару секунд."
 
 
 class ThrottleMiddleware(BaseMiddleware):

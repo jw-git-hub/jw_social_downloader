@@ -30,6 +30,6 @@ def test_download_failed_text_handles_missing_message():
 
 
 def test_media_caption_escapes_platform():
-    assert _media_caption("tiktok", "video") == "✅ Видео из Tiktok"
-    assert _media_caption("pinterest", "image") == "✅ Фото из Pinterest"
-    assert _media_caption("in<s>ta", "video") == "✅ Видео из In&lt;s&gt;ta"
+    assert _media_caption("tiktok", "video") == "Видео из TikTok"
+    assert _media_caption("pinterest", "image") == "Фото из Pinterest"
+    assert _media_caption("in<s>ta", "video") == "Видео из In&lt;s&gt;ta"

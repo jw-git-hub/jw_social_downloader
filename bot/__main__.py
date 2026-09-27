@@ -93,7 +93,7 @@ def build_session() -> AiohttpSession:
     return AiohttpSession(api=_api_server(), timeout=settings.TELEGRAM_REQUEST_TIMEOUT)
 
 
-UNHANDLED_ERROR_TEXT = "⚠️ Что-то пошло не так. Попробуй ещё раз."
+UNHANDLED_ERROR_TEXT = "Что-то пошло не так. Попробуйте ещё раз."
 
 
 async def on_unhandled_error(event) -> None:

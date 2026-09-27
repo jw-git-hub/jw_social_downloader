@@ -92,7 +92,7 @@ async def test_download_media_reports_failure_when_files_vanish(tmp_path, monkey
     assert result.error_message
     # Путь через _sized_files: честная классификация "нет данных об ошибке".
     # Путь через голый .stat(): "Непредвиденная ошибка: [Errno 2] ...".
-    assert result.error_message.startswith("❌ Ошибка загрузки")
+    assert result.error_message.startswith("Ошибка загрузки")
     assert "Непредвиденная ошибка" not in result.error_message
 
 
@@ -102,7 +102,7 @@ async def test_ytdlp_timeout_kill_does_not_raise_when_process_already_exited(tmp
     только на пути yt-dlp (находка ревью фикс-раунда 1, Minor #9): без
     guard'а process.kill() на уже завершившемся процессе бросает
     ProcessLookupError, она уходит во внешний except Exception, и
-    пользователь вместо честного «⏱ Таймаут» получает «Непредвиденная
+    пользователь вместо честного «не уложилось в» получает «Непредвиденная
     ошибка».
     """
     bin_dir = tmp_path / "bin"
@@ -131,5 +131,5 @@ async def test_ytdlp_timeout_kill_does_not_raise_when_process_already_exited(tmp
     result = await downloader.download_media("https://www.youtube.com/watch?v=xyz", "youtube")
 
     assert result.success is False
-    assert "Таймаут" in result.error_message
+    assert "не уложилось в" in result.error_message
     assert "Непредвиденная ошибка" not in result.error_message

@@ -23,9 +23,9 @@ INVOICE_DESCRIPTION = (
     "Продлевается автоматически каждые 30 дней."
 )
 CANCEL_HINT = "отменить автопродление можно в настройках Telegram → «Мои звёзды»"
-STALE_INVOICE_TEXT = "Счёт устарел — открой «👑 Подписка» в боте и оплати заново."
+STALE_INVOICE_TEXT = "Счёт устарел — откройте «Подписка» в боте и оплатите заново."
 PAYMENT_PENDING_TEXT = (
-    "✅ Оплата получена. Подписку включит администратор в ближайшее время; "
+    "Оплата получена. Подписку включит администратор в ближайшее время; "
     "вопросы — /paysupport."
 )
 USER_DATE_FORMAT = "%d.%m.%Y"
@@ -91,10 +91,10 @@ def _payment_done_text(outcome: PaymentOutcome) -> str:
     until = outcome.subscription_until.strftime(USER_DATE_FORMAT)
     if outcome.is_first:
         return (
-            f"✅ <b>Подписка оформлена!</b>\nБезлимит до <b>{until}</b>.\n"
+            f"<b>Подписка оформлена</b>\nБезлимит до <b>{until}</b>. "
             f"Она продлится автоматически; {CANCEL_HINT}."
         )
-    return f"🔄 Подписка продлена до <b>{until}</b>."
+    return f"Подписка продлена до <b>{until}</b>."
 
 
 def _payment_admin_text(message: Message, payment, outcome: PaymentOutcome) -> str:

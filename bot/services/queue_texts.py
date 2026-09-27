@@ -1,15 +1,15 @@
 """Тексты очереди загрузок: статус ждущей ссылки, отказы, уведомление о рестарте.
 
-Модуль чистый (без I/O). Тексты — ровно из брифа
-(`.superpowers/sdd/2026-09-27-queue/plan.md`, раздел «3. Тексты»), их
-формулировки менять нельзя без ведома владельца.
+Модуль чистый (без I/O). Тексты — ровно из плана
+(`.superpowers/sdd/2026-09-27-ecosystem-style/texts-plan.md`, раздел
+«4. Готовые тексты для бота»), их формулировки менять нельзя без ведома владельца.
 """
 
 from __future__ import annotations
 
 from bot.services.download_queue import Admission
 from bot.services.progress_texts import PREPARING_TEXT
-from bot.utils.text import esc
+from bot.utils.text import LINE_MARKER, esc
 
 # Строка списка помещается в экран телефона без переноса на большинстве
 # устройств.
@@ -52,30 +52,30 @@ def queue_status_text(waiting_ahead: int) -> str:
     if waiting_ahead == 0:
         return PREPARING_TEXT
     return (
-        f"⏳ <b>В очереди: {waiting_ahead}-я</b>\n"
-        "Качаю твои ссылки по одной. До этой дойду сам — присылать заново не нужно."
+        f"<b>В очереди: {waiting_ahead}-я</b>\n"
+        "Качаю ваши ссылки по одной. До этой дойду сам — присылать заново не нужно."
     )
 
 
 def refusal_text(refused: list[tuple[str, Admission]], max_links: int) -> str:
     """Одно сообщение на все отказы одного входящего сообщения."""
-    lines = [f"• {_display_link(url)} — {REFUSAL_REASONS[reason]}" for url, reason in refused]
-    text = f"⚠️ <b>Не поставил в очередь:</b>\n{_bulleted_list_with_tail(lines)}"
+    lines = [f"{LINE_MARKER}{_display_link(url)} — {REFUSAL_REASONS[reason]}" for url, reason in refused]
+    text = f"<b>Не поставил в очередь:</b>\n{_bulleted_list_with_tail(lines)}"
 
     if any(reason is Admission.FULL for _, reason in refused):
         text += (
             f"\n\nВ очереди может быть не больше {max_links} ссылок. "
-            "Когда текущие скачаются, пришли остальные ещё раз."
+            "Когда текущие скачаются, пришлите остальные ещё раз."
         )
     return text
 
 
 def interrupted_text(urls: list[str], refunded: bool) -> str:
     """Одно сообщение на чат после рестарта бота."""
-    lines = "\n".join(f"• {_display_link(url)}" for url in urls)
+    lines = "\n".join(f"{LINE_MARKER}{_display_link(url)}" for url in urls)
     tail = (
-        "Пришли их ещё раз — бесплатные скачивания за них возвращены."
+        "Пришлите их ещё раз — бесплатные скачивания за них возвращены."
         if refunded
-        else "Пришли их ещё раз."
+        else "Пришлите их ещё раз."
     )
-    return f"⚠️ <b>Бот перезапускался, и эти ссылки не скачались:</b>\n{lines}\n\n{tail}"
+    return f"<b>Бот перезапускался, и эти ссылки не скачались:</b>\n{lines}\n\n{tail}"

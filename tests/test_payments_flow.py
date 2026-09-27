@@ -7,6 +7,7 @@ import bot.handlers.payments as P
 import bot.handlers.user as U
 from bot.config import settings
 from bot.db.models import User
+from bot.utils.text import stars_text
 from tests.test_user_handle_url import _make_session_maker
 
 UID = 700000001
@@ -212,7 +213,7 @@ def _urls(markup):
 
 async def test_subscribe_screen_offers_stars_purchase(monkeypatch, sqlite_engine_factory, tmp_path):
     text, markup = await _subscribe_screen(monkeypatch, sqlite_engine_factory, tmp_path, until=None)
-    assert f"{settings.SUBSCRIPTION_PRICE_STARS} ⭐" in text and "/terms" in text
+    assert stars_text(settings.SUBSCRIPTION_PRICE_STARS) in text and "/terms" in text
     assert _urls(markup) == ["https://t.me/$invoice"]
 
 
@@ -233,5 +234,5 @@ async def test_subscribe_screen_survives_invoice_failure(monkeypatch, sqlite_eng
     text, markup = await _subscribe_screen(
         monkeypatch, sqlite_engine_factory, tmp_path, until=None, link_error=RuntimeError("net")
     )
-    assert "временно недоступна" in text
+    assert "сейчас недоступна" in text
     assert _urls(markup) == []

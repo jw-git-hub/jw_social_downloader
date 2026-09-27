@@ -17,8 +17,10 @@ from loguru import logger
 
 from bot.config import settings
 from bot.services.process_stream import STREAM_LINE_LIMIT_BYTES, communicate_streaming
+from bot.services.progress_texts import format_size
 from bot.services.ytdlp_progress import YTDLP_PROGRESS_ARGS, DownloadStatus, DownloadTracker
 from bot.utils.log_guard import mask_secrets
+from bot.utils.text import platform_name
 
 DOWNLOAD_DIR = Path(settings.DOWNLOAD_ROOT)
 VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".mov", ".m4v"}
@@ -80,7 +82,7 @@ def _timeout_message() -> str:
     """Текст таймаута загрузки. Раньше был захардкожен «120 секунд» — враньё
     после того, как DOWNLOAD_TIMEOUT подняли до 900с (15 минут)."""
     minutes = math.ceil(settings.DOWNLOAD_TIMEOUT / SECONDS_PER_MINUTE)
-    return f"⏱ Таймаут: загрузка не уложилась в {minutes} мин"
+    return f"Скачивание не уложилось в {minutes} мин. Попробуйте ещё раз позже."
 
 
 @dataclass
@@ -144,7 +146,7 @@ _ERROR_RULES: tuple[tuple[str, re.Pattern[str], str], ...] = (
             r"confirm you(?:'|’)?re not a bot|confirm you are not a bot|are you a robot",
             re.IGNORECASE,
         ),
-        "🤖 Платформа просит подтвердить, что запрос не от робота. Попробуй позже.",
+        "Платформа просит подтвердить, что запрос не от робота. Попробуйте позже.",
     ),
     (
         "age_gate",
@@ -153,7 +155,7 @@ _ERROR_RULES: tuple[tuple[str, re.Pattern[str], str], ...] = (
             r"|inappropriate for some users",
             re.IGNORECASE,
         ),
-        "🔞 Видео с возрастным ограничением.",
+        "Видео с возрастным ограничением — такие я скачать не могу.",
     ),
     (
         "dead_session",
@@ -163,7 +165,7 @@ _ERROR_RULES: tuple[tuple[str, re.Pattern[str], str], ...] = (
             r"|session (?:has )?expired|not logged[ -]?in|please log ?in",
             re.IGNORECASE,
         ),
-        "🍪 Платформа не пускает без авторизации: сессия истекла. Обратитесь к админу.",
+        "Платформа не пускает без входа в аккаунт, а мой вход устарел. Напишите в /support.",
     ),
     (
         "private",
@@ -172,7 +174,7 @@ _ERROR_RULES: tuple[tuple[str, re.Pattern[str], str], ...] = (
             r"|(?:video|post|account|profile) is private",
             re.IGNORECASE,
         ),
-        "🔒 Это приватная публикация. Скачивание невозможно.",
+        "Это закрытая публикация — скачать её нельзя.",
     ),
     (
         # Раньше стояло ПОСЛЕ not_found — «Video unavailable… blocked in
@@ -192,7 +194,7 @@ _ERROR_RULES: tuple[tuple[str, re.Pattern[str], str], ...] = (
             r"|blocked in your (?:country|location|region)",
             re.IGNORECASE,
         ),
-        "🌍 Видео недоступно в текущем регионе.",
+        "Видео недоступно в моём регионе.",
     ),
     (
         "not_found",
@@ -202,12 +204,12 @@ _ERROR_RULES: tuple[tuple[str, re.Pattern[str], str], ...] = (
             r"|(?:post|page|content) (?:isn'?t|is not) available",
             re.IGNORECASE,
         ),
-        "🔍 Публикация не найдена. Возможно, она удалена или ссылка неверная.",
+        "Публикация не найдена: возможно, её удалили или в ссылке опечатка.",
     ),
     (
         "rate_limit",
         re.compile(r"http error 429\b|\btoo many requests\b|\brate[- ]limit", re.IGNORECASE),
-        "⏳ Слишком много запросов. Попробуй через минуту.",
+        "Платформа просит подождать: слишком много запросов. Попробуйте через минуту.",
     ),
     (
         "auth_required",
@@ -215,7 +217,7 @@ _ERROR_RULES: tuple[tuple[str, re.Pattern[str], str], ...] = (
             r"http error 40[13]\b|authentication required|requires (?:a )?(?:login|account|subscription)",
             re.IGNORECASE,
         ),
-        "🔐 {platform}: требуется авторизация.",
+        "{platform} открывает это только после входа в аккаунт.",
     ),
     (
         "no_formats",
@@ -224,12 +226,12 @@ _ERROR_RULES: tuple[tuple[str, re.Pattern[str], str], ...] = (
             r"|no (?:suitable )?formats found|unsupported url",
             re.IGNORECASE,
         ),
-        "🔄 Формат видео не поддерживается. Попробуй другую ссылку.",
+        "По этой ссылке нет видео, которое я умею скачать. Попробуйте другую ссылку.",
     ),
     (
         "too_large",
         re.compile(r"max-?filesize|file is larger than", re.IGNORECASE),
-        "📦 Файл слишком большой (больше {max_mb} МБ).",
+        "Файл слишком большой — больше {max_size}.",
     ),
 )
 
@@ -294,8 +296,8 @@ def _parse_error(outputs: Sequence[tuple[str, str]], platform: str) -> str:
     for _name, pattern, template in _ERROR_RULES:
         if pattern.search(haystack):
             return template.format(
-                platform=platform.capitalize(),
-                max_mb=settings.MAX_FILE_SIZE_MB,
+                platform=platform_name(platform),
+                max_size=format_size(settings.MAX_FILE_SIZE_MB),
             )
 
     # Маскируем ПЕРЕД обрезкой и экранированием. Порядок важен в обе стороны:
@@ -309,7 +311,7 @@ def _parse_error(outputs: Sequence[tuple[str, str]], platform: str) -> str:
     short_err = mask_secrets(_pick_fallback(outputs))[:200]
     # Экранируем: сообщение уходит с parse_mode=HTML, а сырой вывод утилит
     # может содержать <, >, & и ломать разметку.
-    return f"❌ Ошибка загрузки:\n<code>{html.escape(short_err)}</code>"
+    return f"Ошибка загрузки:\n<code>{html.escape(short_err)}</code>"
 
 
 @contextlib.contextmanager

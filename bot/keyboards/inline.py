@@ -1,5 +1,7 @@
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
+from bot.utils.text import stars_text
+
 
 def _maybe_admin_row(is_admin: bool) -> list[list[InlineKeyboardButton]]:
     if is_admin:
@@ -36,7 +38,7 @@ def get_paywall_kb(is_admin: bool = False) -> InlineKeyboardMarkup:
 
 def get_subscribe_kb(invoice_url: str, price: int, is_admin: bool = False) -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton(text=f"⭐ Оформить за {price} ⭐", url=invoice_url)],
+        [InlineKeyboardButton(text=f"⭐ Оформить за {stars_text(price)}", url=invoice_url)],
         [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu:main")],
     ]
     rows.extend(_maybe_admin_row(is_admin))

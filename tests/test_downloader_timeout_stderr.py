@@ -91,10 +91,10 @@ async def test_timeout_logs_masked_stderr_tail_without_changing_the_error_messag
 
     result = await downloader.download_media("https://www.youtube.com/watch?v=xyz", "youtube")
 
-    # Текст и поведение таймаута не изменились (правило брифа: тексты ошибок
-    # не трогаем).
+    # Поведение таймаута не изменилось, текст — в стиле экосистемы (без
+    # эмодзи, см. .superpowers/sdd/2026-09-27-ecosystem-style/texts-plan.md).
     assert result.success is False
-    assert "Таймаут" in result.error_message
+    assert "не уложилось в" in result.error_message
 
     warning_messages = "\n".join(captured_logs)
     assert "Download timeout" in warning_messages

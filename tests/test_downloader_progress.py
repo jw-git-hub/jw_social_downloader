@@ -152,7 +152,7 @@ async def test_oversize_error_detected_from_stdout_only(fake_tools_env):
     result = await download_media(_URL, "youtube")
 
     assert result.success is False
-    assert result.error_message.startswith("📦 Файл слишком большой")
+    assert result.error_message.startswith("Файл слишком большой")
 
 
 async def test_on_status_exception_does_not_fail_the_download(fake_tools_env):

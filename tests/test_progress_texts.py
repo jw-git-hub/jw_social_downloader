@@ -103,7 +103,7 @@ def test_download_status_text_preparing_without_plan_is_preparing_text():
 def test_download_status_text_preparing_with_plan_shows_zero_percent():
     status = DownloadStatus(phase=DownloadPhase.PREPARING, plan=FOUR_K_PLAN)
     text = download_status_text(status, limit_mb=1500)
-    assert "⬇️" in text
+    assert "Скачиваю видео" in text
     assert "▱▱▱▱▱▱▱▱▱▱  0%" in text
 
 
@@ -112,11 +112,11 @@ def test_download_status_text_4k_fits_no_note():
         phase=DownloadPhase.DOWNLOADING, plan=FOUR_K_PLAN, fraction=0.52, downloaded_mb=450.0, eta_sec=70,
     )
     text = download_status_text(status, limit_mb=1500)
-    assert "⬇️" in text
+    assert "Скачиваю видео" in text
     assert "4K · 2160p" in text
     assert "904 МБ" in text
     assert "▰▰▰▰▰▱▱▱▱▱  52% · осталось ~1 мин" in text
-    assert "ℹ️" not in text
+    assert "весит от" not in text
 
 
 def test_download_status_text_downgrade_shows_note():
@@ -151,7 +151,7 @@ def test_download_status_text_unknown_total_shows_downloaded_mb():
 def test_download_status_text_merging_shows_eta():
     status = DownloadStatus(phase=DownloadPhase.MERGING, plan=HOURLY_PLAN, eta_sec=70)
     text = download_status_text(status, limit_mb=1500)
-    assert "🎬" in text
+    assert "Собираю видео и звук" in text
     assert "Ещё ~1 мин." in text
 
 
@@ -180,7 +180,7 @@ def test_upload_status_text_without_expected_has_no_bar():
 
 def test_upload_status_text_small_file_without_plan_shows_size_only():
     text = upload_status_text(None, size_mb=12.0, elapsed_sec=None, expected_sec=None, limit_mb=1500)
-    assert "📤" in text
+    assert "Отправляю в Telegram" in text
     assert "12 МБ" in text
     assert "4K" not in text
 
@@ -193,7 +193,7 @@ def test_upload_status_text_unknown_size_skips_size_part():
 
 def test_upload_status_text_carries_downgrade_note():
     text = upload_status_text(HOURLY_PLAN, size_mb=888.8, elapsed_sec=None, expected_sec=None, limit_mb=1500)
-    assert "ℹ️" in text
+    assert "весит от" in text
 
 
 # ── приветствие/помощь ──

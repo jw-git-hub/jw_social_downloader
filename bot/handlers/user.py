@@ -55,6 +55,7 @@ from bot.services.progress_texts import (
     PREPARING_TEXT,
     QUEUED_TEXT,
     download_status_text,
+    format_size,
     limit_line,
     limits_block,
     upload_status_text,
@@ -64,7 +65,7 @@ from bot.services.sending import ProbablyDeliveredError, SendVerdict, classify_s
 from bot.services.status_board import StatusBoard
 from bot.services.upload_estimate import UploadRateTracker
 from bot.services.ytdlp_progress import DownloadStatus, FormatPlan
-from bot.utils.text import LINE_MARKER, esc, format_wait
+from bot.utils.text import LINE_MARKER, esc, format_wait, platform_name, stars_text
 from bot.utils.url_parser import parse_urls
 
 router = Router(name="user")
@@ -162,23 +163,20 @@ def _help_text(quota: FreeQuota, has_subscription: bool) -> str:
 
 
 def _status_text(quota: FreeQuota, sub_until: datetime | None, total_downloads: int) -> str:
-    sub_text = "✅ до " + sub_until.strftime("%d.%m.%Y") if sub_until else "❌ Не активна"
-    free_line = f"🎟 Бесплатно: {_free_left_text(quota)}"
+    sub_text = f"до {sub_until.strftime('%d.%m.%Y')}" if sub_until else "не активна"
+    lines = [f"{LINE_MARKER}бесплатно: {_free_left_text(quota)}"]
     if quota.left == 0:
-        free_line += f"\n⏳ Следующее — через <b>{_wait_text(quota)}</b>"
-    return (
-        f"📊 <b>Твой профиль:</b>\n\n"
-        f"{free_line}\n"
-        f"👑 Подписка: <b>{sub_text}</b>\n"
-        f"📥 Всего скачано: <b>{total_downloads}</b>"
-    )
+        lines.append(f"{LINE_MARKER}следующее — через <b>{_wait_text(quota)}</b>")
+    lines.append(f"{LINE_MARKER}подписка: <b>{sub_text}</b>")
+    lines.append(f"{LINE_MARKER}всего скачано: <b>{total_downloads}</b>")
+    return "<b>Мой статус</b>\n" + "\n".join(lines)
 
 
 def _limit_reached_text(quota: FreeQuota) -> str:
     return (
-        "🚫 Бесплатные скачивания на сутки закончились.\n"
+        "Бесплатные скачивания на сутки закончились. "
         f"Следующее откроется через <b>{_wait_text(quota)}</b>.\n"
-        "С подпиской — без ограничений 👇"
+        "С подпиской — без ограничений."
     )
 
 
@@ -272,13 +270,13 @@ def _download_failed_text(error_message: str | None) -> str:
     """error_message приходит из загрузчика УЖЕ экранированным
     (downloader.py:77 и :443 прогоняют текст через html.escape).
     Экранировать второй раз нельзя — пользователь увидит «&amp;lt;»."""
-    return f"❌ <b>Не удалось скачать</b>\n{error_message or 'Причина неизвестна'}"
+    return f"<b>Не удалось скачать</b>\n{error_message or 'Причина неизвестна.'}"
 
 
 def _media_caption(platform: str, kind: str) -> str:
     """Подпись к отправляемому медиа. kind: "video" | "image" | "animation" | "album"."""
     titles = {"video": "Видео", "image": "Фото", "animation": "GIF", "album": "Медиа"}
-    return f"✅ {titles.get(kind, 'Медиа')} из {esc(platform.capitalize())}"
+    return f"{titles.get(kind, 'Медиа')} из {esc(platform_name(platform))}"
 
 
 def _url_for_log(url: str) -> str:
@@ -475,14 +473,22 @@ async def _refund_quota(reservation_id: int) -> None:
         logger.error("Не удалось вернуть бесплатное скачивание | reservation={} error={}", reservation_id, exc)
 
 
-LOW_DISK_TEXT = "⚠️ Бот временно не может скачивать. Попробуй через несколько минут."
-TOO_LARGE_FOR_TELEGRAM_TEXT = "📦 Telegram не принял файл: он слишком большой."
-INTERNAL_ERROR_TEXT = "❌ <b>Не удалось скачать</b>\nПроизошла внутренняя ошибка. Попробуй ещё раз."
+LOW_DISK_TEXT = "Сейчас не могу скачивать — попробуйте через несколько минут. Попытка не потрачена."
+TOO_LARGE_FOR_TELEGRAM_TEXT = "Telegram не принял файл: он слишком большой."
+INTERNAL_ERROR_TEXT = "<b>Не удалось скачать</b>\nЧто-то пошло не так. Попробуйте ещё раз."
 PROBABLY_DELIVERED_TEXT = (
-    "📤 <b>Файл большой — Telegram ещё обрабатывает его.</b>\n"
+    "<b>Файл большой — Telegram ещё обрабатывает его.</b>\n"
     "Скорее всего, он появится в этом чате в ближайшие минуты. "
-    "Если через 15 минут его нет — пришли ссылку ещё раз."
+    "Если через 15 минут его нет — пришлите ссылку ещё раз."
 )
+DONE_TEXT = "Готово. Можно прислать следующую ссылку."
+SEND_NETWORK_ERROR_TEXT = "Ошибка сети при отправке файла. Попробуйте ещё раз."
+SEND_ERROR_TEXT = "Ошибка при отправке файла. Попробуйте ещё раз."
+
+
+def _partial_album_send_text(sent: int, total: int, is_network_error: bool) -> str:
+    tail = "ошибка сети" if is_network_error else "ошибка"
+    return f"Отправил {sent} из {total} файлов, дальше случилась {tail}. Попробуйте ещё раз."
 
 
 def _result_paths(dl_result: DownloadResult) -> list[str]:
@@ -508,9 +514,9 @@ async def _record_failure(db_user_id: int, url: str, platform: str, reservation_
 
 def _oversize_text(actual_mb: float, limit_mb: int) -> str:
     return (
-        "📦 <b>Файл слишком большой</b>\n"
-        f"Получилось {actual_mb:.0f} МБ, а отправить можно до {limit_mb} МБ. "
-        "Попробуй видео покороче."
+        "<b>Файл слишком большой</b>\n"
+        f"Получилось {format_size(actual_mb)}, а отправить я могу до {format_size(limit_mb)}. "
+        "Попробуйте видео покороче."
     )
 
 
@@ -691,20 +697,20 @@ async def cb_status(callback: CallbackQuery) -> None:
     )
 
 
-PAYMENT_UNAVAILABLE_TEXT = "⚠️ Оплата временно недоступна, попробуй позже."
+PAYMENT_UNAVAILABLE_TEXT = "Оплата сейчас недоступна. Попробуйте через несколько минут."
 
 
 def _subscribe_text(sub_until: datetime | None) -> str:
     if sub_until is not None:
         return (
-            f"👑 <b>Подписка активна</b> до <b>{sub_until.strftime('%d.%m.%Y')}</b>.\n\n"
+            f"<b>Подписка активна</b> до <b>{sub_until.strftime('%d.%m.%Y')}</b>.\n\n"
             f"Если оформлена звёздами — продлится сама; {CANCEL_HINT}."
         )
     return (
-        "👑 <b>Подписка</b>\n\n"
-        f"Безлимитные скачивания на 30 дней — <b>{settings.SUBSCRIPTION_PRICE_STARS} ⭐</b>.\n"
+        "<b>Подписка</b>\n\n"
+        f"Скачивания без ограничений на 30 дней — <b>{stars_text(settings.SUBSCRIPTION_PRICE_STARS)}</b>.\n"
         f"Продлевается автоматически каждые 30 дней; {CANCEL_HINT}.\n\n"
-        "Оплачивая, ты принимаешь условия: /terms"
+        "Оплачивая, вы принимаете условия: /terms"
     )
 
 
@@ -809,12 +815,15 @@ async def _reserve_for_queue(message: Message, url: str) -> _QuotaHold:
     )
 
 
+BANNED_TEXT = "Ваш аккаунт заблокирован. Если это ошибка — напишите в /support."
+
+
 async def _refuse_if_not_allowed(message: Message, hold: _QuotaHold) -> bool:
     """Отвечает баном/пейволлом, если ссылку нельзя поставить в очередь.
     True — если отказал (дальше по этой ссылке делать нечего)."""
     if hold.is_banned:
         # Резервирования не было — возвращать нечего.
-        await message.reply("🚫 Ваш аккаунт заблокирован. Обратитесь к администратору.")
+        await message.reply(BANNED_TEXT)
         return True
     if hold.pending_id is None:
         if _should_send_paywall(message.from_user.id):
@@ -1235,7 +1244,7 @@ async def _execute_download(job: _DownloadJob) -> None:
             # удалён. Сбой этого финального ответа не должен ничего переписывать.
             try:
                 await message.answer(
-                    "✅ Готово! Что дальше?",
+                    DONE_TEXT,
                     reply_markup=get_after_download_kb(is_admin=_is_admin(user_id)),
                 )
             except Exception:
@@ -1269,15 +1278,13 @@ async def _execute_download(job: _DownloadJob) -> None:
     )
     try:
         if media_total_count > 1:
-            tail = "ошибка сети" if is_network_error else "ошибка"
             await status_msg.edit_text(
-                f"⚠️ Отправлено {media_sent_count} из {media_total_count} файлов, "
-                f"дальше произошла {tail}. Попробуй ещё раз."
+                _partial_album_send_text(media_sent_count, media_total_count, is_network_error)
             )
         elif is_network_error:
-            await status_msg.edit_text("⚠️ Ошибка сети при отправке файла. Попробуй ещё раз.")
+            await status_msg.edit_text(SEND_NETWORK_ERROR_TEXT)
         else:
-            await status_msg.edit_text("⚠️ Ошибка при отправке файла. Попробуй ещё раз.")
+            await status_msg.edit_text(SEND_ERROR_TEXT)
     except (TelegramBadRequest, TelegramForbiddenError):
         pass
 

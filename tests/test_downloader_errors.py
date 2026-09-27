@@ -96,24 +96,24 @@ def test_error_surface_is_empty_when_nothing_looks_like_an_error():
 
 def test_cookie_hint_in_ytdlp_error_is_not_reported_as_expired_cookies():
     msg = _parse_error([("yt-dlp", YTDLP_BOT_CHECK)], "youtube")
-    assert "🍪" not in msg
-    assert "🤖" in msg
+    assert "мой вход устарел" not in msg
+    assert "не от робота" in msg
 
 
 def test_cookie_flag_echo_is_not_reported_as_expired_cookies():
     msg = _parse_error([("yt-dlp", YTDLP_GENERIC_WITH_COOKIE_HINT)], "instagram")
-    assert "🍪" not in msg
+    assert "мой вход устарел" not in msg
 
 
 def test_private_key_noise_is_not_reported_as_private_video():
     msg = _parse_error([("yt-dlp", YTDLP_PRIVATE_KEY_NOISE)], "facebook")
-    assert "🔒" not in msg
+    assert "закрытая публикация" not in msg
 
 
 def test_word_separate_is_not_reported_as_rate_limit():
     msg = _parse_error([("yt-dlp", YTDLP_SEPARATE_NOISE)], "tiktok")
-    assert "⏳" not in msg
-    assert "🔄" in msg
+    assert "слишком много запросов" not in msg
+    assert "умею скачать" in msg
 
 
 # ── Позитивные проверки ──────────────────────────────────────────────────
@@ -124,15 +124,15 @@ def test_gallery_dl_login_redirect_wins_over_ytdlp_json_traceback():
         [("yt-dlp", YTDLP_JSON_TRACEBACK), ("gallery-dl", GALLERY_DL_LOGIN_REDIRECT)],
         "instagram",
     )
-    assert "🍪" in msg
+    assert "мой вход устарел" in msg
 
 
 def test_http_404_is_reported_as_not_found():
-    assert "🔍" in _parse_error([("yt-dlp", YTDLP_NOT_FOUND)], "tiktok")
+    assert "не найдена" in _parse_error([("yt-dlp", YTDLP_NOT_FOUND)], "tiktok")
 
 
 def test_private_post_is_reported_as_private():
-    assert "🔒" in _parse_error([("yt-dlp", YTDLP_PRIVATE)], "instagram")
+    assert "закрытая публикация" in _parse_error([("yt-dlp", YTDLP_PRIVATE)], "instagram")
 
 
 def test_unclassified_error_shows_gallery_dl_text_escaped():
@@ -177,7 +177,7 @@ def test_unclassified_error_masks_query_string_secrets():
 
 
 def test_file_too_large_marker_without_error_prefix_is_recognized():
-    assert "📦" in _parse_error([("yt-dlp", YTDLP_FILE_TOO_LARGE)], "youtube")
+    assert "слишком большой" in _parse_error([("yt-dlp", YTDLP_FILE_TOO_LARGE)], "youtube")
 
 
 # ── Фикс-раунд 1: гео — реальная фраза и порядок правил (Minor #7) ───────
@@ -185,13 +185,13 @@ def test_file_too_large_marker_without_error_prefix_is_recognized():
 
 def test_geo_blocked_real_phrasing_is_recognized():
     msg = _parse_error([("yt-dlp", YTDLP_GEO_BLOCKED_PHRASED)], "youtube")
-    assert "🌍" in msg
+    assert "моём регионе" in msg
 
 
 def test_geo_block_wins_over_generic_unavailable_when_both_present():
     msg = _parse_error([("yt-dlp", YTDLP_GEO_VS_UNAVAILABLE)], "tiktok")
-    assert "🌍" in msg
-    assert "🔍" not in msg
+    assert "моём регионе" in msg
+    assert "не найдена" not in msg
 
 
 # ── Фикс-раунд 1: инвариант порядка правил (холостой тест #2) ────────────
@@ -205,8 +205,8 @@ def test_dead_session_phrase_wins_over_generic_rate_limit_pattern():
     поднять rate_limit выше dead_session в `_ERROR_RULES` — весь сьют
     оставался зелёным."""
     msg = _parse_error([("yt-dlp", INSTAGRAM_DEAD_SESSION_VS_RATE)], "instagram")
-    assert "🍪" in msg
-    assert "⏳" not in msg
+    assert "мой вход устарел" in msg
+    assert "слишком много запросов" not in msg
 
 
 # ── Фикс-раунд 1: показ сохраняет [warning] с настоящей причиной (Minor #8) ─
