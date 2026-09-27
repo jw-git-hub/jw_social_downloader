@@ -19,6 +19,8 @@ from bot.config import settings
 from bot.services.downloader import (
     YOUTUBE_AUDIO_BUDGET_DIVISOR,
     YOUTUBE_AUDIO_BUDGET_MAX_MB,
+    YOUTUBE_CONCURRENT_FRAGMENTS,
+    YOUTUBE_EXTRACTOR_ARGS,
     YOUTUBE_FORMAT_SORT,
     _build_command,
 )
@@ -42,8 +44,6 @@ def test_youtube_client_pin_is_removed(tmp_path):
     assert "player_client" not in joined
     assert "web_safari" not in joined
     assert "android_vr" not in joined
-    # --extractor-args вообще не нужен без пина.
-    assert "--extractor-args" not in cmd
 
 
 def test_youtube_cascade_starts_with_bv_plus_ba(tmp_path):
@@ -188,3 +188,30 @@ def test_youtube_sort_prefers_resolution_without_cap(tmp_path):
     assert "hdr:sdr" in fields
     assert "+codec:avc:m4a" in fields
     assert fields.index("hdr:sdr") < fields.index("+codec:avc:m4a")
+
+
+# ── Холодный кэш googlevideo: dashy + параллельные фрагменты ────────────
+
+
+def test_youtube_extractor_args_use_dashy_and_skip_hls(tmp_path):
+    # Холодный узел googlevideo отдаёт непрогретый топ-формат одним https-
+    # соединением на 0.2–1.6 МиБ/с — dashy переключает его на
+    # http_dash_segments, качаемые диапазонами параллельно. skip=hls нужен,
+    # иначе HLS-вариант с завышенной оценкой размера обгоняет DASH в -S.
+    cmd = _youtube_cmd(tmp_path)
+    assert cmd[cmd.index("--extractor-args") + 1] == YOUTUBE_EXTRACTOR_ARGS
+    assert YOUTUBE_EXTRACTOR_ARGS == "youtube:formats=dashy;skip=hls"
+
+
+def test_youtube_concurrent_fragments_matches_constant(tmp_path):
+    cmd = _youtube_cmd(tmp_path)
+    assert cmd[cmd.index("--concurrent-fragments") + 1] == str(YOUTUBE_CONCURRENT_FRAGMENTS)
+    assert YOUTUBE_CONCURRENT_FRAGMENTS == 8
+
+
+def test_youtube_extractor_args_appears_exactly_once(tmp_path):
+    # yt-dlp берёт для одного экстрактора ПОСЛЕДНЕЕ значение --extractor-args:
+    # если появится второй youtube-специфичный флаг, его надо будет слить в
+    # эту же строку через ";", а не добавлять отдельным вхождением.
+    cmd = _youtube_cmd(tmp_path)
+    assert cmd.count("--extractor-args") == 1

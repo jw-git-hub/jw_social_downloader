@@ -54,6 +54,19 @@ YOUTUBE_AUDIO_BUDGET_MAX_MB = 120
 # Разрешение важнее кодека (решение владельца 2026-09-26: потолка нет — самый
 # лучший вариант всегда), SDR раньше HDR, при равном разрешении avc1 > vp9 > av01.
 YOUTUBE_FORMAT_SORT = "res,fps,hdr:sdr,+codec:avc:m4a"
+# Малоизвестные ролики: верхний формат (1440p/4K vp9/av01) не лежит в кэше
+# узла googlevideo, и такой узел отдаёт непрогретые байты по ОДНОМУ https-
+# соединению со скоростью 0.2–1.6 МиБ/с — файл ~1 ГиБ не укладывается в
+# DOWNLOAD_TIMEOUT (замер: 97PbTbK8qI8, 308+140, 1031 МиБ, таймаут в проде).
+# `formats=dashy` превращает те же https-форматы в `http_dash_segments` —
+# диапазонные запросы по ~10 МиБ, которые `--concurrent-fragments` качает
+# параллельно (ретраи — на каждый фрагмент отдельно, а не на файл целиком).
+# `skip=hls` обязателен: в `-S` (YOUTUBE_FORMAT_SORT) протоколы упорядочены
+# https > m3u8 > dash, и без него HLS-вариант с завышенной оценкой размера
+# при равных res/fps/кодеке обгоняет DASH-дорожку в сортировке.
+YOUTUBE_EXTRACTOR_ARGS = "youtube:formats=dashy;skip=hls"
+# -N: сколько DASH-фрагментов качать параллельно одного формата.
+YOUTUBE_CONCURRENT_FRAGMENTS = 8
 
 
 def _timeout_message() -> str:
@@ -387,6 +400,20 @@ def _youtube_args() -> list[str]:
     не прибавляют разрешения), а при равном разрешении avc1 > vp9 > av01 и
     AAC > Opus — поэтому до 1080p включительно файл остаётся H.264+AAC, как
     раньше.
+
+    `--extractor-args` (YOUTUBE_EXTRACTOR_ARGS) + `--concurrent-fragments`
+    (YOUTUBE_CONCURRENT_FRAGMENTS) решают КАК скачать уже выбранный формат:
+    на непопулярных роликах верхний формат отдаётся холодным узлом googlevideo
+    по одному https-соединению на скорости 0.2–1.6 МиБ/с, и ролик ~1 ГиБ не
+    успевает за DOWNLOAD_TIMEOUT. `dashy` переключает выбранный формат на
+    `http_dash_segments` (те же дорожки, но диапазонными запросами по ~10 МиБ),
+    `-N 8` качает эти диапазоны параллельно.
+
+    Риск: на фрагментах `--max-filesize` не обрывает закачку заранее — он
+    сверяет Content-Length одного ответа, а не сумму фрагментов. Это касается
+    только терминальной ветки каскада `bv*+ba/b` (остальные уже отфильтрованы
+    по filesize_approx до выбора) — превышение лимита на ней ловит гейт
+    `oversized_files` уже после закачки, не до неё.
     """
     return [
         "--no-playlist",
@@ -394,6 +421,8 @@ def _youtube_args() -> list[str]:
         "-f", _youtube_format_selector(),
         "-S", YOUTUBE_FORMAT_SORT,
         "--merge-output-format", "mp4",
+        "--extractor-args", YOUTUBE_EXTRACTOR_ARGS,
+        "--concurrent-fragments", str(YOUTUBE_CONCURRENT_FRAGMENTS),
     ]
 
 

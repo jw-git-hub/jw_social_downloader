@@ -10,8 +10,12 @@ yt-dlp, и текстовая проверка это не поймает.
 вариант всегда выбираем») — 8K допустим наравне с 4K, если влезает в бюджет.
 """
 
+import functools
+import http.server
+import threading
 from pathlib import Path
 
+import pytest
 import yt_dlp
 
 from bot.config import settings
@@ -214,3 +218,125 @@ def test_fallback_audio_skips_surround_tracks(tmp_path, monkeypatch):
         _audio("380", "ec-3", "m4a", 384, 110),
     ]
     assert _choose(video + audio, tmp_path) == "247+139"
+
+
+# ── Холодный кэш googlevideo: dashy + параллельные фрагменты (см. докстринг
+# _youtube_args в bot/services/downloader.py) ────────────────────────────
+
+
+def _protocol_video(format_id: str, height: int, vcodec: str, size_mib: float, protocol: str, *, ext: str = "mp4") -> dict:
+    size = int(size_mib * MIB)
+    fmt = {
+        "format_id": format_id,
+        "url": f"https://example.invalid/{format_id}",
+        "ext": ext,
+        "protocol": protocol,
+        "vcodec": vcodec,
+        "acodec": "none",
+        "width": height * 16 // 9,
+        "height": height,
+        "fps": 60,
+        "dynamic_range": "SDR",
+        "filesize_approx": size,
+    }
+    if protocol != "m3u8_native":
+        fmt["filesize"] = size
+    if protocol == "http_dash_segments":
+        fmt["fragments"] = [{"url": f"https://example.invalid/{format_id}?range=0-1"}]
+    return fmt
+
+
+def _protocol_aac(protocol: str) -> dict:
+    fmt = _protocol_video("140", 0, "none", 15, protocol, ext="m4a")
+    fmt.update(vcodec="none", acodec="mp4a.40.2", abr=129)
+    for key in ("width", "height", "fps", "dynamic_range"):
+        fmt.pop(key)
+    return fmt
+
+
+def test_dashy_extractor_args_and_concurrency_reach_yt_dlp(tmp_path):
+    # Реальная команда (_build_command), без monkeypatch: --extractor-args и
+    # --concurrent-fragments должны дойти до yt_dlp.parse_options как есть.
+    cmd = _build_command(FIXTURE_URL, "youtube", tmp_path / "out.mp4", None)
+    opts = yt_dlp.parse_options(cmd[1:-1] + ["-q", "--no-warnings"]).ydl_opts
+    assert opts["concurrent_fragment_downloads"] == 8
+    assert opts["extractor_args"] == {"youtube": {"formats": ["dashy"], "skip": ["hls"]}}
+
+
+@pytest.mark.parametrize("protocol", ["https", "http_dash_segments"])
+def test_format_choice_is_the_same_on_https_and_dash_protocol(tmp_path, monkeypatch, protocol):
+    # Лестница 97PbTbK8qI8: 1440p vp9 ~1016 МиБ влезает в бюджет (1500 →
+    # 1380 МиБ видео) на ОБОИХ протоколах — dashy меняет только протокол
+    # закачки уже выбранного формата, не сам выбор.
+    monkeypatch.setattr(settings, "MAX_FILE_SIZE_MB", 1500)
+    ladder = [
+        _protocol_video("299", 1080, "avc1.64002a", 546, protocol),
+        _protocol_video("303", 1080, "vp9", 347, protocol, ext="webm"),
+        _protocol_video("308", 1440, "vp9", 1016, protocol, ext="webm"),
+        _protocol_aac(protocol),
+    ]
+    assert _choose(ladder, tmp_path) == "308+140"
+
+    too_big = [f for f in ladder if f["format_id"] != "308"]
+    too_big.append(_protocol_video("308", 1440, "vp9", 1500, protocol, ext="webm"))
+    assert _choose(too_big, tmp_path) == "299+140"
+
+
+def test_hls_wins_tie_against_dash_which_is_why_skip_hls_is_required(tmp_path, monkeypatch):
+    # Документирует, зачем в YOUTUBE_EXTRACTOR_ARGS обязателен skip=hls:
+    # -S сортирует протоколы https > m3u8 > dash, и при равных res/fps/кодеке
+    # HLS-вариант (размер там всегда лишь оценка ≈, не точный Content-Length)
+    # обгоняет DASH. skip=hls решает это на стороне экстрактора — не давая
+    # yt-dlp вообще запросить m3u8-плейлист у YouTube, — а не в сортировке.
+    monkeypatch.setattr(settings, "MAX_FILE_SIZE_MB", 1500)
+    formats = [
+        _protocol_video("299", 1080, "avc1.64002a", 546, "http_dash_segments"),
+        _protocol_video("312", 1080, "avc1.64002a", 686, "m3u8_native"),
+        _protocol_aac("http_dash_segments"),
+    ]
+    assert _choose(formats, tmp_path) == "312+140"
+
+
+@pytest.fixture
+def _fragment_server(tmp_path):
+    root = tmp_path / "fragment_server_root"
+    root.mkdir()
+    for index in range(3):
+        (root / f"frag{index}").write_bytes(b"\0" * MIB)
+    (root / "whole").write_bytes(b"\0" * 3 * MIB)
+    handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(root))
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}"
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+
+@pytest.mark.parametrize("protocol, aborted", [("https", True), ("http_dash_segments", False)])
+def test_max_filesize_guards_only_plain_https_not_dash_fragments(_fragment_server, tmp_path, protocol, aborted):
+    # Риск фикса (см. докстринг _youtube_args): --max-filesize сверяет
+    # Content-Length ОДНОГО ответа. На plain https это весь файл, и превышение
+    # обрывает закачку заранее. На http_dash_segments каждый ответ — фрагмент
+    # ≤10 МиБ, всегда меньше лимита по отдельности, поэтому --max-filesize не
+    # срабатывает; итоговое превышение ловит только гейт oversized_files ПОСЛЕ
+    # закачки (не проверяется этим тестом — тест только про сам предохранитель).
+    fmt = {
+        "format_id": "big", "ext": "mp4", "vcodec": "avc1", "acodec": "mp4a",
+        "protocol": protocol, "url": f"{_fragment_server}/whole", "filesize": 3 * MIB,
+    }
+    if protocol == "http_dash_segments":
+        fmt["fragments"] = [{"url": f"{_fragment_server}/frag{i}"} for i in range(3)]
+    info = {
+        "id": "x", "title": "x", "extractor": "generic", "extractor_key": "Generic",
+        "webpage_url": _fragment_server, "formats": [fmt],
+    }
+    output_path = tmp_path / "out" / "f.mp4"
+    opts = yt_dlp.parse_options(
+        ["-q", "--no-warnings", "--max-filesize", "1500K", "-o", str(output_path)]
+    ).ydl_opts
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        ydl.process_ie_result(info, download=True)
+    assert output_path.exists() is (not aborted)
