@@ -17,6 +17,7 @@ from bot.config import settings
 from bot.services import disk_space, downloader
 from bot.services.downloader import DownloadResult
 from bot.services.media_probe import MediaInfo
+from bot.services.progress_texts import PREPARING_TEXT
 from tests.test_user_handle_url import TEST_URL, _free_downloads_left, _make_session_maker, _seed_user
 
 _METHOD = SendMessage(chat_id=1, text="x")
@@ -55,6 +56,7 @@ class _FakeSendSafetyMessage:
         self, uid: int, *, on_reply_video=None, events: list[str] | None = None
     ) -> None:
         self.from_user = SimpleNamespace(id=uid, username="tester", full_name="Test User")
+        self.chat = SimpleNamespace(id=uid)
         self.reply_calls: list[str] = []
         self.answer_calls: list[tuple[str, object]] = []
         self.reply_video_calls: list[dict] = []
@@ -114,7 +116,7 @@ async def test_probably_delivered_is_not_resent_and_quota_is_kept(
 
         msg = _FakeSendSafetyMessage(uid, on_reply_video=_fail_after_long_wait)
 
-        await U._process_download(msg, TEST_URL, "tiktok")
+        await U._process_download(msg, [(TEST_URL, "tiktok")])
 
         assert calls["n"] == 1
         assert await _free_downloads_left(maker, uid) == 0
@@ -157,7 +159,7 @@ async def test_long_network_failure_in_cloud_mode_refunds_quota(
 
         msg = _FakeSendSafetyMessage(uid, on_reply_video=_fail_after_long_wait)
 
-        await U._process_download(msg, TEST_URL, "tiktok")
+        await U._process_download(msg, [(TEST_URL, "tiktok")])
 
         assert calls["n"] == 1
         assert await _free_downloads_left(maker, uid) == 1
@@ -195,7 +197,7 @@ async def test_quick_network_error_is_retried_once_then_succeeds(
 
         msg = _FakeSendSafetyMessage(uid, on_reply_video=_fail_once_then_ok)
 
-        await U._process_download(msg, TEST_URL, "tiktok")
+        await U._process_download(msg, [(TEST_URL, "tiktok")])
 
         assert calls["n"] == 2
         assert await _free_downloads_left(maker, uid) == 0
@@ -224,7 +226,7 @@ async def test_entity_too_large_is_not_retried(monkeypatch, sqlite_engine_factor
 
         msg = _FakeSendSafetyMessage(uid, on_reply_video=_too_large)
 
-        await U._process_download(msg, TEST_URL, "tiktok")
+        await U._process_download(msg, [(TEST_URL, "tiktok")])
 
         assert calls["n"] == 1
         assert await _free_downloads_left(maker, uid) == 1
@@ -249,7 +251,7 @@ async def test_oversized_file_is_not_sent_and_quota_refunded(
 
         msg = _FakeSendSafetyMessage(uid)
 
-        await U._process_download(msg, TEST_URL, "tiktok")
+        await U._process_download(msg, [(TEST_URL, "tiktok")])
 
         assert msg.reply_video_calls == []
         assert await _free_downloads_left(maker, uid) == 1
@@ -260,9 +262,12 @@ async def test_oversized_file_is_not_sent_and_quota_refunded(
         await engine.dispose()
 
 
-async def test_low_disk_refuses_before_quota_and_download(
+async def test_low_disk_at_start_refunds_and_skips_download(
     monkeypatch, sqlite_engine_factory, tmp_path
 ):
+    """Д4 плана очереди: место проверяется в момент старта загрузки, а не
+    при постановке — статус-сообщение к этому моменту уже отправлено
+    (PREPARING_TEXT), и отказ по месту его правит, а не шлёт новое."""
     maker, engine = await _make_session_maker(sqlite_engine_factory, tmp_path, "low_disk.db")
     try:
         uid = 991005
@@ -276,9 +281,11 @@ async def test_low_disk_refuses_before_quota_and_download(
         monkeypatch.setattr(U, "download_media", _must_not_be_called)
 
         msg = _FakeSendSafetyMessage(uid)
-        await U._process_download(msg, TEST_URL, "tiktok")
+        await U._process_download(msg, [(TEST_URL, "tiktok")])
 
-        assert msg.reply_calls == [U.LOW_DISK_TEXT]
+        assert msg.reply_calls == [PREPARING_TEXT]
+        assert msg.status_message is not None
+        assert msg.status_message.edit_calls[-1] == U.LOW_DISK_TEXT
         assert await _free_downloads_left(maker, uid) == 1
     finally:
         await engine.dispose()
@@ -298,7 +305,7 @@ async def test_sending_status_is_shown_before_upload(monkeypatch, sqlite_engine_
         events: list[str] = []
         msg = _FakeSendSafetyMessage(uid, events=events)
 
-        await U._process_download(msg, TEST_URL, "tiktok")
+        await U._process_download(msg, [(TEST_URL, "tiktok")])
 
         sending_events = [e for e in events if e.startswith("edit:") and "📤" in e]
         assert sending_events
@@ -325,7 +332,7 @@ async def test_single_video_is_streamable_with_dimensions(
         monkeypatch.setattr(U, "probe_media", _probe)
 
         msg = _FakeSendSafetyMessage(uid)
-        await U._process_download(msg, TEST_URL, "tiktok")
+        await U._process_download(msg, [(TEST_URL, "tiktok")])
 
         assert len(msg.reply_video_calls) == 1
         kwargs = msg.reply_video_calls[0]

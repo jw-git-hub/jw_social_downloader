@@ -37,6 +37,7 @@ class _FakeMediaMessage:
 
     def __init__(self, uid: int) -> None:
         self.from_user = SimpleNamespace(id=uid, username="tester", full_name="Test User")
+        self.chat = SimpleNamespace(id=uid)
         self.reply_calls: list[str] = []
         self.answer_calls: list[tuple[str, object]] = []
         self.animation_calls: list[tuple[str, str | None]] = []
@@ -93,7 +94,7 @@ async def test_silent_short_video_is_sent_as_animation(monkeypatch, sqlite_engin
         monkeypatch.setattr("bot.handlers.user.probe_media", _probe)
 
         msg = _FakeMediaMessage(uid)
-        await _process_download(msg, TEST_URL, "pinterest")
+        await _process_download(msg, [(TEST_URL, "pinterest")])
 
         assert msg.animation_calls == [
             ("/tmp/does-not-exist-silent.mp4", _media_caption("pinterest", "animation"))
@@ -124,7 +125,7 @@ async def test_video_with_audio_is_sent_as_video(monkeypatch, sqlite_engine_fact
         monkeypatch.setattr("bot.handlers.user.probe_media", _probe)
 
         msg = _FakeMediaMessage(uid)
-        await _process_download(msg, TEST_URL, "tiktok")
+        await _process_download(msg, [(TEST_URL, "tiktok")])
 
         assert msg.video_calls == [
             ("/tmp/does-not-exist-audio.mp4", _media_caption("tiktok", "video"))
@@ -155,7 +156,7 @@ async def test_silent_video_over_duration_cap_is_sent_as_video(monkeypatch, sqli
         monkeypatch.setattr("bot.handlers.user.probe_media", _probe)
 
         msg = _FakeMediaMessage(uid)
-        await _process_download(msg, TEST_URL, "pinterest")
+        await _process_download(msg, [(TEST_URL, "pinterest")])
 
         assert msg.video_calls == [
             ("/tmp/does-not-exist-long.mp4", _media_caption("pinterest", "video"))
@@ -186,7 +187,7 @@ async def test_unreadable_file_probe_none_falls_back_to_video(monkeypatch, sqlit
         monkeypatch.setattr("bot.handlers.user.probe_media", _probe)
 
         msg = _FakeMediaMessage(uid)
-        await _process_download(msg, TEST_URL, "pinterest")  # не должно бросить
+        await _process_download(msg, [(TEST_URL, "pinterest")])  # не должно бросить
 
         assert msg.video_calls == [
             ("/tmp/does-not-exist-unreadable.mp4", _media_caption("pinterest", "video"))
@@ -224,7 +225,7 @@ async def test_probe_media_raising_falls_back_to_video_without_crashing(
         monkeypatch.setattr("bot.handlers.user.probe_media", _probe)
 
         msg = _FakeMediaMessage(uid)
-        await _process_download(msg, TEST_URL, "pinterest")  # не должно бросить
+        await _process_download(msg, [(TEST_URL, "pinterest")])  # не должно бросить
 
         assert msg.video_calls == [
             ("/tmp/does-not-exist-crash.mp4", _media_caption("pinterest", "video"))
@@ -257,7 +258,7 @@ async def test_silent_short_webm_is_sent_as_video(monkeypatch, sqlite_engine_fac
         monkeypatch.setattr("bot.handlers.user.probe_media", _probe)
 
         msg = _FakeMediaMessage(uid)
-        await _process_download(msg, TEST_URL, "pinterest")
+        await _process_download(msg, [(TEST_URL, "pinterest")])
 
         assert msg.video_calls == [
             ("/tmp/does-not-exist-silent.webm", _media_caption("pinterest", "video"))
@@ -288,7 +289,7 @@ async def test_image_media_type_never_calls_probe_media(monkeypatch, sqlite_engi
         monkeypatch.setattr("bot.handlers.user.probe_media", _must_not_be_called)
 
         msg = _FakeMediaMessage(uid)
-        await _process_download(msg, TEST_URL, "pinterest")
+        await _process_download(msg, [(TEST_URL, "pinterest")])
 
         assert msg.photo_calls == [
             ("/tmp/does-not-exist.jpg", _media_caption("pinterest", "image"))

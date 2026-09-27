@@ -48,6 +48,7 @@ class _FakeMessage:
 
     def __init__(self, uid: int, *, on_reply_video=None) -> None:
         self.from_user = SimpleNamespace(id=uid, username="tester", full_name="Test User")
+        self.chat = SimpleNamespace(id=uid)
         self.reply_calls: list[str] = []
         self.answer_calls: list[tuple[str, object]] = []
         self.reply_video_calls: list[dict] = []
@@ -85,7 +86,7 @@ async def test_first_reply_is_preparing_text(monkeypatch, sqlite_engine_factory,
         monkeypatch.setattr(U, "probe_media", _no_probe)
 
         msg = _FakeMessage(uid)
-        await U._process_download(msg, TEST_URL, "tiktok")
+        await U._process_download(msg, [(TEST_URL, "tiktok")])
 
         assert msg.reply_calls == [PREPARING_TEXT]
     finally:
@@ -112,7 +113,7 @@ async def test_ticker_does_not_overwrite_failure_text(monkeypatch, sqlite_engine
         monkeypatch.setattr(U, "download_media", _fail_with_progress)
 
         msg = _FakeMessage(uid)
-        await U._process_download(msg, TEST_URL, "tiktok")
+        await U._process_download(msg, [(TEST_URL, "tiktok")])
 
         assert msg.status_message is not None
         assert "Не удалось скачать" in msg.status_message.edit_calls[-1]
@@ -182,7 +183,7 @@ async def test_successful_send_records_upload_rate(monkeypatch, sqlite_engine_fa
 
         msg = _FakeMessage(uid, on_reply_video=_advance_and_succeed)
 
-        await U._process_download(msg, TEST_URL, "tiktok")
+        await U._process_download(msg, [(TEST_URL, "tiktok")])
 
         assert U.upload_rate.rate_mb_per_sec() != DEFAULT_UPLOAD_MIB_PER_SEC
         assert U.upload_rate.rate_mb_per_sec() == 150.0 / 30.0
@@ -223,7 +224,7 @@ async def test_probably_delivered_does_not_record_upload_rate(monkeypatch, sqlit
 
         msg = _FakeMessage(uid, on_reply_video=_fail_after_long_wait)
 
-        await U._process_download(msg, TEST_URL, "tiktok")
+        await U._process_download(msg, [(TEST_URL, "tiktok")])
 
         assert await _free_downloads_left(maker, uid) == 0
         assert msg.status_message is not None

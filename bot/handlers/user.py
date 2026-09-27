@@ -4,6 +4,7 @@ import asyncio
 import os
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
@@ -24,6 +25,7 @@ from aiogram.types import (
     InaccessibleMessage,
     InputMediaPhoto,
     InputMediaVideo,
+    LinkPreviewOptions,
     Message,
 )
 from loguru import logger
@@ -31,6 +33,7 @@ from loguru import logger
 from bot.config import settings
 from bot.db.engine import async_session
 from bot.db.free_quota import FreeQuota, free_quota_status, refund_free_download, reserve_free_download
+from bot.db.pending_downloads import add_pending, remove_pending
 from bot.db.queries import get_or_create_user, increment_total_downloads, log_download
 from bot.handlers.info import support_text
 from bot.handlers.payments import CANCEL_HINT, get_invoice_link
@@ -45,6 +48,7 @@ from bot.keyboards.inline import (
 )
 from bot.services.cleanup import remove_file
 from bot.services.disk_space import has_free_space
+from bot.services.download_queue import Admission, DownloadQueue, MAX_LINKS_PER_USER, QueueTicket
 from bot.services.downloader import ANIMATION_EXTS, DownloadResult, IMAGE_EXTS, download_media
 from bot.services.media_probe import MediaInfo, probe_media
 from bot.services.progress_texts import (
@@ -55,24 +59,25 @@ from bot.services.progress_texts import (
     limits_block,
     upload_status_text,
 )
+from bot.services.queue_texts import queue_status_text, refusal_text
 from bot.services.sending import ProbablyDeliveredError, SendVerdict, classify_send_failure, oversized_files
 from bot.services.status_board import StatusBoard
 from bot.services.upload_estimate import UploadRateTracker
 from bot.services.ytdlp_progress import DownloadStatus, FormatPlan
 from bot.utils.text import esc, format_wait
-from bot.utils.url_parser import parse_url
+from bot.utils.url_parser import parse_urls
 
 router = Router(name="user")
 download_semaphore = asyncio.Semaphore(3)
+# Очередь загрузок на пользователя (Д1 плана
+# `.superpowers/sdd/2026-09-27-queue/plan.md`): заменяет прежние
+# user_active_downloads/_try_take_user_slot — правило «одна загрузка на
+# пользователя» теперь выполняется само, потому что качается только голова
+# линии.
+download_queue = DownloadQueue()
 upload_rate = UploadRateTracker()
 # Меньше — отправка занимает секунды, полоска прогресса не успевает быть полезной.
 UPLOAD_PROGRESS_MIN_MB = 50
-
-# Один пользователь — одна загрузка одновременно. Общего семафора на три слота
-# мало: троттл в 3 с позволяет занять все три за девять секунд на всю длину
-# загрузки (до DOWNLOAD_TIMEOUT), и остальные висят на «Скачиваю медиа...».
-MAX_CONCURRENT_PER_USER = 1
-user_active_downloads: dict[int, int] = {}
 
 # Кто нажал «Скачать видео» и ещё не прислал ссылку. Раньше был set, который
 # рос до конца жизни процесса: ушедшего пользователя из него ничто не убирало.
@@ -145,7 +150,8 @@ def _help_text(quota: FreeQuota, has_subscription: bool) -> str:
     return (
         "📖 <b>Как пользоваться ботом:</b>\n\n"
         "1️⃣ Нажми <b>«Скачать видео»</b>\n"
-        "2️⃣ Отправь ссылку на видео\n"
+        f"2️⃣ Отправь ссылку на видео — можно сразу несколько, до {MAX_LINKS_PER_USER}: "
+        "скачаю по очереди\n"
         "3️⃣ Дождись файла — бот покажет, сколько осталось\n\n"
         "🌐 <b>Платформы:</b> Instagram, TikTok, Facebook, Pinterest, YouTube\n\n"
         f"{limits_block(settings.MAX_FILE_SIZE_MB)}\n\n"
@@ -198,20 +204,30 @@ def _classify(path_str: str) -> str:
     return "video"
 
 
-def _try_take_user_slot(user_id: int) -> bool:
-    """Занимает слот загрузки. False — у пользователя уже идёт загрузка."""
-    if user_active_downloads.get(user_id, 0) >= MAX_CONCURRENT_PER_USER:
-        return False
-    user_active_downloads[user_id] = user_active_downloads.get(user_id, 0) + 1
-    return True
+@dataclass(frozen=True)
+class _QuotaHold:
+    """Исход попытки занять квоту и место в журнале для одной ссылки
+    (Д3 плана `.superpowers/sdd/2026-09-27-queue/plan.md`)."""
+
+    db_user_id: int
+    is_banned: bool
+    reservation_id: int | None
+    pending_id: int | None
 
 
-def _release_user_slot(user_id: int) -> None:
-    left = user_active_downloads.get(user_id, 0) - 1
-    if left > 0:
-        user_active_downloads[user_id] = left
-    else:
-        user_active_downloads.pop(user_id, None)
+@dataclass
+class _DownloadJob:
+    """Одна ссылка, принятая в очередь: всё, что нужно, чтобы её докачать."""
+
+    message: Message
+    url: str
+    platform: str
+    ticket: QueueTicket
+    db_user_id: int
+    reservation_id: int | None
+    pending_id: int
+    status_msg: Message
+    board: StatusBoard
 
 
 def _mark_waiting(user_id: int) -> None:
@@ -443,6 +459,7 @@ async def _refund_quota(reservation_id: int) -> None:
 
 LOW_DISK_TEXT = "⚠️ Бот временно не может скачивать. Попробуй через несколько минут."
 TOO_LARGE_FOR_TELEGRAM_TEXT = "📦 Telegram не принял файл: он слишком большой."
+INTERNAL_ERROR_TEXT = "❌ <b>Не удалось скачать</b>\nПроизошла внутренняя ошибка. Попробуй ещё раз."
 PROBABLY_DELIVERED_TEXT = (
     "📤 <b>Файл большой — Telegram ещё обрабатывает его.</b>\n"
     "Скорее всего, он появится в этом чате в ближайшие минуты. "
@@ -632,7 +649,7 @@ async def cb_download(callback: CallbackQuery) -> None:
         "📥 <b>Скачивание видео</b>\n\n"
         "Отправь мне ссылку на видео из:\n"
         "📸 Instagram • 🎵 TikTok • 📘 Facebook • 📌 Pinterest • 📺 YouTube\n\n"
-        "⬇️ Жду ссылку...",
+        f"⬇️ Жду ссылку — можно сразу несколько, до {MAX_LINKS_PER_USER}.",
         reply_markup=get_back_to_menu_kb(is_admin=_is_admin(callback.from_user.id)),
     )
 
@@ -717,9 +734,9 @@ async def cb_help(callback: CallbackQuery) -> None:
 @router.message(F.text | F.caption)
 async def handle_url(message: Message) -> None:
     user_id = message.from_user.id
-    result = parse_url(_incoming_text(message))
+    links = parse_urls(_incoming_text(message))
 
-    if result is None and _is_waiting(user_id):
+    if not links and _is_waiting(user_id):
         await message.answer(
             "🔗 Это не похоже на ссылку. Отправь ссылку из Instagram, TikTok, "
             "Facebook, Pinterest или YouTube.",
@@ -727,7 +744,7 @@ async def handle_url(message: Message) -> None:
         )
         return
 
-    if result is None:
+    if not links:
         if message.text is None:
             # Медиа без ссылки в подписи — молчим, чтобы не отвечать меню на
             # каждое пересланное изображение.
@@ -738,78 +755,197 @@ async def handle_url(message: Message) -> None:
         )
         return
 
-    url, platform = result
     waiting_for_url.pop(user_id, None)
-
-    # Слот берём ДО резервирования квоты: отказ не должен стоить единицы.
-    if not _try_take_user_slot(user_id):
-        await message.reply(
-            "⏳ Я ещё качаю твою предыдущую ссылку. Дождись её и пришли следующую."
-        )
-        return
-    try:
-        await _process_download(message, url, platform)
-    finally:
-        _release_user_slot(user_id)
+    await _process_download(message, links)
 
 
-async def _process_download(message: Message, url: str, platform: str) -> None:
-    user_id = message.from_user.id
-
-    if not has_free_space(Path(settings.DOWNLOAD_ROOT), settings.MIN_FREE_DISK_GB):
-        # Раньше отвалившийся USB-диск ловился только на записи файла: Docker
-        # успевал создать каталог загрузок на eMMC (свободно 3.9 ГБ), и одна
-        # гигабайтная загрузка укладывала весь хост вместе с базой. Квоту не
-        # трогаем — до неё дело ещё не дошло.
-        logger.error(
-            "Недостаточно места на диске, загрузка отклонена | user={} path={}",
-            user_id, settings.DOWNLOAD_ROOT,
-        )
-        try:
-            await message.reply(LOW_DISK_TEXT)
-        except Exception as exc:
-            logger.info("Не удалось предупредить о нехватке места | user={} error={}", user_id, exc)
-        return
-
-    # C-1 шаг 1: одна короткая транзакция читает пользователя И резервирует
-    # бесплатное скачивание. Раньше остаток читался здесь, а списывался после аплоада.
+async def _reserve_for_queue(message: Message, url: str) -> _QuotaHold:
+    """Резервирует квоту и, если пользователю можно качать, пишет строку
+    журнала очереди — одной транзакцией (Д3, Д11 плана
+    `.superpowers/sdd/2026-09-27-queue/plan.md`)."""
     async with async_session() as session, session.begin():
         db_user_id, is_banned, has_subscription, reservation_id = await _reserve_quota(
             session, message.from_user
         )
+        pending_id = None
+        if not is_banned and (has_subscription or reservation_id is not None):
+            pending_id = await add_pending(
+                session,
+                user_id=db_user_id,
+                chat_id=message.chat.id,
+                url=url,
+                reservation_id=reservation_id,
+            )
+    return _QuotaHold(
+        db_user_id=db_user_id,
+        is_banned=is_banned,
+        reservation_id=reservation_id,
+        pending_id=pending_id,
+    )
 
-    if is_banned:
+
+async def _refuse_if_not_allowed(message: Message, hold: _QuotaHold) -> bool:
+    """Отвечает баном/пейволлом, если ссылку нельзя поставить в очередь.
+    True — если отказал (дальше по этой ссылке делать нечего)."""
+    if hold.is_banned:
         # Резервирования не было — возвращать нечего.
         await message.reply("🚫 Ваш аккаунт заблокирован. Обратитесь к администратору.")
-        return
-
-    if not has_subscription and reservation_id is None:
+        return True
+    if hold.pending_id is None:
         quota, _ = await _user_quota_state(message.from_user)
         await message.answer(
             _limit_reached_text(quota),
             reply_markup=get_paywall_kb(is_admin=_is_admin(message.from_user.id)),
         )
-        return
+        return True
+    return False
 
-    # Fix round 1, п.3 (окно 1/3): между резервированием и этим вызовом юзер
-    # мог заблокировать бота в ту же секунду — раньше единица терялась молча.
+
+async def _reply_status(message: Message, text: str) -> Message | None:
+    """Отправляет статус-сообщение ссылки. Сбой — best-effort: None вместо
+    необработанного исключения (Fix round 1, окно 1/3: сетевой сбой или бан
+    между резервированием и этим вызовом не должны ронять хендлер)."""
     try:
-        status_msg = await message.reply(PREPARING_TEXT)
-    except Exception as e:
-        # Fix round 2, N1: было (TelegramBadRequest, TelegramForbiddenError)
-        # — узкий except пропускал TelegramNetworkError/TelegramRetryAfter
-        # (сетевой сбой или 429 не менее вероятны тут, чем блокировка бота),
-        # и они улетали из хендлера необработанными, унося единицу с собой.
-        # Возврат и return корректны для ЛЮБОГО исключения на этом шаге —
-        # дальше по коду ничего не сделано и делать нечего.
+        return await message.reply(text)
+    except Exception as exc:
         logger.info(
-            "Не удалось отправить статус-сообщение | user={} error={}", user_id, e
+            "Не удалось отправить статус-сообщение | user={} error={}", message.from_user.id, exc
         )
-        if _quota_action(reservation_id is not None, download_ok=False, media_sent_count=0) == "refund":
+        return None
+
+
+async def _forget_pending(pending_id: int) -> None:
+    """Убирает строку журнала очереди. Падение не должно ронять хендлер."""
+    try:
+        async with async_session() as session, session.begin():
+            await remove_pending(session, pending_id)
+    except Exception as exc:
+        logger.error(
+            "Не удалось убрать строку журнала очереди | pending_id={} error={}", pending_id, exc
+        )
+
+
+async def _cancel_admission(hold: _QuotaHold, ticket: QueueTicket) -> None:
+    """Откатывает бронь, строку журнала и место в очереди при отказе на
+    шаге постановки (не ушёл статус ссылки)."""
+    if hold.reservation_id is not None:
+        await _refund_quota(hold.reservation_id)
+    if hold.pending_id is not None:
+        await _forget_pending(hold.pending_id)
+    download_queue.withdraw(ticket)
+
+
+async def _admit_job(
+    message: Message, url: str, platform: str, ticket: QueueTicket
+) -> _DownloadJob | None:
+    """Резервирует квоту и место в журнале, шлёт статус ссылки. None — если
+    ссылку пришлось отклонить (бан, пейволл или статус не ушёл)."""
+    hold = await _reserve_for_queue(message, url)
+
+    if await _refuse_if_not_allowed(message, hold):
+        download_queue.withdraw(ticket)
+        return None
+
+    text = queue_status_text(download_queue.waiting_ahead(ticket))
+    status_msg = await _reply_status(message, text)
+    if status_msg is None:
+        await _cancel_admission(hold, ticket)
+        return None
+
+    board = StatusBoard(status_msg, initial_text=text)
+    if download_queue.waiting_ahead(ticket) > 0:
+        await board.start_ticking(lambda: queue_status_text(download_queue.waiting_ahead(ticket)))
+
+    return _DownloadJob(
+        message=message,
+        url=url,
+        platform=platform,
+        ticket=ticket,
+        db_user_id=hold.db_user_id,
+        reservation_id=hold.reservation_id,
+        pending_id=hold.pending_id,
+        status_msg=status_msg,
+        board=board,
+    )
+
+
+async def _reply_refusals(message: Message, refused: list[tuple[str, Admission]]) -> None:
+    """Одно сообщение на все отказы одного входящего сообщения (Д7 плана)."""
+    if not refused:
+        return
+    try:
+        await message.reply(
+            refusal_text(refused, MAX_LINKS_PER_USER),
+            link_preview_options=LinkPreviewOptions(is_disabled=True),
+        )
+    except Exception as exc:
+        logger.info(
+            "Не удалось отправить отказ по очереди | user={} error={}", message.from_user.id, exc
+        )
+
+
+async def _enqueue_links(message: Message, links: list[tuple[str, str]]) -> list[_DownloadJob]:
+    """Ставит ссылки сообщения в очередь по порядку, копит отказы для
+    одного итогового сообщения (Д7 плана)."""
+    jobs: list[_DownloadJob] = []
+    refused: list[tuple[str, Admission]] = []
+
+    for url, platform in links:
+        admission, ticket = download_queue.admit(message.from_user.id, url)
+        if admission is not Admission.ACCEPTED:
+            refused.append((url, admission))
+            continue
+
+        try:
+            job = await _admit_job(message, url, platform, ticket)
+        except Exception:
+            logger.exception(
+                "Не удалось поставить ссылку в очередь | user={} url={}",
+                message.from_user.id, _url_for_log(url),
+            )
+            download_queue.withdraw(ticket)
+            break
+        if job is None:
+            # Бан, пейволл или не ушёл статус — остальные ссылки сообщения
+            # не разбираем (Д3 плана: пейволл сам объясняет причину).
+            break
+        jobs.append(job)
+
+    await _reply_refusals(message, refused)
+    return jobs
+
+
+async def _wait_turn(job: _DownloadJob) -> None:
+    """Ждёт, пока ссылка станет головой линии, и переключает статус на
+    «Готовлю загрузку…» (initial_text доски отсечёт лишнюю правку, если
+    ссылка и так уже была головой — M-7)."""
+    await download_queue.wait_turn(job.ticket)
+    await job.board.stop_ticking()
+    await job.board.show(PREPARING_TEXT)
+
+
+async def _execute_download(job: _DownloadJob) -> None:
+    message = job.message
+    url = job.url
+    platform = job.platform
+    db_user_id = job.db_user_id
+    reservation_id = job.reservation_id
+    status_msg = job.status_msg
+    board = job.board
+    user_id = message.from_user.id
+
+    # Д4 плана: свободное место проверяется в момент старта загрузки, а не
+    # при постановке — ссылка может ждать в очереди десятки минут, а
+    # защищаемся мы именно от записи на отвалившийся диск.
+    if not has_free_space(Path(settings.DOWNLOAD_ROOT), settings.MIN_FREE_DISK_GB):
+        logger.error(
+            "Недостаточно места на диске, загрузка отклонена | user={} path={}",
+            user_id, settings.DOWNLOAD_ROOT,
+        )
+        await board.show(LOW_DISK_TEXT)
+        if reservation_id is not None:
             await _refund_quota(reservation_id)
         return
-
-    board = StatusBoard(status_msg)
 
     # Fix round 1, п.3 (окно 2/3): download_media НЕ гарантирует возврат
     # DownloadResult при любом исходе — до её собственного try (downloader.py)
@@ -840,9 +976,7 @@ async def _process_download(message: Message, url: str, platform: str) -> None:
                 "Не удалось записать лог загрузки | user={} error={}", db_user_id, log_exc
             )
         try:
-            await status_msg.edit_text(
-                "❌ <b>Не удалось скачать</b>\nПроизошла внутренняя ошибка. Попробуй ещё раз."
-            )
+            await status_msg.edit_text(INTERNAL_ERROR_TEXT)
         except (TelegramBadRequest, TelegramForbiddenError):
             pass
         return
@@ -1066,15 +1200,20 @@ async def _process_download(message: Message, url: str, platform: str) -> None:
             await status_msg.delete()
         except (TelegramBadRequest, TelegramForbiddenError):
             pass
-        # Best-effort: медиа доставлено, успех зафиксирован, status_msg удалён.
-        # Сбой этого финального ответа не должен ничего переписывать.
-        try:
-            await message.answer(
-                "✅ Готово! Что дальше?",
-                reply_markup=get_after_download_kb(is_admin=_is_admin(message.from_user.id)),
-            )
-        except Exception:
-            pass
+        # Д10 плана: «Готово» — только после последней ссылки в очереди
+        # пользователя, иначе меню перемешивается с видео. Билет этой ссылки
+        # ещё не снят (снимет `_run_job` в finally) — line_length == 1
+        # значит других ссылок пользователя в линии не осталось.
+        if download_queue.line_length(user_id) == 1:
+            # Best-effort: медиа доставлено, успех зафиксирован, status_msg
+            # удалён. Сбой этого финального ответа не должен ничего переписывать.
+            try:
+                await message.answer(
+                    "✅ Готово! Что дальше?",
+                    reply_markup=get_after_download_kb(is_admin=_is_admin(user_id)),
+                )
+            except Exception:
+                pass
         return
 
     # Fix round 1, п.3: тот же порядок, что и в ветке выше — возврат единицы
@@ -1115,3 +1254,50 @@ async def _process_download(message: Message, url: str, platform: str) -> None:
             await status_msg.edit_text("⚠️ Ошибка при отправке файла. Попробуй ещё раз.")
     except (TelegramBadRequest, TelegramForbiddenError):
         pass
+
+
+async def _run_job(job: _DownloadJob) -> None:
+    """Ждёт очереди, качает ссылку и аккуратно убирает за собой билет и
+    строку журнала.
+
+    При остановке бота строка журнала остаётся — после старта её подберёт
+    `notify_interrupted_downloads` (Д11 плана
+    `.superpowers/sdd/2026-09-27-queue/plan.md`).
+    """
+    cancelled = False
+    try:
+        await _wait_turn(job)
+        await _execute_download(job)
+    except asyncio.CancelledError:
+        cancelled = True
+        raise
+    except Exception:
+        logger.exception(
+            "Неожиданная ошибка при обработке ссылки очереди | user={} url={}",
+            job.message.from_user.id, _url_for_log(job.url),
+        )
+        await job.board.stop_ticking()
+        await _show_status(job.status_msg, INTERNAL_ERROR_TEXT)
+    finally:
+        await job.board.stop_ticking()
+        download_queue.withdraw(job.ticket)
+        if not cancelled:
+            await _forget_pending(job.pending_id)
+
+
+async def _abandon_jobs(jobs: list[_DownloadJob]) -> None:
+    """Снимает билеты ещё не начатых заданий при отмене хендлера. Строки
+    журнала не трогает — после рестарта их подберёт `notify_interrupted_downloads`."""
+    for job in jobs:
+        await job.board.stop_ticking()
+        download_queue.withdraw(job.ticket)
+
+
+async def _process_download(message: Message, links: list[tuple[str, str]]) -> None:
+    jobs = await _enqueue_links(message, links)
+    for index, job in enumerate(jobs):
+        try:
+            await _run_job(job)
+        except asyncio.CancelledError:
+            await _abandon_jobs(jobs[index + 1:])
+            raise

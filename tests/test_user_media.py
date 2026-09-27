@@ -3,16 +3,12 @@ from types import SimpleNamespace
 from aiogram.types import InputMediaPhoto
 
 from bot.handlers.user import (
-    MAX_CONCURRENT_PER_USER,
     WAITING_TTL,
     _classify,
     _is_waiting,
     _mark_waiting,
     _media_caption,
     _process_download,
-    _release_user_slot,
-    _try_take_user_slot,
-    user_active_downloads,
     waiting_for_url,
 )
 from bot.services.downloader import DownloadResult
@@ -36,38 +32,6 @@ def test_everything_else_is_video():
     assert _classify("/tmp/jw_downloads/a.mp4") == "video"
     assert _classify("/tmp/jw_downloads/a.mkv") == "video"
     assert _classify("/tmp/jw_downloads/noextension") == "video"
-
-
-# ── per-user лимит слотов ──
-
-
-def test_second_parallel_download_of_same_user_is_refused():
-    uid = 990001
-    try:
-        assert MAX_CONCURRENT_PER_USER == 1
-        assert _try_take_user_slot(uid) is True
-        assert _try_take_user_slot(uid) is False
-        _release_user_slot(uid)
-        assert _try_take_user_slot(uid) is True
-    finally:
-        user_active_downloads.pop(uid, None)
-
-
-def test_other_users_are_not_blocked():
-    a, b = 990002, 990003
-    try:
-        assert _try_take_user_slot(a) is True
-        assert _try_take_user_slot(b) is True
-    finally:
-        user_active_downloads.pop(a, None)
-        user_active_downloads.pop(b, None)
-
-
-def test_released_slot_leaves_no_garbage():
-    uid = 990004
-    _try_take_user_slot(uid)
-    _release_user_slot(uid)
-    assert uid not in user_active_downloads
 
 
 # ── гигиена множества ожидающих ссылку ──
@@ -124,6 +88,7 @@ class _FakeMediaMessage:
 
     def __init__(self, uid: int) -> None:
         self.from_user = SimpleNamespace(id=uid, username="tester", full_name="Test User")
+        self.chat = SimpleNamespace(id=uid)
         self.reply_calls: list[str] = []
         self.answer_calls: list[tuple[str, object]] = []
         self.animation_calls: list[tuple[str, str | None]] = []
@@ -191,7 +156,7 @@ async def test_carousel_sends_gif_standalone_and_captions_once(
         monkeypatch.setattr("bot.handlers.user.download_media", _ok)
 
         msg = _FakeMediaMessage(uid)
-        await _process_download(msg, TEST_URL, "tiktok")
+        await _process_download(msg, [(TEST_URL, "tiktok")])
 
         assert len(msg.animation_calls) == 1
         assert msg.animation_calls[0][0] == "/tmp/does-not-exist-a.gif"
@@ -231,7 +196,7 @@ async def test_single_animation_uses_reply_animation_with_caption(
         monkeypatch.setattr("bot.handlers.user.download_media", _ok)
 
         msg = _FakeMediaMessage(uid)
-        await _process_download(msg, TEST_URL, "pinterest")
+        await _process_download(msg, [(TEST_URL, "pinterest")])
 
         assert msg.animation_calls == [
             ("/tmp/does-not-exist-single.gif", _media_caption("pinterest", "animation"))
@@ -261,7 +226,7 @@ async def test_carousel_all_gifs_skips_media_group(
         monkeypatch.setattr("bot.handlers.user.download_media", _ok)
 
         msg = _FakeMediaMessage(uid)
-        await _process_download(msg, TEST_URL, "pinterest")
+        await _process_download(msg, [(TEST_URL, "pinterest")])
 
         assert msg.media_group_calls == []
         assert len(msg.animation_calls) == 2

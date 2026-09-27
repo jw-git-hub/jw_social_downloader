@@ -10,7 +10,20 @@ network_mode: host, поэтому "127.0.0.1" изнутри него — эт�
 
 import pytest
 
-from bot.utils.url_parser import parse_url, parse_urls
+from bot.utils.url_parser import parse_urls
+
+
+def parse_url(text: str) -> tuple[str, str] | None:
+    """Локальный хелпер для старых тестов этого файла (Задача 2 очереди,
+    `parse_url` удалена из модуля вместе со снятием слота на пользователя).
+
+    Возвращает первый элемент `parse_urls(text)` или `None` — прежние
+    тесты безопасности здесь проверяют разбор ОДНОГО кандидата, и это
+    поведение `_parse_candidate` не поменялось ни на йоту, поменялся лишь
+    публичный вход к нему.
+    """
+    matches = parse_urls(text)
+    return matches[0] if matches else None
 
 
 # ── Позитив: по одной ссылке на каждую поддерживаемую платформу ──────────

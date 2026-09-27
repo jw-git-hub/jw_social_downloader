@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import bot.handlers.user as U
 import pytest
@@ -89,6 +90,7 @@ class _FakeMessage:
         self.text = text
         self.caption = caption
         self.from_user = _FakeUser(uid)
+        self.chat = SimpleNamespace(id=uid)
         self.reply_calls: list[str] = []
         self.answer_calls: list[tuple[str, object]] = []
         self.reply_raises = reply_raises
