@@ -333,6 +333,76 @@ async def test_free_user_with_one_left_gets_one_status_and_one_paywall(
         await engine.dispose()
 
 
+# ── 4b. Пачка сообщений с исчерпанной квотой шлёт один пейволл ──
+
+
+async def test_paywall_is_sent_once_for_a_burst_of_messages(
+    monkeypatch, sqlite_engine_factory, tmp_path
+):
+    maker, engine = await _make_session_maker(sqlite_engine_factory, tmp_path, "burst_paywall.db")
+    try:
+        uid = 994013
+        await _seed_user(maker, id=uid, free_left=1)
+        monkeypatch.setattr(U, "async_session", maker)
+        _install_queue(monkeypatch)
+        downloader = _FakeDownloader()
+        monkeypatch.setattr(U, "download_media", downloader)
+        clock = {"now": 1000.0}
+        monkeypatch.setattr(U, "time", SimpleNamespace(monotonic=lambda: clock["now"]))
+        U.last_paywall_at.clear()
+
+        urls = [f"https://youtu.be/burst{i}" for i in range(5)]
+        messages: list[_FakeMessage] = []
+        for url in urls:
+            downloader.gate_for(url).set()
+            msg = _FakeMessage(uid, url)
+            messages.append(msg)
+            await U.handle_url(msg)
+
+        # Первое сообщение забирает последнюю бесплатную загрузку и качается;
+        # остальные четыре бьются об исчерпанную квоту, но пейволл — только
+        # один на всю пачку (регрессия: раньше был на каждое сообщение).
+        paywall_replies = [
+            text for msg in messages for text, _ in msg.answer_calls if "закончились" in text
+        ]
+        assert len(paywall_replies) == 1
+        assert downloader.calls == [urls[0]]
+        assert await _free_downloads_left(maker, uid) == 0
+    finally:
+        await engine.dispose()
+
+
+async def test_paywall_repeats_after_the_window(monkeypatch, sqlite_engine_factory, tmp_path):
+    maker, engine = await _make_session_maker(sqlite_engine_factory, tmp_path, "paywall_window.db")
+    try:
+        uid = 994014
+        await _seed_user(maker, id=uid, free_left=1)
+        monkeypatch.setattr(U, "async_session", maker)
+        _install_queue(monkeypatch)
+        downloader = _FakeDownloader()
+        monkeypatch.setattr(U, "download_media", downloader)
+        clock = {"now": 1000.0}
+        monkeypatch.setattr(U, "time", SimpleNamespace(monotonic=lambda: clock["now"]))
+        U.last_paywall_at.clear()
+
+        first_url = "https://youtu.be/window0"
+        downloader.gate_for(first_url).set()
+        await U.handle_url(_FakeMessage(uid, first_url))  # тратит последнюю бесплатную загрузку
+
+        second_msg = _FakeMessage(uid, "https://youtu.be/window1")
+        await U.handle_url(second_msg)
+        first_paywalls = [t for t, _ in second_msg.answer_calls if "закончились" in t]
+        assert len(first_paywalls) == 1
+
+        clock["now"] += U.PAYWALL_REPEAT_WINDOW + 1
+        third_msg = _FakeMessage(uid, "https://youtu.be/window2")
+        await U.handle_url(third_msg)
+        second_paywalls = [t for t, _ in third_msg.answer_calls if "закончились" in t]
+        assert len(second_paywalls) == 1
+    finally:
+        await engine.dispose()
+
+
 # ── 5. Подписчик присылает 7 ссылок ──
 
 

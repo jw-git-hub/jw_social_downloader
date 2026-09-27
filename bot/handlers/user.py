@@ -84,6 +84,13 @@ UPLOAD_PROGRESS_MIN_MB = 50
 WAITING_TTL = 3600.0
 waiting_for_url: dict[int, float] = {}
 
+# Раньше троттлинг молчал одно сообщение из пачки, и это скрывало регрессию:
+# каждое входящее сообщение с исчерпанной квотой шлёт пейволл заново. Пачка
+# из нескольких пересланных ссылок (одно сообщение — одна ссылка) получала
+# пейволл на каждое. Окно ниже глушит повтор одному и тому же пользователю.
+PAYWALL_REPEAT_WINDOW = 10.0
+last_paywall_at: dict[int, float] = {}
+
 MEDIA_GROUP_CHUNK_SIZE = 5  # Telegram допускает до 10, но большие чанки (~10 МБ) вызывают таймауты
 SEND_RETRY_DELAYS = (2, 5, 10)  # экспоненциальный backoff между повторными попытками отправки
 
@@ -247,6 +254,22 @@ def _is_waiting(user_id: int) -> bool:
     if (time.monotonic() - ts) > WAITING_TTL:
         del waiting_for_url[user_id]
         return False
+    return True
+
+
+def _should_send_paywall(user_id: int) -> bool:
+    """True — пейволл этому пользователю не показывали последние
+    PAYWALL_REPEAT_WINDOW секунд; заодно отмечает показ и вытесняет
+    протухшие записи (тот же приём, что в `_mark_waiting`). Одна запись на
+    пользователя — этого достаточно, чтобы словарь не рос бесконечно."""
+    now = time.monotonic()
+    last = last_paywall_at.get(user_id)
+    if last is not None and (now - last) <= PAYWALL_REPEAT_WINDOW:
+        return False
+    last_paywall_at[user_id] = now
+    stale = [uid for uid, ts in last_paywall_at.items() if (now - ts) > PAYWALL_REPEAT_WINDOW]
+    for uid in stale:
+        del last_paywall_at[uid]
     return True
 
 
@@ -792,11 +815,12 @@ async def _refuse_if_not_allowed(message: Message, hold: _QuotaHold) -> bool:
         await message.reply("🚫 Ваш аккаунт заблокирован. Обратитесь к администратору.")
         return True
     if hold.pending_id is None:
-        quota, _ = await _user_quota_state(message.from_user)
-        await message.answer(
-            _limit_reached_text(quota),
-            reply_markup=get_paywall_kb(is_admin=_is_admin(message.from_user.id)),
-        )
+        if _should_send_paywall(message.from_user.id):
+            quota, _ = await _user_quota_state(message.from_user)
+            await message.answer(
+                _limit_reached_text(quota),
+                reply_markup=get_paywall_kb(is_admin=_is_admin(message.from_user.id)),
+            )
         return True
     return False
 
