@@ -26,10 +26,10 @@ BACKLOG_BATCH = 100
 MESSAGE_BURST = 2 * MAX_LINKS_PER_USER
 
 PUBLIC_COMMANDS = [
-    BotCommand(command="start", description="🏠 Главное меню"),
-    BotCommand(command="terms", description="📄 Условия использования"),
-    BotCommand(command="support", description="✉️ Поддержка"),
-    BotCommand(command="paysupport", description="💳 Вопросы по оплате"),
+    BotCommand(command="start", description="Начать"),
+    BotCommand(command="terms", description="Условия использования"),
+    BotCommand(command="support", description="Поддержка"),
+    BotCommand(command="paysupport", description="Вопросы по оплате"),
 ]
 
 
@@ -177,7 +177,7 @@ async def main() -> None:
     from aiogram.types import BotCommandScopeChat
     try:
         await bot.set_my_commands(
-            [*PUBLIC_COMMANDS, BotCommand(command="admin", description="⚙️  Админ-панель")],
+            [*PUBLIC_COMMANDS, BotCommand(command="admin", description="Админ-панель")],
             scope=BotCommandScopeChat(chat_id=settings.ADMIN_ID),
         )
     except Exception:

@@ -64,7 +64,7 @@ from bot.services.sending import ProbablyDeliveredError, SendVerdict, classify_s
 from bot.services.status_board import StatusBoard
 from bot.services.upload_estimate import UploadRateTracker
 from bot.services.ytdlp_progress import DownloadStatus, FormatPlan
-from bot.utils.text import esc, format_wait
+from bot.utils.text import LINE_MARKER, esc, format_wait
 from bot.utils.url_parser import parse_urls
 
 router = Router(name="user")
@@ -100,6 +100,11 @@ SEND_RETRY_DELAYS = (2, 5, 10)  # экспоненциальный backoff ме�
 # чтобы длинная немая запись не превратилась в автоплей-луп без управления.
 SILENT_VIDEO_AS_ANIMATION_MAX_SEC = 60.0
 
+# Перечень платформ для приветствия, помощи и подсказок — раньше был
+# скопирован в четырёх местах и мог разъехаться.
+PLATFORM_LIST_TEXT = "Instagram, TikTok, Facebook, Pinterest или YouTube"
+
+
 def _active_subscription_until(user) -> datetime | None:
     """Конец подписки в UTC, если она ещё действует; иначе None.
 
@@ -128,39 +133,29 @@ def _free_left_text(quota: FreeQuota) -> str:
 def _quota_line(quota: FreeQuota, has_subscription: bool) -> str:
     """Одна строка о правах пользователя для приветствия и помощи."""
     if has_subscription:
-        return "👑 Подписка активна — скачивай без ограничений."
+        return "Подписка активна — скачивайте без ограничений."
     if quota.left > 0:
-        return f"🎁 Бесплатно: {_free_left_text(quota)}."
+        return f"Бесплатно: {_free_left_text(quota)}."
     return (
-        "⏳ Бесплатные на сутки закончились. "
+        "Бесплатные скачивания на сутки закончились. "
         f"Следующее — через <b>{_wait_text(quota)}</b>. С подпиской — без ограничений."
     )
 
 
 def _welcome_text(quota: FreeQuota, has_subscription: bool) -> str:
     return (
-        "👋 <b>Добро пожаловать!</b>\n\n"
-        "Я — бот для скачивания видео из соцсетей.\n\n"
-        "🌐 <b>Поддерживаемые платформы:</b>\n"
-        "├ 📸 Instagram\n"
-        "├ 🎵 TikTok\n"
-        "├ 📘 Facebook\n"
-        "├ 📌 Pinterest\n"
-        "└ 📺 YouTube\n\n"
+        f"Пришлите ссылку на видео или фото из {PLATFORM_LIST_TEXT} — отправлю сюда файл. "
+        f"Можно сразу несколько ссылок, до {MAX_LINKS_PER_USER}: скачаю по очереди.\n\n"
         f"{limit_line(settings.MAX_FILE_SIZE_MB)}\n\n"
-        f"{_quota_line(quota, has_subscription)}\n\n"
-        "Выбери действие 👇"
+        f"{_quota_line(quota, has_subscription)}"
     )
 
 
 def _help_text(quota: FreeQuota, has_subscription: bool) -> str:
     return (
-        "📖 <b>Как пользоваться ботом:</b>\n\n"
-        "1️⃣ Нажми <b>«Скачать видео»</b>\n"
-        f"2️⃣ Отправь ссылку на видео — можно сразу несколько, до {MAX_LINKS_PER_USER}: "
-        "скачаю по очереди\n"
-        "3️⃣ Дождись файла — бот покажет, сколько осталось\n\n"
-        "🌐 <b>Платформы:</b> Instagram, TikTok, Facebook, Pinterest, YouTube\n\n"
+        "<b>Как скачать</b>\n"
+        f"{LINE_MARKER}пришлите ссылку из {PLATFORM_LIST_TEXT} — нажимать «Скачать видео» не обязательно\n"
+        f"{LINE_MARKER}можно сразу несколько ссылок, до {MAX_LINKS_PER_USER}: скачаю по очереди\n\n"
         f"{limits_block(settings.MAX_FILE_SIZE_MB)}\n\n"
         f"{_quota_line(quota, has_subscription)}"
     )
@@ -663,16 +658,20 @@ async def cb_main_menu(callback: CallbackQuery) -> None:
     )
 
 
+def _download_prompt_text() -> str:
+    return (
+        f"Пришлите ссылку на видео или фото из {PLATFORM_LIST_TEXT}. "
+        f"Можно сразу несколько, до {MAX_LINKS_PER_USER}."
+    )
+
+
 @router.callback_query(F.data == "menu:download")
 async def cb_download(callback: CallbackQuery) -> None:
     await callback.answer()
     _mark_waiting(callback.from_user.id)
     await _safe_edit(
         callback,
-        "📥 <b>Скачивание видео</b>\n\n"
-        "Отправь мне ссылку на видео из:\n"
-        "📸 Instagram • 🎵 TikTok • 📘 Facebook • 📌 Pinterest • 📺 YouTube\n\n"
-        f"⬇️ Жду ссылку — можно сразу несколько, до {MAX_LINKS_PER_USER}.",
+        _download_prompt_text(),
         reply_markup=get_back_to_menu_kb(is_admin=_is_admin(callback.from_user.id)),
     )
 
@@ -754,6 +753,10 @@ async def cb_help(callback: CallbackQuery) -> None:
     )
 
 
+NOT_A_LINK_TEXT = f"Это не похоже на ссылку. Пришлите ссылку на видео или фото из {PLATFORM_LIST_TEXT}."
+MENU_PROMPT_TEXT = "Пришлите ссылку на видео или фото — или выберите действие ниже."
+
+
 @router.message(F.text | F.caption)
 async def handle_url(message: Message) -> None:
     user_id = message.from_user.id
@@ -761,8 +764,7 @@ async def handle_url(message: Message) -> None:
 
     if not links and _is_waiting(user_id):
         await message.answer(
-            "🔗 Это не похоже на ссылку. Отправь ссылку из Instagram, TikTok, "
-            "Facebook, Pinterest или YouTube.",
+            NOT_A_LINK_TEXT,
             reply_markup=get_back_to_menu_kb(is_admin=_is_admin(user_id)),
         )
         return
@@ -773,7 +775,7 @@ async def handle_url(message: Message) -> None:
             # каждое пересланное изображение.
             return
         await message.answer(
-            "Выбери действие 👇",
+            MENU_PROMPT_TEXT,
             reply_markup=get_main_menu_kb(is_admin=_is_admin(user_id)),
         )
         return

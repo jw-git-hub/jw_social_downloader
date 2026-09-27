@@ -12,10 +12,8 @@ def get_main_menu_kb(is_admin: bool = False) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📥 Скачать видео", callback_data="menu:download")],
         [InlineKeyboardButton(text="📊 Мой статус", callback_data="menu:status")],
         [InlineKeyboardButton(text="👑 Подписка", callback_data="menu:subscribe")],
-        [
-            InlineKeyboardButton(text="📖 Помощь", callback_data="menu:help"),
-            InlineKeyboardButton(text="✉️  Поддержка", callback_data="menu:support"),
-        ],
+        [InlineKeyboardButton(text="📖 Помощь", callback_data="menu:help")],
+        [InlineKeyboardButton(text="💬 Поддержка", callback_data="menu:support")],
     ]
     rows.extend(_maybe_admin_row(is_admin))
     return InlineKeyboardMarkup(inline_keyboard=rows)

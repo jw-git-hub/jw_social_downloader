@@ -28,8 +28,8 @@ HOURLY_PLAN = FormatPlan(chosen_height=1080, chosen_mb=888.8, best_height=2160, 
 def test_format_size_examples():
     assert format_size(904.1) == "904 МБ"
     assert format_size(888.8) == "889 МБ"
-    assert format_size(1500) == "1.5 ГБ"
-    assert format_size(5234) == "5.1 ГБ"
+    assert format_size(1500) == "1,5 ГБ"
+    assert format_size(5234) == "5,1 ГБ"
     assert format_size(50) == "50 МБ"
     assert format_size(0.3) == "1 МБ"
 
@@ -60,8 +60,8 @@ def test_format_eta_examples():
 
 def test_downgrade_note_shown_when_best_exceeds_limit():
     note = downgrade_note(HOURLY_PLAN, limit_mb=1500)
-    assert "В 4K ролик весит от 5.1 ГБ" in note
-    assert "до 1.5 ГБ" in note
+    assert "В 4K ролик весит от 5,1 ГБ" in note
+    assert "до 1,5 ГБ" in note
     assert note.endswith("— 1080p.")
 
 
@@ -126,8 +126,8 @@ def test_download_status_text_downgrade_shows_note():
     text = download_status_text(status, limit_mb=1500)
     assert "1080p" in text
     assert "889 МБ" in text
-    assert "В 4K ролик весит от 5.1 ГБ" in text
-    assert "до 1.5 ГБ" in text
+    assert "В 4K ролик весит от 5,1 ГБ" in text
+    assert "до 1,5 ГБ" in text
     assert "— 1080p." in text
 
 
@@ -200,7 +200,7 @@ def test_upload_status_text_carries_downgrade_note():
 
 
 def test_limit_line_shows_gib_for_large_limit():
-    assert "1.5 ГБ" in limit_line(1500)
+    assert "1,5 ГБ" in limit_line(1500)
 
 
 def test_limit_line_shows_mb_for_cloud_limit():

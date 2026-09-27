@@ -12,9 +12,11 @@ from __future__ import annotations
 import math
 
 from bot.services.ytdlp_progress import DownloadPhase, DownloadStatus, FormatPlan
+from bot.utils.text import LINE_MARKER
 
 GIB_DISPLAY_FROM_MB = 1000  # от этого порога размер показываем в ГиБ, а не в МиБ
 MIB_PER_GIB = 1024
+DECIMAL_SEPARATOR = ","  # десятичная запятая — стиль экосистемы (правило С6)
 BAR_CELLS = 10
 BAR_FILLED = "▰"
 BAR_EMPTY = "▱"
@@ -39,10 +41,11 @@ QUEUED_TEXT = (
 
 
 def format_size(mb: float) -> str:
-    """904.1 → «904 МБ», 1500 → «1.5 ГБ» (см. брифа: от 1000 МиБ — в ГБ)."""
+    """904.1 → «904 МБ», 1500 → «1,5 ГБ» (от 1000 МиБ — в ГБ, запятая — десятичный разделитель)."""
     if mb < GIB_DISPLAY_FROM_MB:
         return f"{max(1, round(mb))} МБ"
-    return f"{mb / MIB_PER_GIB:.1f} ГБ"
+    gib_value = f"{mb / MIB_PER_GIB:.1f}".replace(".", DECIMAL_SEPARATOR)
+    return f"{gib_value} ГБ"
 
 
 def quality_short(height: int) -> str:
@@ -173,7 +176,7 @@ def upload_status_text(
 def limit_line(limit_mb: int) -> str:
     """Строка приветствия про лимит Telegram-бота."""
     return (
-        f"📦 Присылаю в лучшем качестве, которое помещается в <b>{format_size(limit_mb)}</b> "
+        f"Видео присылаю в лучшем качестве, которое помещается в <b>{format_size(limit_mb)}</b>, "
         "— больше Telegram-бот отправить не может."
     )
 
@@ -182,9 +185,9 @@ def limits_block(limit_mb: int) -> str:
     """Блок «Ограничения» для помощи."""
     limit_text = format_size(limit_mb)
     return (
-        "📦 <b>Ограничения</b>\n"
-        f"├ Размер файла — до <b>{limit_text}</b>: больше Telegram-бот отправить не может.\n"
-        "├ Видео приходит в лучшем качестве, которое помещается в этот размер. Длинный ролик "
-        "может прийти не в 4K, а, например, в 1080p — бот заранее напишет, в каком.\n"
-        "└ Большой файл качается и отправляется несколько минут — бот показывает, сколько осталось."
+        "<b>Ограничения</b>\n"
+        f"{LINE_MARKER}файл — до <b>{limit_text}</b>: больше Telegram-бот отправить не может\n"
+        f"{LINE_MARKER}видео приходит в лучшем качестве, которое помещается в этот размер: "
+        "длинный ролик может прийти не в 4K, а, например, в 1080p — заранее напишу, в каком\n"
+        f"{LINE_MARKER}большой файл качается и отправляется несколько минут — покажу, сколько осталось"
     )
