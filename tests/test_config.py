@@ -61,6 +61,20 @@ def test_unknown_dotenv_keys_do_not_break_settings(tmp_path, monkeypatch):
     assert loaded.BOT_TOKEN == "123:ABC"
 
 
+def test_settings_ignore_dotenv_file_in_working_directory(tmp_path, monkeypatch):
+    # Регрессия: прогон тестов с примонтированным репозиторием подхватывал
+    # боевой .env из каталога запуска и переводил облачные тесты на локальный
+    # транспорт. Источник dotenv отключает conftest.py; явный _env_file (тест
+    # выше) при этом продолжает работать.
+    (tmp_path / ".env").write_text("USE_LOCAL_BOT_API=true\n")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("USE_LOCAL_BOT_API", raising=False)
+
+    from bot.config import Settings
+
+    assert Settings().USE_LOCAL_BOT_API is False
+
+
 def test_download_root_default_matches_the_shared_mount_path():
     # Этот путь обязан совпадать с bind-монтированием контейнера
     # telegram-bot-api, иначе отдача по file:// не разрешится на его стороне.

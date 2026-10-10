@@ -9,6 +9,29 @@ os.environ.setdefault("DOWNLOAD_ROOT", "/tmp/jw_test_downloads")
 import pytest
 
 
+def _detach_settings_from_dotenv_file():
+    """Тесты не должны читать `.env` из рабочего каталога.
+
+    `Settings` подключает источник dotenv по относительному пути, то есть из
+    каталога запуска. В собранном образе файла нет (`.dockerignore`), но при
+    прогоне с примонтированным репозиторием он на месте — и боевой
+    `USE_LOCAL_BOT_API=true` молча переключал тесты облачного режима на
+    локальный транспорт. `monkeypatch.delenv` от этого не спасает: он снимает
+    переменную окружения, а значение приходит из файла.
+
+    Синглтон `settings` пересобирается здесь же: он создан на импорте
+    `bot.config`, уже с содержимым файла. Делается до импорта остальных
+    модулей `bot.*`, пока никто не успел взять на него ссылку.
+    """
+    from bot import config
+
+    config.Settings.model_config["env_file"] = None
+    config.settings = config.Settings()
+
+
+_detach_settings_from_dotenv_file()
+
+
 @pytest.fixture
 def anyio_backend():
     return "asyncio"
