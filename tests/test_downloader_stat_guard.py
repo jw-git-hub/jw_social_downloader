@@ -31,7 +31,7 @@ async def test_gallery_fallback_returns_none_when_files_vanish(tmp_path, monkeyp
 
     ghost = tmp_path / "deadbeef_1.jpg"
 
-    async def fake_gallery_dl(url, platform, filename):
+    async def fake_gallery_dl(url, platform, filename, h264_only=False):
         return GalleryDlRun(files=[ghost], stderr="", returncode=0)
 
     monkeypatch.setattr(downloader, "_try_gallery_dl", fake_gallery_dl)

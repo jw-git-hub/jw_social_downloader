@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import sys
 from pathlib import Path
 
@@ -68,6 +69,23 @@ def test_instagram_command_prefers_h264_at_equal_resolution(tmp_path):
     assert cmd[cmd.index("-f") + 1] == "bv*+ba/b"
 
 
+def test_transcode_cmd_pads_odd_frame_size_to_even():
+    cmd = build_transcode_cmd(Path("in.mp4"), Path("out.mp4"), copy_audio=True)
+    assert cmd[cmd.index("-vf") + 1] == "pad=ceil(iw/2)*2:ceil(ih/2)*2"
+
+
+def test_h264_only_selector_lets_sort_pick_best_resolution_among_all_non_vp9():
+    selector = downloader.INSTAGRAM_H264_ONLY_SELECTOR
+    assert selector.index("bv*") < selector.index("/b[")
+
+
+def test_gallery_dl_h264_only_takes_merged_progressive_videos():
+    plain = downloader._build_gallery_dl_cmd(_URL, "instagram", "abc", None)
+    h264 = downloader._build_gallery_dl_cmd(_URL, "instagram", "abc", None, h264_only=True)
+    assert "videos=merged" not in plain
+    assert h264[h264.index("-o") + 1] == "videos=merged"
+
+
 def test_instagram_h264_only_command_excludes_vp9_and_av1(tmp_path):
     cmd = _build_command(_URL, "instagram", tmp_path / "o.%(ext)s", None, h264_only=True)
     selector = cmd[cmd.index("-f") + 1]
@@ -82,9 +100,21 @@ argv = sys.argv[1:]
 log = pathlib.Path({log!r})
 with log.open("a") as handle:
     handle.write("ytdlp " + argv[argv.index("-f") + 1] + "\\n")
-template = argv[argv.index("-o") + 1].replace("%(playlist_index)s", "NA").replace("%(ext)s", "mp4")
-codec = "h264" if "vcodec!^=?vp" in argv[argv.index("-f") + 1] else {codec!r}
-pathlib.Path(template).write_text(codec + " " + {duration!r})
+codec = {retry_codec!r} if "vcodec!^=?vp" in argv[argv.index("-f") + 1] else {codec!r}
+for index in range({files_count!r}):
+    template = argv[argv.index("-o") + 1].replace("%(playlist_index)s", str(index)).replace("%(ext)s", "mp4")
+    pathlib.Path(template).write_text(codec + " " + {duration!r})
+"""
+
+_FAKE_GALLERY_DL = """#!{python}
+import pathlib, sys
+argv = sys.argv[1:]
+merged = "videos=merged" in argv
+with pathlib.Path({log!r}).open("a") as handle:
+    handle.write("gallery-dl merged\\n" if merged else "gallery-dl\\n")
+name = argv[argv.index("-f") + 1].replace("{{num}}", "1").replace("{{id|filename|num}}", "x").replace("{{extension}}", "mp4")
+codec = {retry_codec!r} if merged else {codec!r}
+(pathlib.Path(argv[argv.index("-D") + 1]) / name).write_text(codec + " " + {duration!r})
 """
 
 _FAKE_FFPROBE = """#!{python}
@@ -97,10 +127,13 @@ print(json.dumps({{"streams": [
 """
 
 _FAKE_FFMPEG = """#!{python}
-import pathlib, sys
+import pathlib, sys, time
 argv = sys.argv[1:]
 with pathlib.Path({log!r}).open("a") as handle:
     handle.write("ffmpeg\\n")
+time.sleep({ffmpeg_sleep!r})
+with pathlib.Path({log!r}).open("a") as handle:
+    handle.write("ffmpeg_end\\n")
 if {fail!r}:
     sys.stderr.write("boom")
     sys.exit(1)
@@ -110,15 +143,24 @@ pathlib.Path(argv[-1]).write_text("h264 " + duration)
 """
 
 
-def _install_tools(tmp_path, monkeypatch, *, codec: str, duration: str, ffmpeg_fails: bool = False):
+def _install_tools(
+    tmp_path, monkeypatch, *, codec: str, duration: str, ffmpeg_fails: bool = False,
+    retry_codec: str = "h264", files_count: int = 1, ffmpeg_sleep: float = 0.0,
+):
     bin_dir, dl_dir = tmp_path / "bin", tmp_path / "downloads"
     bin_dir.mkdir()
     dl_dir.mkdir()
     log = tmp_path / "calls.log"
     scripts = {
-        "yt-dlp": _FAKE_YTDLP.format(python=sys.executable, log=str(log), codec=codec, duration=duration),
+        "yt-dlp": _FAKE_YTDLP.format(
+            python=sys.executable, log=str(log), codec=codec, duration=duration,
+            retry_codec=retry_codec, files_count=files_count,
+        ),
+        "gallery-dl": _FAKE_GALLERY_DL.format(
+            python=sys.executable, log=str(log), codec=codec, duration=duration, retry_codec=retry_codec,
+        ),
         "ffprobe": _FAKE_FFPROBE.format(python=sys.executable),
-        "ffmpeg": _FAKE_FFMPEG.format(python=sys.executable, log=str(log), fail=ffmpeg_fails),
+        "ffmpeg": _FAKE_FFMPEG.format(python=sys.executable, log=str(log), fail=ffmpeg_fails, ffmpeg_sleep=ffmpeg_sleep),
     }
     for name, body in scripts.items():
         (bin_dir / name).write_text(body)
@@ -194,3 +236,46 @@ async def test_download_complete_log_reports_codec_and_height(tmp_path, monkeypa
         logger.remove(sink_id)
     complete = [m for m in messages if m.startswith("Download complete")]
     assert complete and "codec=h264" in complete[0] and "height=1920" in complete[0]
+
+
+async def test_long_post_via_gallery_dl_is_refetched_with_merged_videos(tmp_path, monkeypatch):
+    long_duration = str(TRANSCODE_MAX_DURATION_SEC + 60)
+    _dl_dir, log = _install_tools(tmp_path, monkeypatch, codec="vp9", duration=long_duration)
+    result = await download_media("https://www.instagram.com/p/DBc1abc/", "instagram")
+    calls = _calls(log)
+    assert result.success is True
+    assert calls == ["gallery-dl", "gallery-dl merged"]
+    assert Path(result.file_path).read_text().startswith("h264")
+
+
+async def test_refetch_that_is_still_non_h264_is_sent_as_is_without_ffmpeg(tmp_path, monkeypatch):
+    long_duration = str(TRANSCODE_MAX_DURATION_SEC + 60)
+    _dl_dir, log = _install_tools(
+        tmp_path, monkeypatch, codec="vp9", duration=long_duration, retry_codec="vp9",
+    )
+    result = await download_media(_URL, "instagram")
+    calls = _calls(log)
+    assert result.success is True
+    assert len([c for c in calls if c.startswith("ytdlp")]) == 2
+    assert "ffmpeg" not in calls
+    assert Path(result.file_path).read_text().startswith("vp9")
+
+
+async def test_carousel_is_judged_by_total_duration_not_per_file(tmp_path, monkeypatch):
+    each = str(TRANSCODE_MAX_DURATION_SEC // 2 + 10)
+    _dl_dir, log = _install_tools(tmp_path, monkeypatch, codec="vp9", duration=each, files_count=2)
+    result = await download_media(_URL, "instagram")
+    calls = _calls(log)
+    assert result.success is True
+    assert len([c for c in calls if c.startswith("ytdlp")]) == 2
+    assert "ffmpeg" not in calls
+
+
+async def test_two_transcodes_never_run_at_the_same_time(tmp_path, monkeypatch):
+    dl_dir, log = _install_tools(tmp_path, monkeypatch, codec="vp9", duration="8.4", ffmpeg_sleep=0.3)
+    sources = []
+    for name in ("a.mp4", "b.mp4"):
+        (dl_dir / name).write_text("vp9 8.4")
+        sources.append(dl_dir / name)
+    await asyncio.gather(*(video_transcode.transcode_to_h264(path, _info("vp9")) for path in sources))
+    assert _calls(log) == ["ffmpeg", "ffmpeg_end", "ffmpeg", "ffmpeg_end"]

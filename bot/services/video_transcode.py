@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import shutil
 from pathlib import Path
 
 from loguru import logger
@@ -25,16 +26,27 @@ AAC_CODEC_NAME = "aac"
 # Ролики длиннее не перекодируем, а качаем в H.264 пониженного разрешения.
 TRANSCODE_MAX_DURATION_SEC = 90
 TRANSCODE_SECONDS_PER_VIDEO_SECOND = 2.5  # с запасом к замеру, для оценки «осталось» в статусе
-TRANSCODE_TIMEOUT_SEC = 600
+TRANSCODE_TIMEOUT_SEC = 600  # отсчитывается после захвата очереди, а не вместе с ожиданием
+# Загрузки идут под общим Semaphore(3), а libx264 и один занимает все 6 ядер:
+# три параллельных перекодирования по 80–90 с вылетели бы в таймаут. Поэтому
+# перекодируем по одному, остальные ждут своей очереди.
+MAX_CONCURRENT_TRANSCODES = 1
+NICE_PRIORITY = "10"  # перекодирование не должно душить бота и остальные загрузки
 # crf 20 / veryfast: на VP9-источнике визуально без потерь (источник уже сжат
 # сильнее), файл ~3x больше источника; crf 18 давал ещё +27 % размера за то же время.
 X264_PRESET = "veryfast"
 X264_CRF = "20"
 OUTPUT_PIXEL_FORMAT = "yuv420p"
+# libx264 + yuv420p не принимают нечётную ширину/высоту; pad добавляет один
+# пиксель вместо того, чтобы отрезать или сжимать кадр.
+EVEN_SIZE_PAD_FILTER = "pad=ceil(iw/2)*2:ceil(ih/2)*2"
 AAC_FALLBACK_BITRATE = "192k"
 TRANSCODED_SUFFIX = "_h264"
 OUTPUT_EXTENSION = ".mp4"
 STDERR_LOG_LIMIT_CHARS = 300
+
+
+_transcode_slots = asyncio.Semaphore(MAX_CONCURRENT_TRANSCODES)
 
 
 class TranscodeError(Exception):
@@ -59,6 +71,7 @@ def build_transcode_cmd(source: Path, target: Path, copy_audio: bool) -> list[st
         "ffmpeg", "-nostdin", "-y", "-v", "error",
         "-i", str(source),
         "-map", "0:v:0", "-map", "0:a:0?",
+        "-vf", EVEN_SIZE_PAD_FILTER,
         "-c:v", "libx264", "-preset", X264_PRESET, "-crf", X264_CRF,
         "-pix_fmt", OUTPUT_PIXEL_FORMAT,
         *audio_args,
@@ -67,7 +80,17 @@ def build_transcode_cmd(source: Path, target: Path, copy_audio: bool) -> list[st
     ]
 
 
+def _with_low_priority(cmd: list[str]) -> list[str]:
+    nice_path = shutil.which("nice")
+    return [nice_path, "-n", NICE_PRIORITY, *cmd] if nice_path else cmd
+
+
 async def _run_ffmpeg(cmd: list[str]) -> None:
+    async with _transcode_slots:
+        await _run_ffmpeg_exclusive(_with_low_priority(cmd))
+
+
+async def _run_ffmpeg_exclusive(cmd: list[str]) -> None:
     process = await asyncio.create_subprocess_exec(
         *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
     )

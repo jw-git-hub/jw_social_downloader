@@ -71,9 +71,13 @@ INSTAGRAM_FORMAT_SORT = YOUTUBE_FORMAT_SORT
 # Формат без VP9/AV1. `?` после оператора пропускает формат с незаполненным
 # vcodec: у прогрессивных форматов Instagram (H.264+AAC) это поле пустое.
 INSTAGRAM_NOT_VP9_AV1 = "[vcodec!^=?vp][vcodec!^=?av0]"
+# DASH-склейка раньше прогрессивного формата: `-S` выберет максимальное
+# разрешение среди всех не-VP9/не-AV1 (прогрессивный 720p не перебьёт DASH avc1 1080p).
 INSTAGRAM_H264_ONLY_SELECTOR = (
-    f"b{INSTAGRAM_NOT_VP9_AV1}/bv*{INSTAGRAM_NOT_VP9_AV1}+ba/bv*+ba/b"
+    f"bv*{INSTAGRAM_NOT_VP9_AV1}+ba/b{INSTAGRAM_NOT_VP9_AV1}/bv*+ba/b"
 )
+# gallery-dl: прогрессивный формат вместо DASH (там H.264+AAC, а не VP9).
+GALLERY_DL_H264_ONLY_ARGS = ("-o", "videos=merged")
 INSTAGRAM_ANY_SELECTOR = "bv*+ba/b"
 TRANSCODE_FAILED_MESSAGE = "Не удалось подготовить видео к просмотру. Попробуйте ещё раз позже."
 # Малоизвестные ролики: верхний формат (1440p/4K vp9/av01) не лежит в кэше
@@ -700,7 +704,9 @@ def _gallery_dl_item_limit(url: str, platform: str) -> int:
     return GALLERY_DL_CAROUSEL_MAX_ITEMS
 
 
-def _build_gallery_dl_cmd(url: str, platform: str, prefix: str, cookies_path: Path | None) -> list[str]:
+def _build_gallery_dl_cmd(
+    url: str, platform: str, prefix: str, cookies_path: Path | None, h264_only: bool = False
+) -> list[str]:
     """Командная строка gallery-dl. Вынесена отдельно, чтобы её можно было
     проверить тестом без сети.
 
@@ -726,6 +732,8 @@ def _build_gallery_dl_cmd(url: str, platform: str, prefix: str, cookies_path: Pa
         "-f", f"{prefix}_{{num}}_{{id|filename|num}}.{{extension}}",
         "--range", f"1-{_gallery_dl_item_limit(url, platform)}",
     ]
+    if h264_only:
+        cmd.extend(GALLERY_DL_H264_ONLY_ARGS)
     if cookies_path is not None:
         cmd.extend(["--cookies", str(cookies_path)])
     cmd.append(url)
@@ -767,9 +775,9 @@ def _stderr_tail(buffer: bytes) -> str:
     return "\n".join(lines[-TIMEOUT_STDERR_TAIL_LINES:])
 
 
-async def _try_gallery_dl(url: str, platform: str, filename: str) -> GalleryDlRun:
+async def _try_gallery_dl(url: str, platform: str, filename: str, h264_only: bool = False) -> GalleryDlRun:
     with _ephemeral_cookies() as cookies_path:
-        cmd = _build_gallery_dl_cmd(url, platform, filename, cookies_path)
+        cmd = _build_gallery_dl_cmd(url, platform, filename, cookies_path, h264_only)
 
         logger.info("Falling back to gallery-dl | url={}", mask_secrets(url))
 
@@ -824,9 +832,9 @@ async def _try_gallery_dl(url: str, platform: str, filename: str) -> GalleryDlRu
 
 
 async def _try_gallery_dl_fallback(
-    url: str, platform: str, filename: str, outputs: list[tuple[str, str]]
+    url: str, platform: str, filename: str, outputs: list[tuple[str, str]], h264_only: bool = False
 ) -> DownloadResult | None:
-    run = await _try_gallery_dl(url, platform, filename)
+    run = await _try_gallery_dl(url, platform, filename, h264_only)
     # stderr gallery-dl копим ВСЕГДА — даже на успехе, чтобы при последующем
     # провале другой ветки его текст не пропал.
     if run.stderr:
@@ -905,7 +913,7 @@ async def _download_media_once(
         or (platform == "tiktok" and "/photo/" in url_lower)
     )
     if gallery_first:
-        gd_result = await _try_gallery_dl_fallback(url, platform, filename, outputs)
+        gd_result = await _try_gallery_dl_fallback(url, platform, filename, outputs, h264_only)
         if gd_result:
             return gd_result
         logger.info("gallery-dl primary returned nothing, falling back to yt-dlp | platform={} url={}", platform, mask_secrets(url))
@@ -1001,7 +1009,7 @@ async def _download_media_once(
 
                     outputs.append(("yt-dlp", full_output))
                     if platform in GALLERY_DL_FALLBACK_PLATFORMS:
-                        gd_result = await _try_gallery_dl_fallback(url, platform, filename, outputs)
+                        gd_result = await _try_gallery_dl_fallback(url, platform, filename, outputs, h264_only)
                         if gd_result:
                             return gd_result
 
@@ -1038,7 +1046,7 @@ async def _download_media_once(
 
             outputs.append(("yt-dlp", full_output))
             if platform in GALLERY_DL_FALLBACK_PLATFORMS:
-                gd_result = await _try_gallery_dl_fallback(url, platform, filename, outputs)
+                gd_result = await _try_gallery_dl_fallback(url, platform, filename, outputs, h264_only)
                 if gd_result:
                     return gd_result
 
@@ -1144,17 +1152,25 @@ async def _convert_instagram_result(
     """Гарантирует H.264 во всех видео Instagram: iPhone-клиент Telegram не
     показывает VP9 (картинка стоит на первом кадре).
 
-    Короткий не-H.264 ролик перекодируем (макс. качество сохраняется), длинный
-    качаем заново в H.264 пониженного разрешения. После повторной загрузки
-    (`h264_only`) перекодируем без ограничения длительности — деваться некуда.
+    Предел длительности сравниваем с СУММОЙ видео поста: карусель из десяти
+    роликов не должна давать десятки минут ffmpeg подряд. Короткий пост
+    перекодируем (макс. качество сохраняется), длинный качаем заново ровно один
+    раз в H.264 пониженного разрешения. Если и после этого H.264 нет, отдаём
+    файл как есть (поведение до перекодирования): сверх предела не кодируем.
     """
     pending = await _find_non_h264_videos(_result_file_paths(result))
     if not pending:
         return result
-    too_long = any(info.duration > TRANSCODE_MAX_DURATION_SEC for _, info in pending)
-    if too_long and not h264_only:
-        return await _redownload_as_h264(result, url, platform, on_status)
-    return await _transcode_videos(result, pending, on_status)
+    total_duration = sum(info.duration for _, info in pending)
+    if total_duration <= TRANSCODE_MAX_DURATION_SEC:
+        return await _transcode_videos(result, pending, on_status)
+    if h264_only:
+        logger.warning(
+            "No h264 available for a long post, sending as is | duration={:.0f}s url={}",
+            total_duration, mask_secrets(url),
+        )
+        return result
+    return await _redownload_as_h264(result, url, platform, on_status)
 
 
 async def _log_download_complete(result: DownloadResult) -> None:
