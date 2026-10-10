@@ -28,6 +28,7 @@ _TIER_NAMES = {4320: "8K", 2160: "4K"}
 
 DOWNLOAD_TITLE = "Скачиваю видео"
 MERGE_TITLE = "Собираю видео и звук"
+CONVERT_TITLE = "Готовлю видео для всех устройств"
 UPLOAD_TITLE = "Отправляю в Telegram"
 
 PREPARING_TEXT = (
@@ -140,8 +141,9 @@ def download_status_text(status: DownloadStatus | None, limit_mb: int) -> str:
     elif status.phase is DownloadPhase.DOWNLOADING:
         title = _title(DOWNLOAD_TITLE, height, size_mb)
         body = _download_progress_line(status)
-    else:  # MERGING
-        title = _title(MERGE_TITLE, height, size_mb)
+    else:  # MERGING / CONVERTING: тело одинаковое — «Ещё ~N мин.»
+        phase_title = CONVERT_TITLE if status.phase is DownloadPhase.CONVERTING else MERGE_TITLE
+        title = _title(phase_title, height, size_mb)
         body = f"Ещё {format_eta(status.eta_sec)}." if status.eta_sec is not None else ""
 
     text = f"{title}\n{body}" if body else title

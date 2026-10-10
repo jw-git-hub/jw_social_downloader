@@ -60,6 +60,7 @@ class DownloadPhase(str, Enum):
     PREPARING = "preparing"  # yt-dlp запущен, прогресса ещё нет
     DOWNLOADING = "downloading"
     MERGING = "merging"  # постобработка ffmpeg (склейка/исправление контейнера)
+    CONVERTING = "converting"  # перекодирование в H.264 после скачивания; статус шлёт downloader, трекер его не ведёт
 
 
 @dataclass(frozen=True)
@@ -76,7 +77,7 @@ class DownloadStatus:
     plan: FormatPlan | None = None
     fraction: float | None = None  # 0..FRACTION_CAP; None — общий размер неизвестен
     downloaded_mb: float = 0.0
-    eta_sec: float | None = None  # DOWNLOADING — остаток скачивания; MERGING — оценка склейки
+    eta_sec: float | None = None  # DOWNLOADING — остаток скачивания; MERGING/CONVERTING — оценка до конца
 
 
 def nominal_height(width: float | int | None, height: float | int | None) -> int | None:

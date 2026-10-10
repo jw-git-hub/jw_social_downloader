@@ -216,3 +216,9 @@ def test_limits_block_mentions_examples():
 
 def test_queued_text_is_a_fixed_constant():
     assert "Жду своей очереди" in QUEUED_TEXT
+
+
+def test_converting_phase_shows_conversion_title_and_eta():
+    status = DownloadStatus(phase=DownloadPhase.CONVERTING, eta_sec=70)
+    text = download_status_text(status, limit_mb=1500)
+    assert text == "<b>Готовлю видео для всех устройств</b>\nЕщё ~1 мин."
