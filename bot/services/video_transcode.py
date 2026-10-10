@@ -41,6 +41,16 @@ OUTPUT_PIXEL_FORMAT = "yuv420p"
 # пиксель вместо того, чтобы отрезать или сжимать кадр.
 EVEN_SIZE_PAD_FILTER = "pad=ceil(iw/2)*2:ceil(ih/2)*2"
 AAC_FALLBACK_BITRATE = "192k"
+# HDR (PQ / HLG) через `-pix_fmt yuv420p` без тонмаппинга даёт блёклую картинку.
+# Теги источника не всегда проставлены (контейнер mp4 с vp09 их нередко теряет),
+# поэтому `setparams` задаёт их явно: PQ и HLG бывают только в BT.2020, limited range.
+HDR_TRANSFERS = frozenset({"smpte2084", "arib-std-b67"})
+HDR_TO_SDR_FILTER = (
+    "setparams=color_trc={transfer}:colorspace=bt2020nc:color_primaries=bt2020:range=tv,"
+    "zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,"
+    "tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p"
+)
+SDR_COLOR_TAG_ARGS = ("-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709")
 TRANSCODED_SUFFIX = "_h264"
 OUTPUT_EXTENSION = ".mp4"
 STDERR_LOG_LIMIT_CHARS = 300
@@ -60,20 +70,37 @@ def needs_h264_transcode(info: MediaInfo | None) -> bool:
     return info.video_codec != H264_CODEC_NAME
 
 
+def is_hdr(info: MediaInfo) -> bool:
+    return info.color_transfer in HDR_TRANSFERS
+
+
 def estimate_transcode_seconds(info: MediaInfo) -> float:
     return info.duration * TRANSCODE_SECONDS_PER_VIDEO_SECOND
 
 
-def build_transcode_cmd(source: Path, target: Path, copy_audio: bool) -> list[str]:
-    """argv ffmpeg: видео в H.264, разрешение и fps исходные, звук — копия или AAC."""
+def _video_filter(hdr_transfer: str | None) -> str:
+    if hdr_transfer is None:
+        return EVEN_SIZE_PAD_FILTER
+    return f"{EVEN_SIZE_PAD_FILTER},{HDR_TO_SDR_FILTER.format(transfer=hdr_transfer)}"
+
+
+def build_transcode_cmd(
+    source: Path, target: Path, copy_audio: bool, hdr_transfer: str | None = None
+) -> list[str]:
+    """argv ffmpeg: видео в H.264, разрешение и fps исходные, звук — копия или AAC.
+
+    `hdr_transfer` (smpte2084 / arib-std-b67) включает тонмаппинг в SDR bt709.
+    """
+    color_args = SDR_COLOR_TAG_ARGS if hdr_transfer else ()
     audio_args = ["-c:a", "copy"] if copy_audio else ["-c:a", "aac", "-b:a", AAC_FALLBACK_BITRATE]
     return [
         "ffmpeg", "-nostdin", "-y", "-v", "error",
         "-i", str(source),
         "-map", "0:v:0", "-map", "0:a:0?",
-        "-vf", EVEN_SIZE_PAD_FILTER,
+        "-vf", _video_filter(hdr_transfer),
         "-c:v", "libx264", "-preset", X264_PRESET, "-crf", X264_CRF,
         "-pix_fmt", OUTPUT_PIXEL_FORMAT,
+        *color_args,
         *audio_args,
         "-movflags", "+faststart",
         str(target),
@@ -125,7 +152,10 @@ async def transcode_to_h264(source: Path, info: MediaInfo) -> Path:
     убирается, источник остаётся нетронутым, наружу летит `TranscodeError`.
     """
     temp_path = source.with_name(f"{source.stem}{TRANSCODED_SUFFIX}{OUTPUT_EXTENSION}")
-    cmd = build_transcode_cmd(source, temp_path, copy_audio=info.audio_codec == AAC_CODEC_NAME)
+    cmd = build_transcode_cmd(
+        source, temp_path, copy_audio=info.audio_codec == AAC_CODEC_NAME,
+        hdr_transfer=info.color_transfer if is_hdr(info) else None,
+    )
     logger.info(
         "Transcoding to h264 | from={} duration={:.1f}s height={}",
         info.video_codec, info.duration, info.height,

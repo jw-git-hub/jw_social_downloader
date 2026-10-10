@@ -19,6 +19,7 @@ class MediaInfo:
     height: int
     video_codec: str = ""
     audio_codec: str = ""
+    color_transfer: str = ""
 
 
 def _first_float(*values: object) -> float:
@@ -84,6 +85,7 @@ def parse_ffprobe_json(raw: str) -> MediaInfo | None:
             height=height,
             video_codec=str(video.get("codec_name") or "") if video else "",
             audio_codec=str(audio.get("codec_name") or "") if audio else "",
+            color_transfer=str(video.get("color_transfer") or "") if video else "",
         )
     except Exception as exc:
         # Форма JSON неожиданная (не тот тип поля, не dict/list там, где ждали

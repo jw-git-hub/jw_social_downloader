@@ -10,6 +10,8 @@
 from __future__ import annotations
 
 import asyncio
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -18,19 +20,22 @@ from loguru import logger
 
 from bot.services import downloader, video_transcode
 from bot.services.downloader import _build_command, download_media
-from bot.services.media_probe import MediaInfo
+from bot.services.media_probe import MediaInfo, probe_media
 from bot.services.video_transcode import (
     TRANSCODE_MAX_DURATION_SEC,
     TranscodeError,
     build_transcode_cmd,
+    is_hdr,
     needs_h264_transcode,
 )
 
 _URL = "https://www.instagram.com/reel/DbWoC_CsNcZ/"
 
 
-def _info(video_codec: str, duration: float = 8.4, audio_codec: str = "aac") -> MediaInfo:
-    return MediaInfo(True, True, duration, 1080, 1920, video_codec, audio_codec)
+def _info(
+    video_codec: str, duration: float = 8.4, audio_codec: str = "aac", color_transfer: str = ""
+) -> MediaInfo:
+    return MediaInfo(True, True, duration, 1080, 1920, video_codec, audio_codec, color_transfer)
 
 
 @pytest.mark.parametrize("codec", ["vp9", "av1", "hevc"])
@@ -279,3 +284,45 @@ async def test_two_transcodes_never_run_at_the_same_time(tmp_path, monkeypatch):
         sources.append(dl_dir / name)
     await asyncio.gather(*(video_transcode.transcode_to_h264(path, _info("vp9")) for path in sources))
     assert _calls(log) == ["ffmpeg", "ffmpeg_end", "ffmpeg", "ffmpeg_end"]
+
+
+# ── HDR → SDR ───────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("transfer", ["smpte2084", "arib-std-b67"])
+def test_hdr_transfer_is_detected(transfer):
+    assert is_hdr(_info("vp9", color_transfer=transfer)) is True
+
+
+@pytest.mark.parametrize("transfer", ["", "bt709", "unknown"])
+def test_sdr_transfer_is_not_hdr(transfer):
+    assert is_hdr(_info("vp9", color_transfer=transfer)) is False
+
+
+def test_hdr_cmd_tonemaps_to_bt709_and_sdr_cmd_does_not():
+    hdr_cmd = build_transcode_cmd(Path("in.mp4"), Path("out.mp4"), True, hdr_transfer="smpte2084")
+    plain_cmd = build_transcode_cmd(Path("in.mp4"), Path("out.mp4"), True)
+    hdr_filter = hdr_cmd[hdr_cmd.index("-vf") + 1]
+    assert "color_trc=smpte2084" in hdr_filter and "tonemap" in hdr_filter and "zscale" in hdr_filter
+    assert "-colorspace" in hdr_cmd
+    assert "tonemap" not in plain_cmd[plain_cmd.index("-vf") + 1]
+    assert "-colorspace" not in plain_cmd
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="нужен ffmpeg с zscale и tonemap")
+async def test_real_ffmpeg_turns_hdr_clip_into_bt709_yuv420p(tmp_path):
+    source = tmp_path / "hdr.mkv"
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=15:duration=1,format=yuv420p10le",
+         "-f", "lavfi", "-i", "sine=d=1", "-c:v", "libvpx-vp9", "-profile:v", "2", "-pix_fmt", "yuv420p10le",
+         "-c:a", "aac", str(source)],
+        check=True,
+    )
+    info = _info("vp9", color_transfer="smpte2084")
+    result = await video_transcode.transcode_to_h264(source, info)
+    probed = await probe_media(result)
+    assert probed.video_codec == "h264"
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "stream=pix_fmt,color_transfer", "-of", "csv=p=0", str(result)],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    assert "yuv420p,bt709" in out

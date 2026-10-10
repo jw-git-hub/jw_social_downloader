@@ -28,13 +28,15 @@ def _ffprobe_output(streams, duration="12.5"):
 
 def test_parses_normal_video_with_audio():
     raw = _ffprobe_output([
-        {"codec_type": "video", "codec_name": "vp9", "width": 1920, "height": 1080},
+        {"codec_type": "video", "codec_name": "vp9", "width": 1920, "height": 1080,
+         "color_transfer": "smpte2084"},
         {"codec_type": "audio", "codec_name": "aac"},
     ])
     info = parse_ffprobe_json(raw)
     assert info == MediaInfo(
         has_video=True, has_audio=True, duration=12.5, width=1920, height=1080,
         video_codec="vp9", audio_codec="aac",
+        color_transfer="smpte2084",
     )
 
 
