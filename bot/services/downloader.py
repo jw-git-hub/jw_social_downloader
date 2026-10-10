@@ -66,8 +66,12 @@ YOUTUBE_AUDIO_BUDGET_MAX_MB = 120
 # Разрешение важнее кодека (решение владельца 2026-09-26: потолка нет — самый
 # лучший вариант всегда), SDR раньше HDR, при равном разрешении avc1 > vp9 > av01.
 YOUTUBE_FORMAT_SORT = "res,fps,hdr:sdr,+codec:avc:m4a"
-# Instagram: тот же порядок — лучшее разрешение, при равном H.264 раньше VP9/AV1.
-INSTAGRAM_FORMAT_SORT = YOUTUBE_FORMAT_SORT
+# Instagram: лучшее разрешение, при равном H.264 раньше VP9/AV1. От YouTube-сортировки
+# отличается двумя вещами (замер на реальном рилсе, tests/test_instagram_format_choice.py):
+# нет `fps` и нет `+` перед codec — у прогрессивных форматов (H.264+AAC) Instagram нет ни
+# `fps`, ни `vcodec`, и с любым из них они проигрывали DASH-VP9 того же разрешения,
+# а это лишнее перекодирование.
+INSTAGRAM_FORMAT_SORT = "res,hdr:sdr,codec:avc:m4a"
 # Формат без VP9/AV1. `?` после оператора пропускает формат с незаполненным
 # vcodec: у прогрессивных форматов Instagram (H.264+AAC) это поле пустое.
 INSTAGRAM_NOT_VP9_AV1 = "[vcodec!^=?vp][vcodec!^=?av0]"

@@ -65,7 +65,7 @@ def test_transcode_cmd_reencodes_non_aac_audio():
 
 def test_instagram_command_prefers_h264_at_equal_resolution(tmp_path):
     cmd = _build_command(_URL, "instagram", tmp_path / "o.%(ext)s", None)
-    assert cmd[cmd.index("-S") + 1] == downloader.YOUTUBE_FORMAT_SORT
+    assert cmd[cmd.index("-S") + 1] == downloader.INSTAGRAM_FORMAT_SORT
     assert cmd[cmd.index("-f") + 1] == "bv*+ba/b"
 
 
