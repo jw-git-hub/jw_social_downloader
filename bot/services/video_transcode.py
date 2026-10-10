@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import math
 import os
 import shutil
+from collections.abc import Iterator
 from pathlib import Path
 
 from loguru import logger
@@ -56,7 +58,15 @@ OUTPUT_EXTENSION = ".mp4"
 STDERR_LOG_LIMIT_CHARS = 300
 
 
-_transcode_slots = asyncio.Semaphore(MAX_CONCURRENT_TRANSCODES)
+# Размер перекодированного файла к источнику (замер: VP9 2,06 МБ → H.264 5,92 МБ);
+# нужен только для строки статуса «Готовлю видео…».
+TRANSCODE_OUTPUT_SIZE_RATIO = 3.0
+BYTES_PER_MB = 1024 * 1024
+
+# Семафор создаётся лениво под текущий event loop: asyncio.Semaphore привязывается
+# к циклу при первом ожидании, а циклов в тестах несколько.
+_slots_by_loop: dict[asyncio.AbstractEventLoop, asyncio.Semaphore] = {}
+_backlog_sec = 0.0  # оценка работы всех перекодирований, вставших в очередь и не закончивших
 
 
 class TranscodeError(Exception):
@@ -72,6 +82,28 @@ def needs_h264_transcode(info: MediaInfo | None) -> bool:
 
 def is_hdr(info: MediaInfo) -> bool:
     return info.color_transfer in HDR_TRANSFERS
+
+
+def effective_duration_sec(info: MediaInfo) -> float:
+    """Длительность для сравнения с пределом: нулевая/неизвестная = бесконечная,
+    такой ролик не должен уходить в ffmpeg до таймаута."""
+    return info.duration if info.duration > 0 else math.inf
+
+
+def estimate_output_mb(source_bytes: int) -> float:
+    return source_bytes * TRANSCODE_OUTPUT_SIZE_RATIO / BYTES_PER_MB
+
+
+@contextlib.contextmanager
+def transcode_backlog(estimate_sec: float) -> Iterator[float]:
+    """Встаёт в очередь перекодирований; отдаёт оценку работы, что стоит впереди."""
+    global _backlog_sec
+    ahead = _backlog_sec
+    _backlog_sec += estimate_sec
+    try:
+        yield ahead
+    finally:
+        _backlog_sec -= estimate_sec
 
 
 def estimate_transcode_seconds(info: MediaInfo) -> float:
@@ -95,6 +127,9 @@ def build_transcode_cmd(
     audio_args = ["-c:a", "copy"] if copy_audio else ["-c:a", "aac", "-b:a", AAC_FALLBACK_BITRATE]
     return [
         "ffmpeg", "-nostdin", "-y", "-v", "error",
+        # Вход — недоверенный скачанный файл (см. _ffprobe_cmd в media_probe.py):
+        # демуксер не должен открывать вложенные ссылки, только локальный файл.
+        "-protocol_whitelist", "file",
         "-i", str(source),
         "-map", "0:v:0", "-map", "0:a:0?",
         "-vf", _video_filter(hdr_transfer),
@@ -112,8 +147,15 @@ def _with_low_priority(cmd: list[str]) -> list[str]:
     return [nice_path, "-n", NICE_PRIORITY, *cmd] if nice_path else cmd
 
 
+def _transcode_slots() -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    if loop not in _slots_by_loop:
+        _slots_by_loop[loop] = asyncio.Semaphore(MAX_CONCURRENT_TRANSCODES)
+    return _slots_by_loop[loop]
+
+
 async def _run_ffmpeg(cmd: list[str]) -> None:
-    async with _transcode_slots:
+    async with _transcode_slots():
         await _run_ffmpeg_exclusive(_with_low_priority(cmd))
 
 

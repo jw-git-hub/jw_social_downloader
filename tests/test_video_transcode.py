@@ -105,10 +105,17 @@ argv = sys.argv[1:]
 log = pathlib.Path({log!r})
 with log.open("a") as handle:
     handle.write("ytdlp " + argv[argv.index("-f") + 1] + "\\n")
+    if "--load-info-json" in argv:
+        handle.write("loaded-info-json\\n")
+if {retry_fails!r} and "vcodec!^=?vp" in argv[argv.index("-f") + 1]:
+    sys.stderr.write("ERROR: boom")
+    sys.exit(1)
 codec = {retry_codec!r} if "vcodec!^=?vp" in argv[argv.index("-f") + 1] else {codec!r}
 for index in range({files_count!r}):
     template = argv[argv.index("-o") + 1].replace("%(playlist_index)s", str(index)).replace("%(ext)s", "mp4")
     pathlib.Path(template).write_text(codec + " " + {duration!r})
+    if "--write-info-json" in argv:
+        pathlib.Path(template).with_suffix(".info.json").write_text("{{}}")
 """
 
 _FAKE_GALLERY_DL = """#!{python}
@@ -117,6 +124,8 @@ argv = sys.argv[1:]
 merged = "videos=merged" in argv
 with pathlib.Path({log!r}).open("a") as handle:
     handle.write("gallery-dl merged\\n" if merged else "gallery-dl\\n")
+if merged and {retry_fails!r}:
+    sys.exit(1)
 name = argv[argv.index("-f") + 1].replace("{{num}}", "1").replace("{{id|filename|num}}", "x").replace("{{extension}}", "mp4")
 codec = {retry_codec!r} if merged else {codec!r}
 (pathlib.Path(argv[argv.index("-D") + 1]) / name).write_text(codec + " " + {duration!r})
@@ -124,6 +133,8 @@ codec = {retry_codec!r} if merged else {codec!r}
 
 _FAKE_FFPROBE = """#!{python}
 import json, pathlib, sys
+with pathlib.Path({log!r}).open("a") as handle:
+    handle.write("ffprobe\\n")
 codec, duration = pathlib.Path(sys.argv[-1]).read_text().split()
 print(json.dumps({{"streams": [
     {{"codec_type": "video", "codec_name": codec, "width": 1080, "height": 1920}},
@@ -150,7 +161,7 @@ pathlib.Path(argv[-1]).write_text("h264 " + duration)
 
 def _install_tools(
     tmp_path, monkeypatch, *, codec: str, duration: str, ffmpeg_fails: bool = False,
-    retry_codec: str = "h264", files_count: int = 1, ffmpeg_sleep: float = 0.0,
+    retry_codec: str = "h264", files_count: int = 1, ffmpeg_sleep: float = 0.0, retry_fails: bool = False,
 ):
     bin_dir, dl_dir = tmp_path / "bin", tmp_path / "downloads"
     bin_dir.mkdir()
@@ -159,12 +170,13 @@ def _install_tools(
     scripts = {
         "yt-dlp": _FAKE_YTDLP.format(
             python=sys.executable, log=str(log), codec=codec, duration=duration,
-            retry_codec=retry_codec, files_count=files_count,
+            retry_codec=retry_codec, files_count=files_count, retry_fails=retry_fails,
         ),
         "gallery-dl": _FAKE_GALLERY_DL.format(
             python=sys.executable, log=str(log), codec=codec, duration=duration, retry_codec=retry_codec,
+            retry_fails=retry_fails,
         ),
-        "ffprobe": _FAKE_FFPROBE.format(python=sys.executable),
+        "ffprobe": _FAKE_FFPROBE.format(python=sys.executable, log=str(log)),
         "ffmpeg": _FAKE_FFMPEG.format(python=sys.executable, log=str(log), fail=ffmpeg_fails, ffmpeg_sleep=ffmpeg_sleep),
     }
     for name, body in scripts.items():
@@ -202,16 +214,17 @@ async def test_long_vp9_instagram_video_is_redownloaded_as_h264(tmp_path, monkey
     calls = _calls(log)
     assert result.success is True
     assert len([c for c in calls if c.startswith("ytdlp")]) == 2
-    assert "vcodec!^=?vp" in calls[-1]
+    assert "vcodec!^=?vp" in [c for c in calls if c.startswith("ytdlp")][-1]
     assert "ffmpeg" not in calls
     assert Path(result.file_path).read_text().startswith("h264")
 
 
-async def test_other_platforms_are_not_probed_or_transcoded(tmp_path, monkeypatch):
+async def test_other_platforms_are_not_transcoded_and_probed_once_for_the_log(tmp_path, monkeypatch):
     _dl_dir, log = _install_tools(tmp_path, monkeypatch, codec="vp9", duration="8.4")
     result = await download_media("https://www.facebook.com/watch?v=1", "facebook")
     assert result.success is True
     assert "ffmpeg" not in _calls(log)
+    assert _calls(log).count("ffprobe") == 1
 
 
 async def test_transcode_failure_is_a_failed_download_without_leftovers(tmp_path, monkeypatch):
@@ -249,7 +262,7 @@ async def test_long_post_via_gallery_dl_is_refetched_with_merged_videos(tmp_path
     result = await download_media("https://www.instagram.com/p/DBc1abc/", "instagram")
     calls = _calls(log)
     assert result.success is True
-    assert calls == ["gallery-dl", "gallery-dl merged"]
+    assert [c for c in calls if c.startswith("gallery-dl")] == ["gallery-dl", "gallery-dl merged"]
     assert Path(result.file_path).read_text().startswith("h264")
 
 

@@ -491,15 +491,6 @@ def _partial_album_send_text(sent: int, total: int, is_network_error: bool) -> s
     return f"Отправил {sent} из {total} файлов, дальше случилась {tail}. Попробуйте ещё раз."
 
 
-def _result_paths(dl_result: DownloadResult) -> list[str]:
-    """Все пути результата без дублей — та же логика, что раньше собиралась
-    прямо в `finally` (и отправленные, и отклонённые файлы)."""
-    paths = list(dl_result.file_paths or [])
-    if dl_result.file_path and dl_result.file_path not in paths:
-        paths.append(dl_result.file_path)
-    return paths
-
-
 async def _record_failure(db_user_id: int, url: str, platform: str, reservation_id: int | None) -> None:
     """Возврат брони и запись неуспеха в лог — тот же порядок, что в трёх
     старых копиях этой логики выше по файлу (Этап 2 их не трогает)."""
@@ -535,7 +526,7 @@ async def _reject_oversized(
     """Отказ по размеру: статус пользователю и уборка всех путей результата."""
     actual_mb = max(size for _, size in oversized)
     await _show_status(status_msg, _oversize_text(actual_mb, settings.MAX_FILE_SIZE_MB))
-    for path in _result_paths(dl_result):
+    for path in dl_result.all_paths():
         await remove_file(path)
 
 
@@ -1042,7 +1033,7 @@ async def _execute_download(job: _DownloadJob) -> None:
     # отдельности, и склейка может выйти больше лимита. Ловим ПОСЛЕ загрузки,
     # по фактическому размеру готового файла — до отправки, чтобы не тратить
     # минуты на заведомо отклоняемую отдачу.
-    oversized = oversized_files(_result_paths(dl_result), settings.MAX_FILE_SIZE_MB)
+    oversized = oversized_files(dl_result.all_paths(), settings.MAX_FILE_SIZE_MB)
     if oversized:
         await _record_failure(db_user_id, url, platform, reservation_id)
         await _reject_oversized(status_msg, dl_result, oversized)
@@ -1209,7 +1200,7 @@ async def _execute_download(job: _DownloadJob) -> None:
         logger.error(f"Failed to send file: {e}")
     finally:
         await board.stop_ticking()
-        for p in _result_paths(dl_result):
+        for p in dl_result.all_paths():
             await remove_file(p)
 
     if send_error is None and not probably_delivered and _wants_upload_progress(dl_result):

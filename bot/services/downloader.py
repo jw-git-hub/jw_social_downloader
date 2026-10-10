@@ -8,8 +8,9 @@ import os
 import re
 import shutil
 import tempfile
-from collections.abc import Callable, Iterator, Sequence
-from dataclasses import dataclass, field
+import time
+from collections.abc import AsyncIterator, Callable, Iterator, Sequence
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from uuid import uuid4
 
@@ -22,11 +23,21 @@ from bot.services.progress_texts import format_size
 from bot.services.video_transcode import (
     TRANSCODE_MAX_DURATION_SEC,
     TranscodeError,
+    effective_duration_sec,
+    estimate_output_mb,
     estimate_transcode_seconds,
     needs_h264_transcode,
+    transcode_backlog,
     transcode_to_h264,
 )
-from bot.services.ytdlp_progress import YTDLP_PROGRESS_ARGS, DownloadPhase, DownloadStatus, DownloadTracker
+from bot.services.ytdlp_progress import (
+    YTDLP_PROGRESS_ARGS,
+    DownloadPhase,
+    DownloadStatus,
+    DownloadTracker,
+    FormatPlan,
+    nominal_height,
+)
 from bot.utils.log_guard import mask_secrets
 from bot.utils.text import platform_name
 
@@ -83,6 +94,8 @@ INSTAGRAM_H264_ONLY_SELECTOR = (
 # gallery-dl: прогрессивный формат вместо DASH (там H.264+AAC, а не VP9).
 GALLERY_DL_H264_ONLY_ARGS = ("-o", "videos=merged")
 INSTAGRAM_ANY_SELECTOR = "bv*+ba/b"
+CONVERT_STATUS_INTERVAL_SEC = 5.0  # как часто обновляем «Ещё ~N мин» на время перекодирования
+INFO_JSON_SUFFIX = ".info.json"
 TRANSCODE_FAILED_MESSAGE = "Не удалось подготовить видео к просмотру. Попробуйте ещё раз позже."
 # Малоизвестные ролики: верхний формат (1440p/4K vp9/av01) не лежит в кэше
 # узла googlevideo, и такой узел отдаёт непрогретые байты по ОДНОМУ https-
@@ -129,6 +142,13 @@ class DownloadResult:
     # False, поведение не менялось.
     partial: bool = False
     truncated: bool = False
+
+    def all_paths(self) -> list[str]:
+        """Все пути результата без дублей (и отправленные, и отклонённые файлы)."""
+        paths = list(self.file_paths or [])
+        if self.file_path and self.file_path not in paths:
+            paths.append(self.file_path)
+        return paths
 
 
 # ── Классификация ошибок загрузки ────────────────────────────────────────
@@ -478,7 +498,12 @@ def _youtube_args() -> list[str]:
 
 
 def _build_command(
-    url: str, platform: str, output_path: Path, cookies_path: Path | None, h264_only: bool = False
+    url: str,
+    platform: str,
+    output_path: Path,
+    cookies_path: Path | None,
+    h264_only: bool = False,
+    info_json_path: Path | None = None,
 ) -> list[str]:
     cmd = [
         "yt-dlp",
@@ -523,6 +548,10 @@ def _build_command(
         # .mkv/.webm — расширение мимо IMAGE_EXTS, файл уходил как видео, и
         # Telegram отдавал невоспроизводимое вложение.
         cmd.extend(["--merge-output-format", "mp4"])
+        if not h264_only:
+            # Разбор страницы сохраняем рядом с файлом: если ролик окажется длинным,
+            # повторная загрузка в H.264 пойдёт по нему без второго запроса к Instagram.
+            cmd.append("--write-info-json")
     elif platform == "tiktok":
         # У текущего yt-dlp формат-ID TikTok — h264_<res>_* / bytevc1_<res>_* (склеенные
         # video+audio), плюс watermark-версии download / download_addr. Старых play_addr_*
@@ -592,7 +621,7 @@ def _build_command(
     # (см. докстринг bot/services/ytdlp_progress.py: --no-quiet обязателен,
     # иначе --print молча включает --quiet и глушит строку про max-filesize).
     cmd.extend(YTDLP_PROGRESS_ARGS)
-    cmd.append(url)
+    cmd.extend(["--load-info-json", str(info_json_path)] if info_json_path else [url])
     return cmd
 
 
@@ -890,10 +919,12 @@ async def _download_media_once(
     platform: str,
     on_status: Callable[[DownloadStatus], None] | None,
     h264_only: bool = False,
+    info_json_path: Path | None = None,
 ) -> DownloadResult:
     """Одна попытка скачивания (yt-dlp / gallery-dl) без пост-обработки кодека.
 
-    `h264_only` — только Instagram: селектор без VP9/AV1 (см. `_convert_instagram_result`).
+    `h264_only` — только Instagram: селектор без VP9/AV1 (см. `_redownload_as_h264`);
+    `info_json_path` — разбор страницы с первой попытки yt-dlp (без повторного запроса).
     """
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -929,7 +960,7 @@ async def _download_media_once(
                 output_template = DOWNLOAD_DIR / (filename + "_%(playlist_index)s.%(ext)s")
             else:
                 output_template = DOWNLOAD_DIR / (filename + ".%(ext)s")
-            cmd = _build_command(url, platform, output_template, cookies_path, h264_only)
+            cmd = _build_command(url, platform, output_template, cookies_path, h264_only, info_json_path)
         else:
             cmd = _build_command(url, platform, output_path, cookies_path)
 
@@ -1069,14 +1100,61 @@ async def _download_media_once(
             )
 
 
+
+
 def _result_file_paths(result: DownloadResult) -> list[Path]:
-    paths = result.file_paths or ([result.file_path] if result.file_path else [])
-    return [Path(path) for path in paths]
+    return [Path(path) for path in result.all_paths()]
 
 
 def _remove_files(paths: Sequence[Path]) -> None:
     for path in paths:
         path.unlink(missing_ok=True)
+
+
+def _info_json_path(media_path: Path) -> Path:
+    """Где yt-dlp кладёт разбор страницы для файла (`--write-info-json`)."""
+    return media_path.with_suffix(INFO_JSON_SUFFIX)
+
+
+def _reusable_info_json(result: DownloadResult) -> Path | None:
+    """Разбор страницы можно переиспользовать, только если ролик один."""
+    paths = _result_file_paths(result)
+    if len(paths) != 1:
+        return None
+    info_json = _info_json_path(paths[0])
+    return info_json if info_json.exists() else None
+
+
+class _StatusRelay:
+    """Колбэк статуса, который запоминает последний план формата: статус
+    перекодирования и отправки показывает то же разрешение, что и скачивание."""
+
+    def __init__(self, on_status: Callable[[DownloadStatus], None] | None) -> None:
+        self._on_status = on_status
+        self.plan: FormatPlan | None = None
+
+    def __call__(self, status: DownloadStatus) -> None:
+        if status.plan is not None:
+            self.plan = status.plan
+        if self._on_status is not None:
+            self._on_status(status)
+
+
+@dataclass(frozen=True)
+class _PostRequest:
+    url: str
+    platform: str
+    status: _StatusRelay
+
+
+ProbeCache = dict[Path, MediaInfo | None]
+
+
+async def _probe_cached(path: Path, probes: ProbeCache) -> MediaInfo | None:
+    """Один ffprobe на файл за всю обработку результата."""
+    if path not in probes:
+        probes[path] = await probe_media(path)
+    return probes[path]
 
 
 def _result_with_paths(result: DownloadResult, paths: list[Path]) -> DownloadResult:
@@ -1093,99 +1171,177 @@ def _result_with_paths(result: DownloadResult, paths: list[Path]) -> DownloadRes
     )
 
 
-async def _find_non_h264_videos(paths: Sequence[Path]) -> list[tuple[Path, MediaInfo]]:
+async def _find_non_h264_videos(paths: Sequence[Path], probes: ProbeCache) -> list[tuple[Path, MediaInfo]]:
     """Видеофайлы, у которых по ffprobe кодек не H.264. Кодек берём из файла,
     а не из списка форматов: так закрыты и yt-dlp, и путь через gallery-dl."""
     found = []
     for path in paths:
         if _media_type_for(path) != "video":
             continue
-        info = await probe_media(path)
+        info = await _probe_cached(path, probes)
         if needs_h264_transcode(info):
             found.append((path, info))
     return found
 
 
-def _notify_converting(on_status: Callable[[DownloadStatus], None] | None, eta_sec: float) -> None:
-    if on_status is None:
-        return
+def _notify_converting(
+    on_status: Callable[[DownloadStatus], None], plan: FormatPlan, eta_sec: float
+) -> None:
     try:
-        on_status(DownloadStatus(phase=DownloadPhase.CONVERTING, eta_sec=eta_sec))
+        on_status(DownloadStatus(phase=DownloadPhase.CONVERTING, plan=plan, eta_sec=eta_sec))
     except Exception as exc:
         logger.debug("on_status callback failed: {}", exc)
+
+
+def _converting_plan(known: FormatPlan | None, pending: list[tuple[Path, MediaInfo]]) -> FormatPlan:
+    """План для заголовка статуса: разрешение берём из самого файла, размер —
+    оценка итогового (перекодированный файл тяжелее VP9-источника)."""
+    first_info = pending[0][1]
+    source_bytes = sum(size for _, size in _sized_files([path for path, _ in pending]))
+    base = known or FormatPlan(None, None, None, None)
+    return replace(
+        base,
+        chosen_height=nominal_height(first_info.width, first_info.height),
+        chosen_mb=estimate_output_mb(source_bytes),
+    )
+
+
+async def _tick_converting_status(
+    on_status: Callable[[DownloadStatus], None], plan: FormatPlan, total_sec: float
+) -> None:
+    started_at = time.monotonic()
+    while True:
+        _notify_converting(on_status, plan, max(0.0, total_sec - (time.monotonic() - started_at)))
+        await asyncio.sleep(CONVERT_STATUS_INTERVAL_SEC)
+
+
+@contextlib.asynccontextmanager
+async def _converting_status(
+    on_status: Callable[[DownloadStatus], None], plan: FormatPlan, total_sec: float
+) -> AsyncIterator[None]:
+    """На время перекодирования регулярно обновляет «Ещё ~N мин» (доска статуса
+    рисует последний полученный статус, сама оценку не уменьшает)."""
+    ticker = asyncio.create_task(_tick_converting_status(on_status, plan, total_sec))
+    try:
+        yield
+    finally:
+        ticker.cancel()
+        await asyncio.gather(ticker, return_exceptions=True)
+
+
+async def _transcode_pending(
+    pending: list[tuple[Path, MediaInfo]], replacements: dict[Path, Path], probes: ProbeCache
+) -> None:
+    for path, info in pending:
+        try:
+            replacements[path] = await transcode_to_h264(path, info)
+        finally:
+            probes.pop(path, None)
 
 
 async def _transcode_videos(
     result: DownloadResult,
     pending: list[tuple[Path, MediaInfo]],
-    on_status: Callable[[DownloadStatus], None] | None,
+    request: _PostRequest,
+    probes: ProbeCache,
 ) -> DownloadResult:
     """Перекодирует файлы `pending`; сбой — обычная ошибка скачивания, файлов не остаётся."""
     paths = _result_file_paths(result)
-    _notify_converting(on_status, sum(estimate_transcode_seconds(info) for _, info in pending))
+    own_sec = sum(estimate_transcode_seconds(info) for _, info in pending)
+    plan = _converting_plan(request.status.plan, pending)
     replacements: dict[Path, Path] = {}
     try:
-        for path, info in pending:
-            replacements[path] = await transcode_to_h264(path, info)
+        with transcode_backlog(own_sec) as ahead_sec:
+            async with _converting_status(request.status, plan, ahead_sec + own_sec):
+                await _transcode_pending(pending, replacements, probes)
     except TranscodeError as exc:
         logger.error("Transcode to h264 failed | error={}", exc)
         _remove_files([replacements.get(path, path) for path in paths])
         return DownloadResult(success=False, error_message=TRANSCODE_FAILED_MESSAGE)
+    except asyncio.CancelledError:
+        _remove_files([replacements.get(path, path) for path in paths])
+        raise
     return _result_with_paths(result, [replacements.get(path, path) for path in paths])
 
 
-async def _redownload_as_h264(
-    result: DownloadResult, url: str, platform: str, on_status: Callable[[DownloadStatus], None] | None
+async def _choose_after_refetch(
+    original: DownloadResult, retry: DownloadResult, request: _PostRequest, probes: ProbeCache
 ) -> DownloadResult:
-    """Ролик слишком длинный для перекодирования на этом железе: берём лучший H.264."""
-    logger.info("Video longer than {}s, redownloading as h264 | url={}", TRANSCODE_MAX_DURATION_SEC, mask_secrets(url))
-    _remove_files(_result_file_paths(result))
-    retry = await _download_media_once(url, platform, on_status, h264_only=True)
+    """Что отдать после повторной загрузки: исходник цел, пока H.264 не получен."""
     if not retry.success:
-        return retry
-    return await _convert_instagram_result(retry, url, platform, on_status, h264_only=True)
+        logger.warning("h264 refetch failed, sending the original | url={}", mask_secrets(request.url))
+        return original
+    retry_paths = _result_file_paths(retry)
+    if await _find_non_h264_videos(retry_paths, probes):
+        logger.warning("No h264 available for a long post, sending as is | url={}", mask_secrets(request.url))
+        _remove_files(retry_paths)
+        return original
+    _remove_files(_result_file_paths(original))
+    return retry
+
+
+async def _redownload_as_h264(
+    original: DownloadResult, request: _PostRequest, probes: ProbeCache
+) -> DownloadResult:
+    """Ролик слишком длинный для перекодирования на этом железе: берём лучший H.264.
+
+    Исходник удаляется только после успешной повторной загрузки; повтор — один.
+    """
+    logger.info(
+        "Video longer than {}s, refetching as h264 | url={}", TRANSCODE_MAX_DURATION_SEC, mask_secrets(request.url)
+    )
+    try:
+        retry = await _download_media_once(
+            request.url, request.platform, request.status,
+            h264_only=True, info_json_path=_reusable_info_json(original),
+        )
+        return await _choose_after_refetch(original, retry, request, probes)
+    except asyncio.CancelledError:
+        _remove_files(_result_file_paths(original))
+        raise
 
 
 async def _convert_instagram_result(
-    result: DownloadResult,
-    url: str,
-    platform: str,
-    on_status: Callable[[DownloadStatus], None] | None,
-    h264_only: bool = False,
+    result: DownloadResult, request: _PostRequest, probes: ProbeCache
 ) -> DownloadResult:
     """Гарантирует H.264 во всех видео Instagram: iPhone-клиент Telegram не
     показывает VP9 (картинка стоит на первом кадре).
 
     Предел длительности сравниваем с СУММОЙ видео поста: карусель из десяти
-    роликов не должна давать десятки минут ffmpeg подряд. Короткий пост
-    перекодируем (макс. качество сохраняется), длинный качаем заново ровно один
-    раз в H.264 пониженного разрешения. Если и после этого H.264 нет, отдаём
-    файл как есть (поведение до перекодирования): сверх предела не кодируем.
+    роликов не должна давать десятки минут ffmpeg подряд; неизвестная
+    длительность считается бесконечной. Короткий пост перекодируем (макс.
+    качество сохраняется), длинный пробуем скачать заново в H.264 пониженного
+    разрешения — один раз. Нет H.264 или повтор сорвался — отдаём исходник как
+    есть (поведение до перекодирования): сверх предела не кодируем.
     """
-    pending = await _find_non_h264_videos(_result_file_paths(result))
+    pending = await _find_non_h264_videos(_result_file_paths(result), probes)
     if not pending:
         return result
-    total_duration = sum(info.duration for _, info in pending)
+    total_duration = sum(effective_duration_sec(info) for _, info in pending)
     if total_duration <= TRANSCODE_MAX_DURATION_SEC:
-        return await _transcode_videos(result, pending, on_status)
-    if h264_only:
-        logger.warning(
-            "No h264 available for a long post, sending as is | duration={:.0f}s url={}",
-            total_duration, mask_secrets(url),
-        )
-        return result
-    return await _redownload_as_h264(result, url, platform, on_status)
+        return await _transcode_videos(result, pending, request, probes)
+    return await _redownload_as_h264(result, request, probes)
 
 
-async def _log_download_complete(result: DownloadResult) -> None:
-    """Строка итога: кодек и высота видео нужны, чтобы разбирать жалобы «не играет»."""
+async def _log_download_complete(result: DownloadResult, probes: ProbeCache) -> None:
+    """Строка итога: кодек и высота видео нужны, чтобы разбирать жалобы «не играет».
+    На не-Instagram платформах это единственный ffprobe; на Instagram — из кэша."""
     paths = _result_file_paths(result)
-    info = await probe_media(paths[0]) if _media_type_for(paths[0]) == "video" else None
+    info = await _probe_cached(paths[0], probes) if _media_type_for(paths[0]) == "video" else None
     logger.info(
         "Download complete | files={} total_size={}MB video_codec={} height={}",
         len(paths), result.file_size_mb,
         info.video_codec if info and info.video_codec else "-", info.height if info else "-",
     )
+
+
+async def _finish_download(result: DownloadResult, request: _PostRequest) -> DownloadResult:
+    probes: ProbeCache = {}
+    if result.success and request.platform == "instagram":
+        result = await _convert_instagram_result(result, request, probes)
+    if result.success:
+        await _log_download_complete(result, probes)
+    return result
 
 
 async def download_media(
@@ -1201,9 +1357,10 @@ async def download_media(
     отображения прогресса никогда не должен ронять саму загрузку. Без колбэка
     поведение (таймаут, kill, уборка, ретраи TikTok, тексты ошибок) не меняется.
     """
-    result = await _download_media_once(url, platform, on_status)
-    if result.success and platform == "instagram":
-        result = await _convert_instagram_result(result, url, platform, on_status)
-    if result.success:
-        await _log_download_complete(result)
-    return result
+    request = _PostRequest(url, platform, _StatusRelay(on_status))
+    result = await _download_media_once(url, platform, request.status)
+    info_jsons = [_info_json_path(path) for path in _result_file_paths(result)]
+    try:
+        return await _finish_download(result, request)
+    finally:
+        _remove_files(info_jsons)
