@@ -12,4 +12,6 @@ loguru==0.7.3
 # Extras обязательны: curl-cffi нужен для TikTok и Instagram.
 yt-dlp[default,curl-cffi]==2026.8.19
 # 1.32.11 чинит падение TikTok `_generate_headers`, 1.32.12 — Instagram posts/reels.
-gallery-dl==1.32.12
+# 1.32.16: между 1.32.12 и ней правки Instagram касаются только stories/highlights/
+# user lookup, ломающих изменений для posts/reels, Pinterest и TikTok нет.
+gallery-dl==1.32.16

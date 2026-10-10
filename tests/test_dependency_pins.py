@@ -16,8 +16,8 @@ def _dockerfile_text() -> str:
 
 
 def test_gallery_dl_is_pinned_to_the_version_that_fixes_instagram():
-    # 1.32.11 чинит падение TikTok, 1.32.12 — Instagram posts/reels.
-    assert "gallery-dl==1.32.12" in _requirements()
+    # 1.32.11 чинит падение TikTok, 1.32.12 — Instagram posts/reels; 1.32.16 — актуальная без ломающих правок.
+    assert "gallery-dl==1.32.16" in _requirements()
 
 
 def test_aiogram_is_pinned_exactly():
@@ -254,7 +254,7 @@ def test_installed_versions_match_the_pins():
     """
     from importlib.metadata import version
 
-    assert version("gallery-dl") == "1.32.12"
+    assert version("gallery-dl") == "1.32.16"
     assert version("aiogram") == "3.31.0"
     assert version("SQLAlchemy") == "2.0.52"
     assert version("aiosqlite") == "0.22.1"
