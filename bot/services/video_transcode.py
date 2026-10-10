@@ -13,12 +13,13 @@ import contextlib
 import math
 import os
 import shutil
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 from loguru import logger
 
 from bot.services.media_probe import MediaInfo
+from bot.services.ytdlp_progress import MIB
 
 H264_CODEC_NAME = "h264"
 AAC_CODEC_NAME = "aac"
@@ -28,6 +29,14 @@ AAC_CODEC_NAME = "aac"
 # Ролики длиннее не перекодируем, а качаем в H.264 пониженного разрешения.
 TRANSCODE_MAX_DURATION_SEC = 90
 TRANSCODE_SECONDS_PER_VIDEO_SECOND = 2.5  # с запасом к замеру, для оценки «осталось» в статусе
+# Тонмаппинг HDR (zscale+tonemap на float-кадрах) втрое медленнее обычного
+# перекодирования. Замер 2026-10-10 в jw_downloader:followups-test, 1080x1920 30 fps:
+# 5,9 с на секунду видео (обычное — 1,4–1,7); ревьюер на том же железе: 5,9–6,1.
+HDR_SECONDS_PER_VIDEO_SECOND = 6.5
+# Бюджет времени работы ffmpeg на пост (~3,75 мин): прежние 90 с обычной скорости.
+# С ним сравниваем оценку времени, а не голую длительность, — иначе HDR на 70–90 с
+# уходил бы в таймаут вместо повторной загрузки в H.264.
+TRANSCODE_MAX_WORK_SEC = TRANSCODE_MAX_DURATION_SEC * TRANSCODE_SECONDS_PER_VIDEO_SECOND
 TRANSCODE_TIMEOUT_SEC = 600  # отсчитывается после захвата очереди, а не вместе с ожиданием
 # Загрузки идут под общим Semaphore(3), а libx264 и один занимает все 6 ядер:
 # три параллельных перекодирования по 80–90 с вылетели бы в таймаут. Поэтому
@@ -61,7 +70,6 @@ STDERR_LOG_LIMIT_CHARS = 300
 # Размер перекодированного файла к источнику (замер: VP9 2,06 МБ → H.264 5,92 МБ);
 # нужен только для строки статуса «Готовлю видео…».
 TRANSCODE_OUTPUT_SIZE_RATIO = 3.0
-BYTES_PER_MB = 1024 * 1024
 
 # Семафор создаётся лениво под текущий event loop: asyncio.Semaphore привязывается
 # к циклу при первом ожидании, а циклов в тестах несколько.
@@ -91,7 +99,7 @@ def effective_duration_sec(info: MediaInfo) -> float:
 
 
 def estimate_output_mb(source_bytes: int) -> float:
-    return source_bytes * TRANSCODE_OUTPUT_SIZE_RATIO / BYTES_PER_MB
+    return source_bytes * TRANSCODE_OUTPUT_SIZE_RATIO / MIB
 
 
 @contextlib.contextmanager
@@ -107,7 +115,9 @@ def transcode_backlog(estimate_sec: float) -> Iterator[float]:
 
 
 def estimate_transcode_seconds(info: MediaInfo) -> float:
-    return info.duration * TRANSCODE_SECONDS_PER_VIDEO_SECOND
+    """Оценка времени работы ffmpeg; для неизвестной длительности — бесконечность."""
+    rate = HDR_SECONDS_PER_VIDEO_SECOND if is_hdr(info) else TRANSCODE_SECONDS_PER_VIDEO_SECOND
+    return effective_duration_sec(info) * rate
 
 
 def _video_filter(hdr_transfer: str | None) -> str:
@@ -187,23 +197,46 @@ def _publish_transcoded(temp_path: Path, source: Path) -> Path:
     return final_path
 
 
-async def transcode_to_h264(source: Path, info: MediaInfo) -> Path:
+async def _encode(source: Path, temp_path: Path, info: MediaInfo, hdr_transfer: str | None) -> None:
+    cmd = build_transcode_cmd(
+        source, temp_path, copy_audio=info.audio_codec == AAC_CODEC_NAME, hdr_transfer=hdr_transfer,
+    )
+    await _run_ffmpeg(cmd)
+
+
+async def _encode_with_tonemap_fallback(
+    source: Path, temp_path: Path, info: MediaInfo, on_tonemap_fallback: Callable[[], None] | None
+) -> None:
+    """HDR кодируем с тонмаппингом; если цепочка упала, один раз без него — файл
+    с блёклыми цветами лучше, чем ошибка."""
+    if not is_hdr(info):
+        await _encode(source, temp_path, info, None)
+        return
+    try:
+        await _encode(source, temp_path, info, info.color_transfer)
+    except TranscodeError as exc:
+        logger.warning("Tonemap chain failed, retrying without tonemap | error={}", exc)
+        if on_tonemap_fallback is not None:
+            on_tonemap_fallback()
+        await _encode(source, temp_path, info, None)
+
+
+async def transcode_to_h264(
+    source: Path, info: MediaInfo, on_tonemap_fallback: Callable[[], None] | None = None
+) -> Path:
     """Перекодирует `source` в H.264 и возвращает путь итогового mp4.
 
     Источник заменяется результатом. При любой ошибке временный файл
     убирается, источник остаётся нетронутым, наружу летит `TranscodeError`.
+    `on_tonemap_fallback` вызывается, когда HDR-цепочка упала и идёт повтор без неё.
     """
     temp_path = source.with_name(f"{source.stem}{TRANSCODED_SUFFIX}{OUTPUT_EXTENSION}")
-    cmd = build_transcode_cmd(
-        source, temp_path, copy_audio=info.audio_codec == AAC_CODEC_NAME,
-        hdr_transfer=info.color_transfer if is_hdr(info) else None,
-    )
     logger.info(
-        "Transcoding to h264 | from={} duration={:.1f}s height={}",
-        info.video_codec, info.duration, info.height,
+        "Transcoding to h264 | from={} duration={:.1f}s height={} hdr={}",
+        info.video_codec, info.duration, info.height, is_hdr(info),
     )
     try:
-        await _run_ffmpeg(cmd)
+        await _encode_with_tonemap_fallback(source, temp_path, info, on_tonemap_fallback)
         return _publish_transcoded(temp_path, source)
     except OSError as exc:
         raise TranscodeError(f"не удалось запустить или сохранить перекодирование: {exc}") from exc

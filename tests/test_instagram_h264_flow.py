@@ -7,11 +7,22 @@ info-json и статус перекодирования. Поддельные �
 from __future__ import annotations
 
 import asyncio
+import functools
+import http.server
+import json
+import threading
 from pathlib import Path
 
 from bot.services import downloader, video_transcode
 from bot.services.downloader import DownloadResult, _build_command, download_media
-from bot.services.video_transcode import TRANSCODE_MAX_DURATION_SEC, build_transcode_cmd
+from bot.services.media_probe import MediaInfo
+from bot.services.video_transcode import (
+    HDR_SECONDS_PER_VIDEO_SECOND,
+    TRANSCODE_MAX_DURATION_SEC,
+    TRANSCODE_SECONDS_PER_VIDEO_SECOND,
+    build_transcode_cmd,
+    estimate_transcode_seconds,
+)
 from bot.services.ytdlp_progress import DownloadPhase
 from tests.test_video_transcode import _URL, _calls, _install_tools
 
@@ -152,3 +163,173 @@ async def test_converting_eta_includes_the_queue_ahead(tmp_path, monkeypatch):
     first_eta = next(s.eta_sec for s in first if s.phase is DownloadPhase.CONVERTING)
     second_eta = next(s.eta_sec for s in second if s.phase is DownloadPhase.CONVERTING)
     assert max(first_eta, second_eta) >= 2 * min(first_eta, second_eta) * 0.99
+
+
+# ── I1. HDR медленнее обычного перекодирования ──────────────────────────
+
+TONEMAP_CONSTANTS_BUDGET_SEC = TRANSCODE_MAX_DURATION_SEC * TRANSCODE_SECONDS_PER_VIDEO_SECOND
+HDR_TRANSFER = "smpte2084"
+
+
+def test_hdr_estimate_uses_the_slower_tonemap_rate():
+    sdr = MediaInfo(True, True, 10.0, 1080, 1920, "vp9", "aac", "")
+    hdr = MediaInfo(True, True, 10.0, 1080, 1920, "vp9", "aac", HDR_TRANSFER)
+    assert estimate_transcode_seconds(sdr) == 10.0 * TRANSCODE_SECONDS_PER_VIDEO_SECOND
+    assert estimate_transcode_seconds(hdr) == 10.0 * HDR_SECONDS_PER_VIDEO_SECOND
+
+
+async def test_long_hdr_post_is_refetched_while_same_length_sdr_is_transcoded(tmp_path, monkeypatch):
+    duration = str(int(TONEMAP_CONSTANTS_BUDGET_SEC / HDR_SECONDS_PER_VIDEO_SECOND) + 10)
+    (tmp_path / "hdr").mkdir()
+    (tmp_path / "sdr").mkdir()
+    _dl_dir, hdr_log = _install_tools(tmp_path / "hdr", monkeypatch, codec="vp9", duration=duration, transfer=HDR_TRANSFER)
+    await download_media(_URL, "instagram")
+    assert "ffmpeg" not in _calls(hdr_log)
+    assert len([c for c in _calls(hdr_log) if c.startswith("ytdlp")]) == 2
+
+    _dl_dir, sdr_log = _install_tools(tmp_path / "sdr", monkeypatch, codec="vp9", duration=duration)
+    await download_media(_URL, "instagram")
+    assert _calls(sdr_log).count("ffmpeg") == 1
+
+
+async def test_failed_tonemap_is_retried_once_without_tonemap(tmp_path, monkeypatch):
+    _dl_dir, log = _install_tools(
+        tmp_path, monkeypatch, codec="vp9", duration="8.4", transfer=HDR_TRANSFER, fail_on_tonemap=True,
+    )
+    result = await download_media(_URL, "instagram")
+    assert result.success is True
+    assert _calls(log).count("ffmpeg") == 2
+    assert Path(result.file_path).read_text().startswith("h264")
+
+
+async def test_failed_tonemap_and_failed_retry_is_a_normal_download_error(tmp_path, monkeypatch):
+    dl_dir, log = _install_tools(
+        tmp_path, monkeypatch, codec="vp9", duration="8.4", transfer=HDR_TRANSFER, ffmpeg_fails=True,
+    )
+    result = await download_media(_URL, "instagram")
+    assert result.success is False
+    assert _calls(log).count("ffmpeg") == 2
+    assert list(dl_dir.iterdir()) == []
+
+
+async def test_status_countdown_is_reset_to_the_cheaper_estimate_after_tonemap_fallback(tmp_path, monkeypatch):
+    monkeypatch.setattr(downloader, "CONVERT_STATUS_INTERVAL_SEC", 0.1)
+    monkeypatch.setattr(video_transcode, "HDR_SECONDS_PER_VIDEO_SECOND", 100.0)
+    monkeypatch.setattr(downloader, "TRANSCODE_MAX_WORK_SEC", 10_000.0)
+    monkeypatch.setattr(video_transcode, "TRANSCODE_SECONDS_PER_VIDEO_SECOND", 1.0)
+    _install_tools(
+        tmp_path, monkeypatch, codec="vp9", duration="8.4", transfer=HDR_TRANSFER,
+        fail_on_tonemap=True, ffmpeg_sleep=0.4,
+    )
+    statuses = []
+    await download_media(_URL, "instagram", statuses.append)
+    etas = [s.eta_sec for s in statuses if s.phase is DownloadPhase.CONVERTING]
+    assert etas[0] > 500
+    assert etas[-1] < 20
+
+
+# ── I2. нечитаемый повтор не заменяет исходник ──────────────────────────
+
+async def test_unreadable_refetch_does_not_replace_the_original(tmp_path, monkeypatch):
+    dl_dir, _log = _install_tools(tmp_path, monkeypatch, codec="vp9", duration=LONG_DURATION, retry_codec="broken")
+    result = await download_media(_URL, "instagram")
+    assert result.success is True
+    assert Path(result.file_path).read_text().startswith("vp9")
+    assert _file_texts(dl_dir) == ["vp9"]
+
+
+# ── M1. info-json не остаётся на диске ──────────────────────────────────
+
+def test_playlist_metafiles_are_not_written():
+    cmd = _build_command(_URL, "instagram", Path("/tmp/o.%(ext)s"), None)
+    assert "--no-write-playlist-metafiles" in cmd
+
+
+async def test_info_json_is_removed_when_ytdlp_found_no_media_and_gallery_dl_took_over(tmp_path, monkeypatch):
+    dl_dir, _log = _install_tools(tmp_path, monkeypatch, codec="h264", duration="8.4", json_without_media=True)
+    result = await download_media(_URL, "instagram")
+    assert result.success is True
+    assert not list(dl_dir.glob("*.json"))
+
+
+async def test_info_json_of_every_playlist_item_is_removed(tmp_path, monkeypatch):
+    dl_dir, _log = _install_tools(tmp_path, monkeypatch, codec="h264", duration="8.4", files_count=3)
+    result = await download_media(_URL, "instagram")
+    assert result.success is True
+    assert not list(dl_dir.glob("*.json"))
+
+
+# ── M5. без H.264 повтор не качает VP9 второй раз ───────────────────────
+
+def test_h264_only_selector_has_no_catch_all_tail():
+    assert not downloader.INSTAGRAM_H264_ONLY_SELECTOR.endswith("/bv*+ba/b")
+
+
+class _CountingHandler(http.server.BaseHTTPRequestHandler):
+    hits: list[str] = []
+
+    def do_GET(self):
+        type(self).hits.append(self.path)
+        self.send_response(404)
+        self.end_headers()
+
+    def log_message(self, *args):
+        pass
+
+
+async def test_refetch_without_any_h264_format_downloads_nothing(tmp_path, monkeypatch):
+    """Реальный yt-dlp на info-json, где есть только VP9: команда завершается чисто,
+    ничего не качается, `_choose_after_refetch` отдаёт исходник."""
+    _CountingHandler.hits = []
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _CountingHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    info = {
+        "id": "x", "title": "t", "extractor": "instagram", "extractor_key": "Instagram", "webpage_url": base,
+        "duration": 150,
+        "formats": [
+            {"format_id": "vp9", "url": f"{base}/v", "ext": "mp4", "protocol": "https", "vcodec": "vp09.00.40.08",
+             "acodec": "none", "width": 1080, "height": 1920, "fps": 30},
+            {"format_id": "aud", "url": f"{base}/a", "ext": "m4a", "protocol": "https", "vcodec": "none",
+             "acodec": "mp4a.40.5"},
+        ],
+    }
+    info_json = tmp_path / "orig.info.json"
+    info_json.write_text(json.dumps(info))
+    monkeypatch.setattr(downloader, "DOWNLOAD_DIR", tmp_path / "dl")
+    try:
+        retry = await downloader._download_media_once(
+            _URL, "instagram", None, h264_only=True, info_json_path=info_json,
+        )
+    finally:
+        server.shutdown()
+    assert retry.success is False
+    assert _CountingHandler.hits == []
+    assert not list((tmp_path / "dl").iterdir())
+
+
+# ── M8. метка качества соответствует отправляемому файлу ────────────────
+
+def _last_plan_height(statuses):
+    return [s.plan.chosen_height for s in statuses if s.plan is not None][-1]
+
+
+async def test_quality_label_returns_to_the_original_when_refetch_fails(tmp_path, monkeypatch):
+    _install_tools(tmp_path, monkeypatch, codec="vp9", duration=LONG_DURATION, retry_fails=True)
+    statuses = []
+    await download_media(_URL, "instagram", statuses.append)
+    assert _last_plan_height(statuses) == 1080
+
+
+async def test_quality_label_returns_to_the_original_when_refetch_is_rejected(tmp_path, monkeypatch):
+    _install_tools(tmp_path, monkeypatch, codec="vp9", duration=LONG_DURATION, retry_codec="vp9")
+    statuses = []
+    await download_media(_URL, "instagram", statuses.append)
+    assert _last_plan_height(statuses) == 1080
+
+
+async def test_quality_label_follows_an_accepted_refetch(tmp_path, monkeypatch):
+    _install_tools(tmp_path, monkeypatch, codec="vp9", duration=LONG_DURATION)
+    statuses = []
+    await download_media(_URL, "instagram", statuses.append)
+    assert _last_plan_height(statuses) == 720

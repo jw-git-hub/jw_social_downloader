@@ -107,13 +107,19 @@ with log.open("a") as handle:
     handle.write("ytdlp " + argv[argv.index("-f") + 1] + "\\n")
     if "--load-info-json" in argv:
         handle.write("loaded-info-json\\n")
-if {retry_fails!r} and "vcodec!^=?vp" in argv[argv.index("-f") + 1]:
+is_retry = "vcodec!^=?vp" in argv[argv.index("-f") + 1]
+print('JWPLAN {{"width": %d, "height": %d}}\t[]' % ((720, 1280) if is_retry else (1080, 1920)), flush=True)
+if {retry_fails!r} and is_retry:
     sys.stderr.write("ERROR: boom")
     sys.exit(1)
-codec = {retry_codec!r} if "vcodec!^=?vp" in argv[argv.index("-f") + 1] else {codec!r}
+codec = {retry_codec!r} if is_retry else {codec!r}
 for index in range({files_count!r}):
     template = argv[argv.index("-o") + 1].replace("%(playlist_index)s", str(index)).replace("%(ext)s", "mp4")
-    pathlib.Path(template).write_text(codec + " " + {duration!r})
+    if {json_without_media!r} and not is_retry:
+        pathlib.Path(template).with_suffix(".info.json").write_text("{{}}")
+        sys.stderr.write("ERROR: no formats")
+        sys.exit(1)
+    pathlib.Path(template).write_text(codec + " " + {duration!r} + " " + {transfer!r})
     if "--write-info-json" in argv:
         pathlib.Path(template).with_suffix(".info.json").write_text("{{}}")
 """
@@ -128,16 +134,20 @@ if merged and {retry_fails!r}:
     sys.exit(1)
 name = argv[argv.index("-f") + 1].replace("{{num}}", "1").replace("{{id|filename|num}}", "x").replace("{{extension}}", "mp4")
 codec = {retry_codec!r} if merged else {codec!r}
-(pathlib.Path(argv[argv.index("-D") + 1]) / name).write_text(codec + " " + {duration!r})
+(pathlib.Path(argv[argv.index("-D") + 1]) / name).write_text(codec + " " + {duration!r} + " " + {transfer!r})
 """
 
 _FAKE_FFPROBE = """#!{python}
 import json, pathlib, sys
 with pathlib.Path({log!r}).open("a") as handle:
     handle.write("ffprobe\\n")
-codec, duration = pathlib.Path(sys.argv[-1]).read_text().split()
+parts = pathlib.Path(sys.argv[-1]).read_text().split()
+codec, duration = parts[:2]
+transfer = parts[2] if len(parts) > 2 else "unknown"
+if codec == "broken":
+    sys.exit(1)
 print(json.dumps({{"streams": [
-    {{"codec_type": "video", "codec_name": codec, "width": 1080, "height": 1920}},
+    {{"codec_type": "video", "codec_name": codec, "width": 1080, "height": 1920, "color_transfer": transfer}},
     {{"codec_type": "audio", "codec_name": "aac"}}],
   "format": {{"duration": duration}}}}))
 """
@@ -150,18 +160,19 @@ with pathlib.Path({log!r}).open("a") as handle:
 time.sleep({ffmpeg_sleep!r})
 with pathlib.Path({log!r}).open("a") as handle:
     handle.write("ffmpeg_end\\n")
-if {fail!r}:
+if {fail!r} or ({fail_on_tonemap!r} and "zscale" in argv[argv.index("-vf") + 1]):
     sys.stderr.write("boom")
     sys.exit(1)
 source = pathlib.Path(argv[argv.index("-i") + 1])
 duration = source.read_text().split()[1]
-pathlib.Path(argv[-1]).write_text("h264 " + duration)
+pathlib.Path(argv[-1]).write_text("h264 " + duration + " unknown")
 """
 
 
 def _install_tools(
     tmp_path, monkeypatch, *, codec: str, duration: str, ffmpeg_fails: bool = False,
     retry_codec: str = "h264", files_count: int = 1, ffmpeg_sleep: float = 0.0, retry_fails: bool = False,
+    transfer: str = "unknown", json_without_media: bool = False, fail_on_tonemap: bool = False,
 ):
     bin_dir, dl_dir = tmp_path / "bin", tmp_path / "downloads"
     bin_dir.mkdir()
@@ -171,13 +182,16 @@ def _install_tools(
         "yt-dlp": _FAKE_YTDLP.format(
             python=sys.executable, log=str(log), codec=codec, duration=duration,
             retry_codec=retry_codec, files_count=files_count, retry_fails=retry_fails,
+            transfer=transfer, json_without_media=json_without_media,
         ),
         "gallery-dl": _FAKE_GALLERY_DL.format(
             python=sys.executable, log=str(log), codec=codec, duration=duration, retry_codec=retry_codec,
-            retry_fails=retry_fails,
+            retry_fails=retry_fails, transfer=transfer,
         ),
         "ffprobe": _FAKE_FFPROBE.format(python=sys.executable, log=str(log)),
-        "ffmpeg": _FAKE_FFMPEG.format(python=sys.executable, log=str(log), fail=ffmpeg_fails, ffmpeg_sleep=ffmpeg_sleep),
+        "ffmpeg": _FAKE_FFMPEG.format(python=sys.executable, log=str(log), fail=ffmpeg_fails, ffmpeg_sleep=ffmpeg_sleep,
+            fail_on_tonemap=fail_on_tonemap,
+        ),
     }
     for name, body in scripts.items():
         (bin_dir / name).write_text(body)
