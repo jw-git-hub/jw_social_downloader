@@ -33,6 +33,7 @@ from bot.db.free_quota import free_quota_status
 from bot.db.models import EXTRA_INDEX_DDL, Base, FreeDownload, User
 from bot.services.downloader import DownloadResult
 from bot.utils.log_guard import setup_logging
+from tests.fake_bot import FakeBot
 
 # Реальная ссылка, которую parse_url распознаёт как TikTok — handle_url не
 # должен уйти в ветку "это не похоже на ссылку" ни в одном сценарии.
@@ -91,6 +92,7 @@ class _FakeMessage:
         self.caption = caption
         self.from_user = _FakeUser(uid)
         self.chat = SimpleNamespace(id=uid)
+        self.bot = FakeBot()
         self.reply_calls: list[str] = []
         self.answer_calls: list[tuple[str, object]] = []
         self.reply_raises = reply_raises

@@ -18,6 +18,7 @@ from bot.services import disk_space, downloader
 from bot.services.downloader import DownloadResult
 from bot.services.media_probe import MediaInfo
 from bot.services.progress_texts import PREPARING_TEXT
+from tests.fake_bot import FakeBot
 from tests.test_user_handle_url import TEST_URL, _free_downloads_left, _make_session_maker, _seed_user
 
 _METHOD = SendMessage(chat_id=1, text="x")
@@ -57,6 +58,7 @@ class _FakeSendSafetyMessage:
     ) -> None:
         self.from_user = SimpleNamespace(id=uid, username="tester", full_name="Test User")
         self.chat = SimpleNamespace(id=uid)
+        self.bot = FakeBot()
         self.reply_calls: list[str] = []
         self.answer_calls: list[tuple[str, object]] = []
         self.reply_video_calls: list[dict] = []

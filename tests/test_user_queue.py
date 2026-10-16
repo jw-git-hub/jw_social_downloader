@@ -26,6 +26,7 @@ from bot.services.downloader import DownloadResult
 from bot.services.progress_texts import PREPARING_TEXT
 from bot.services.queue_texts import queue_status_text
 from bot.services.status_board import StatusBoard
+from tests.fake_bot import FakeBot
 from tests.test_user_handle_url import _free_downloads_left, _make_session_maker, _seed_user
 
 # Тесты ждут не фиксированным `sleep`, а опросом `_wait_until` — контейнер
@@ -84,6 +85,7 @@ class _FakeMessage:
     def __init__(self, uid: int, text: str) -> None:
         self.from_user = SimpleNamespace(id=uid, username="tester", full_name="Test User")
         self.chat = SimpleNamespace(id=uid)
+        self.bot = FakeBot()
         self.text = text
         self.caption = None
         self.reply_calls: list[tuple[str, dict]] = []

@@ -17,6 +17,7 @@ from types import SimpleNamespace
 from bot.handlers.user import _media_caption, _process_download
 from bot.services.downloader import DownloadResult
 from bot.services.media_probe import MediaInfo
+from tests.fake_bot import FakeBot
 from tests.test_user_handle_url import TEST_URL, _make_session_maker, _seed_user
 
 
@@ -38,6 +39,7 @@ class _FakeMediaMessage:
     def __init__(self, uid: int) -> None:
         self.from_user = SimpleNamespace(id=uid, username="tester", full_name="Test User")
         self.chat = SimpleNamespace(id=uid)
+        self.bot = FakeBot()
         self.reply_calls: list[str] = []
         self.answer_calls: list[tuple[str, object]] = []
         self.animation_calls: list[tuple[str, str | None]] = []

@@ -7,6 +7,7 @@ from bot.services.progress_texts import (
     QUEUED_TEXT,
     download_status_text,
     downgrade_note,
+    format_elapsed,
     format_eta,
     format_size,
     limit_line,
@@ -194,6 +195,55 @@ def test_upload_status_text_unknown_size_skips_size_part():
 def test_upload_status_text_carries_downgrade_note():
     text = upload_status_text(HOURLY_PLAN, size_mb=888.8, elapsed_sec=None, expected_sec=None, limit_mb=1500)
     assert "весит от" in text
+
+
+# ── счётчик «идёт N с» ──
+
+
+def test_format_elapsed_seconds_and_minutes():
+    assert format_elapsed(15) == "15 с"
+    assert format_elapsed(59.9) == "59 с"
+    assert format_elapsed(60) == "1 мин 00 с"
+    assert format_elapsed(65) == "1 мин 05 с"
+    assert format_elapsed(125) == "2 мин 05 с"
+
+
+def test_upload_status_text_small_file_shows_elapsed_counter():
+    text = upload_status_text(None, size_mb=2.0, elapsed_sec=15, expected_sec=None, limit_mb=1500)
+    assert "Отправляю в Telegram · 2 МБ · идёт 15 с" in text
+
+
+def test_upload_status_text_small_file_counter_switches_to_minutes():
+    text = upload_status_text(None, size_mb=2.0, elapsed_sec=65, expected_sec=None, limit_mb=1500)
+    assert "идёт 1 мин 05 с" in text
+
+
+def test_upload_status_text_hides_counter_at_the_very_start():
+    text = upload_status_text(None, size_mb=2.0, elapsed_sec=0.4, expected_sec=None, limit_mb=1500)
+    assert "идёт" not in text
+
+
+def test_upload_status_text_with_bar_has_no_counter():
+    text = upload_status_text(FOUR_K_PLAN, size_mb=904.1, elapsed_sec=60, expected_sec=188, limit_mb=1500)
+    assert "идёт" not in text
+
+
+def test_download_status_text_without_status_shows_elapsed_counter():
+    text = download_status_text(None, limit_mb=1500, elapsed_sec=15)
+    assert "Готовлю загрузку… · идёт 15 с" in text
+    assert "покажу, сколько осталось" in text
+
+
+def test_download_status_text_without_elapsed_is_plain_preparing_text():
+    assert download_status_text(None, limit_mb=1500) == PREPARING_TEXT
+    assert download_status_text(None, limit_mb=1500, elapsed_sec=0.4) == PREPARING_TEXT
+
+
+def test_download_status_text_with_progress_ignores_elapsed():
+    status = DownloadStatus(DownloadPhase.DOWNLOADING, FOUR_K_PLAN, 0.5, 450.0, 60.0)
+    text = download_status_text(status, limit_mb=1500, elapsed_sec=90)
+    assert "идёт" not in text
+    assert text == download_status_text(status, limit_mb=1500)
 
 
 # ── приветствие/помощь ──

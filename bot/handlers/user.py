@@ -11,6 +11,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 import aiohttp
 from aiogram import F, Router
+from aiogram.enums import ChatAction
 from aiogram.exceptions import (
     TelegramBadRequest,
     TelegramEntityTooLarge,
@@ -46,6 +47,7 @@ from bot.keyboards.inline import (
     get_status_kb,
     get_subscribe_kb,
 )
+from bot.services.chat_action import ChatActionLoop
 from bot.services.cleanup import remove_file
 from bot.services.disk_space import has_free_space
 from bot.services.download_queue import Admission, DownloadQueue, MAX_LINKS_PER_USER, QueueTicket
@@ -79,6 +81,15 @@ download_queue = DownloadQueue()
 upload_rate = UploadRateTracker()
 # Меньше — отправка занимает секунды, полоска прогресса не успевает быть полезной.
 UPLOAD_PROGRESS_MIN_MB = 50
+# Диагностика скорости: выгрузка от 1 МБ медленнее 0,3 МБ/с — повод заглянуть в
+# сеть (path MTU, NAT), а не в код. Мелкие файлы не показательны: их время
+# целиком уходит на рукопожатие.
+SLOW_UPLOAD_MIN_SIZE_MB = 1.0
+SLOW_UPLOAD_MAX_SPEED_MB_PER_SEC = 0.3
+# Что Telegram показывает в шапке чата, пока бот отправляет файл.
+CHAT_ACTION_BY_MEDIA_KIND = {"video": ChatAction.UPLOAD_VIDEO, "image": ChatAction.UPLOAD_PHOTO}
+DEFAULT_UPLOAD_CHAT_ACTION = ChatAction.UPLOAD_DOCUMENT
+BYTES_PER_MB = 1024 * 1024
 
 # Кто нажал «Скачать видео» и ещё не прислал ссылку. Раньше был set, который
 # рос до конца жизни процесса: ушедшего пользователя из него ничто не убирало.
@@ -396,8 +407,41 @@ async def _handle_send_failure(exc: BaseException, elapsed: float, attempt: int)
     raise exc
 
 
-async def _send_with_retry(send_coro_factory):
+def _files_size_mb(paths: list[str]) -> float:
+    """Суммарный размер файлов на диске, МБ; недоступный файл считается нулём."""
+    total_bytes = 0
+    for path in paths:
+        try:
+            total_bytes += os.path.getsize(path)
+        except OSError:
+            continue
+    return total_bytes / BYTES_PER_MB
+
+
+def _log_send_finished(elapsed: float, attempt: int, size_mb: float | None) -> None:
+    """Итог успешной отправки; со скоростью, если известен размер, и
+    предупреждением, если выгрузка подозрительно медленная."""
+    if size_mb is None or elapsed <= 0:
+        logger.info("Отправка в Telegram завершена | elapsed={:.1f}s attempt={}", elapsed, attempt + 1)
+        return
+    speed = size_mb / elapsed
+    logger.info(
+        "Отправка в Telegram завершена | elapsed={:.1f}s attempt={} size={:.1f} МБ speed={:.2f} МБ/с",
+        elapsed, attempt + 1, size_mb, speed,
+    )
+    if size_mb >= SLOW_UPLOAD_MIN_SIZE_MB and speed < SLOW_UPLOAD_MAX_SPEED_MB_PER_SEC:
+        logger.warning(
+            "Медленная выгрузка в Telegram | size={:.1f} МБ speed={:.2f} МБ/с "
+            "(порог {} МБ/с) elapsed={:.1f}s attempt={}",
+            size_mb, speed, SLOW_UPLOAD_MAX_SPEED_MB_PER_SEC, elapsed, attempt + 1,
+        )
+
+
+async def _send_with_retry(send_coro_factory, size_mb: float | None = None):
     """Выполняет send_coro_factory() с ретраем при временных сетевых сбоях.
+
+    size_mb — размер отправляемого (для альбома — сумма): нужен только логу,
+    чтобы вычислить скорость выгрузки.
 
     Классификация исхода — bot.services.sending.classify_send_failure:
     TelegramEntityTooLarge никогда не ретраится, а обрыв дольше
@@ -412,10 +456,7 @@ async def _send_with_retry(send_coro_factory):
         except _RETRYABLE_SEND_ERRORS as e:
             await _handle_send_failure(e, time.monotonic() - started, attempt)
             continue
-        logger.info(
-            "Отправка в Telegram завершена | elapsed={:.1f}s attempt={}",
-            time.monotonic() - started, attempt + 1,
-        )
+        _log_send_finished(time.monotonic() - started, attempt, size_mb)
         return result
 
 
@@ -538,6 +579,8 @@ async def _download_with_progress(
     Последний статус от `download_media` хранится в замыкании — рендер,
     вызываемый тикером доски, каждый раз читает именно его, а не спрашивает
     yt-dlp напрямую (обновления приходят синхронно из цикла чтения stdout).
+    Счётчик «идёт N с» в тексте подготовки считается от получения слота
+    семафора: gallery-dl статусов не шлёт, и без него строка не меняется.
     """
     latest: DownloadStatus | None = None
 
@@ -548,10 +591,13 @@ async def _download_with_progress(
     if download_semaphore.locked():
         await board.show(QUEUED_TEXT)
 
-    def render() -> str:
-        return download_status_text(latest, settings.MAX_FILE_SIZE_MB)
-
     async with download_semaphore:
+        started = time.monotonic()
+
+        def render() -> str:
+            elapsed = time.monotonic() - started
+            return download_status_text(latest, settings.MAX_FILE_SIZE_MB, elapsed)
+
         async with board.ticking(render):
             dl_result = await download_media(url, platform, on_status=remember)
 
@@ -574,17 +620,29 @@ def _upload_renderer(dl_result: DownloadResult, plan: FormatPlan | None) -> Call
     захваченный на момент вызова объект): тесты подменяют `U.time` целиком."""
     limit_mb = settings.MAX_FILE_SIZE_MB
     size_mb = dl_result.file_size_mb
-    if not _wants_upload_progress(dl_result):
-        return lambda: upload_status_text(plan, size_mb, None, None, limit_mb)
-
-    expected = upload_rate.expected_seconds(size_mb)
     started = time.monotonic()
+    expected = upload_rate.expected_seconds(size_mb) if _wants_upload_progress(dl_result) else None
 
     def render() -> str:
         elapsed = time.monotonic() - started
         return upload_status_text(plan, size_mb, elapsed, expected, limit_mb)
 
     return render
+
+
+def _chat_action_name(dl_result: DownloadResult) -> ChatAction:
+    """Что показывать в шапке чата: видео, фото или файл. Для альбома —
+    по первому элементу (как его увидит получатель)."""
+    if dl_result.file_paths and len(dl_result.file_paths) > 1:
+        media_kind = _classify(dl_result.file_paths[0])
+    else:
+        media_kind = dl_result.media_type
+    return CHAT_ACTION_BY_MEDIA_KIND.get(media_kind, DEFAULT_UPLOAD_CHAT_ACTION)
+
+
+def _upload_chat_action(message: Message, dl_result: DownloadResult) -> ChatActionLoop:
+    """«Отправляет видео…» в шапке чата, пока файл уходит в Telegram."""
+    return ChatActionLoop(message.bot, message.chat.id, _chat_action_name(dl_result))
 
 
 def _video_meta(info: MediaInfo | None) -> dict[str, int]:
@@ -1054,7 +1112,9 @@ async def _execute_download(job: _DownloadJob) -> None:
     # успеха лежала внутри, и её падение откатывало инкремент и success-лог, а
     # управление уходило в except, который писал status="failed" и показывал
     # «Ошибка при отправке», хотя медиа уже было доставлено.
+    chat_action = _upload_chat_action(message, dl_result)
     try:
+        chat_action.start()
         if dl_result.file_paths and len(dl_result.file_paths) > 1:
             # Карусель — media group чанками по MEDIA_GROUP_CHUNK_SIZE.
             # Вне альбома идут: анимации (Telegram не смешивает их с фото и
@@ -1088,11 +1148,13 @@ async def _execute_download(job: _DownloadJob) -> None:
                     cap = caption if not first_media_captioned else None
                     if kind == "image":
                         await _send_with_retry(
-                            lambda ff=f, c=cap: message.reply_photo(photo=ff, caption=c)
+                            lambda ff=f, c=cap: message.reply_photo(photo=ff, caption=c),
+                            _files_size_mb([path_str]),
                         )
                     else:
                         await _send_with_retry(
-                            lambda ff=f, c=cap: message.reply_video(video=ff, caption=c)
+                            lambda ff=f, c=cap: message.reply_video(video=ff, caption=c),
+                            _files_size_mb([path_str]),
                         )
                     first_media_captioned = True
                     media_sent_count += 1
@@ -1107,7 +1169,8 @@ async def _execute_download(job: _DownloadJob) -> None:
                             media_group.append(InputMediaVideo(media=f, caption=cap))
                         first_media_captioned = True
                     await _send_with_retry(
-                        lambda mg=media_group: message.reply_media_group(media=mg)
+                        lambda mg=media_group: message.reply_media_group(media=mg),
+                        _files_size_mb([sendable_path for sendable_path, _ in sendable]),
                     )
                     media_sent_count += len(media_group)
 
@@ -1116,34 +1179,40 @@ async def _execute_download(job: _DownloadJob) -> None:
                     cap = caption if not first_media_captioned else None
                     if kind == "animation":
                         await _send_with_retry(
-                            lambda ff=f, c=cap: message.reply_animation(animation=ff, caption=c)
+                            lambda ff=f, c=cap: message.reply_animation(animation=ff, caption=c),
+                            _files_size_mb([path_str]),
                         )
                     else:
                         await _send_with_retry(
-                            lambda ff=f, c=cap: message.reply_document(document=ff, caption=c)
+                            lambda ff=f, c=cap: message.reply_document(document=ff, caption=c),
+                            _files_size_mb([path_str]),
                         )
                     first_media_captioned = True
                     media_sent_count += 1
         else:
             media = FSInputFile(dl_result.file_path)
+            media_size_mb = dl_result.file_size_mb
             if dl_result.media_type == "animation":
                 await _send_with_retry(
                     lambda: message.reply_animation(
                         animation=media, caption=_media_caption(platform, "animation")
-                    )
+                    ),
+                    media_size_mb,
                 )
             elif dl_result.media_type == "image":
                 if dl_result.file_size_mb and dl_result.file_size_mb > 10:
                     await _send_with_retry(
                         lambda: message.reply_document(
                             document=media, caption=_media_caption(platform, "image")
-                        )
+                        ),
+                        media_size_mb,
                     )
                 else:
                     await _send_with_retry(
                         lambda: message.reply_photo(
                             photo=media, caption=_media_caption(platform, "image")
-                        )
+                        ),
+                        media_size_mb,
                     )
             else:
                 # Беззвучное короткое видео (например, Pinterest-пин) —
@@ -1169,7 +1238,8 @@ async def _execute_download(job: _DownloadJob) -> None:
                     await _send_with_retry(
                         lambda: message.reply_animation(
                             animation=media, caption=_media_caption(platform, "animation")
-                        )
+                        ),
+                        media_size_mb,
                     )
                 else:
                     video_meta = _video_meta(probe_info)
@@ -1179,7 +1249,8 @@ async def _execute_download(job: _DownloadJob) -> None:
                             caption=_media_caption(platform, "video"),
                             supports_streaming=True,
                             **video_meta,
-                        )
+                        ),
+                        media_size_mb,
                     )
             media_sent_count = 1
     except ProbablyDeliveredError:
@@ -1199,6 +1270,7 @@ async def _execute_download(job: _DownloadJob) -> None:
         send_error = e
         logger.error(f"Failed to send file: {e}")
     finally:
+        chat_action.stop()
         await board.stop_ticking()
         for p in dl_result.all_paths():
             await remove_file(p)

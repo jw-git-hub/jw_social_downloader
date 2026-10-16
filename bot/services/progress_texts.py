@@ -23,6 +23,7 @@ BAR_EMPTY = "▱"
 BAR_PERCENT_GAP = "  "  # два пробела между шкалой и процентом — для воздуха
 PERCENT = 100
 SECONDS_PER_MINUTE = 60
+ELAPSED_SHOWN_FROM_SEC = 1  # раньше счётчик показывал бы «идёт 0 с» в первом же сообщении
 UPLOAD_FRACTION_CAP = 0.95  # дальше — «почти готово», без конкретного процента
 _TIER_NAMES = {4320: "8K", 2160: "4K"}
 
@@ -31,10 +32,9 @@ MERGE_TITLE = "Собираю видео и звук"
 CONVERT_TITLE = "Готовлю видео для всех устройств"
 UPLOAD_TITLE = "Отправляю в Telegram"
 
-PREPARING_TEXT = (
-    "<b>Готовлю загрузку…</b>\n"
-    "Большое видео качается несколько минут — покажу, сколько осталось."
-)
+PREPARING_TITLE = "Готовлю загрузку…"
+PREPARING_BODY = "Большое видео качается несколько минут — покажу, сколько осталось."
+PREPARING_TEXT = f"<b>{PREPARING_TITLE}</b>\n{PREPARING_BODY}"
 QUEUED_TEXT = (
     "<b>Жду своей очереди</b>\n"
     "Сейчас качаю другие ролики — начну, как только освободится место."
@@ -47,6 +47,22 @@ def format_size(mb: float) -> str:
         return f"{max(1, round(mb))} МБ"
     gib_value = f"{mb / MIB_PER_GIB:.1f}".replace(".", DECIMAL_SEPARATOR)
     return f"{gib_value} ГБ"
+
+
+def format_elapsed(seconds: float) -> str:
+    """15 → «15 с», 65 → «1 мин 05 с»."""
+    whole_seconds = int(seconds)
+    minutes, rest = divmod(whole_seconds, SECONDS_PER_MINUTE)
+    if minutes == 0:
+        return f"{rest} с"
+    return f"{minutes} мин {rest:02d} с"
+
+
+def _elapsed_part(elapsed_sec: float | None) -> str | None:
+    """«идёт 15 с» — или None, пока этап только начался (или время неизвестно)."""
+    if elapsed_sec is None or elapsed_sec < ELAPSED_SHOWN_FROM_SEC:
+        return None
+    return f"идёт {format_elapsed(elapsed_sec)}"
 
 
 def quality_short(height: int) -> str:
@@ -95,14 +111,24 @@ def downgrade_note(plan: FormatPlan | None, limit_mb: int) -> str | None:
     )
 
 
-def _title(title: str, height: int | None, size_mb: float | None) -> str:
-    """Заголовок статуса, пропуская неизвестные качество/размер."""
+def _title(
+    title: str, height: int | None, size_mb: float | None, elapsed_sec: float | None = None
+) -> str:
+    """Заголовок статуса, пропуская неизвестные качество/размер/время этапа."""
     parts = [title]
     if height is not None:
         parts.append(quality_label(height))
     if size_mb is not None:
         parts.append(format_size(size_mb))
+    elapsed_part = _elapsed_part(elapsed_sec)
+    if elapsed_part is not None:
+        parts.append(elapsed_part)
     return f"<b>{' · '.join(parts)}</b>"
+
+
+def _preparing_text(elapsed_sec: float | None) -> str:
+    """Подготовка без плана: к заголовку добавляется счётчик, тело то же."""
+    return f"{_title(PREPARING_TITLE, None, None, elapsed_sec)}\n{PREPARING_BODY}"
 
 
 def _append_note(text: str, plan: FormatPlan | None, limit_mb: int) -> str:
@@ -122,14 +148,18 @@ def _download_progress_line(status: DownloadStatus) -> str:
     return f"{progress_bar(0.0)}{BAR_PERCENT_GAP}0%"
 
 
-def download_status_text(status: DownloadStatus | None, limit_mb: int) -> str:
+def download_status_text(
+    status: DownloadStatus | None, limit_mb: int, elapsed_sec: float | None = None
+) -> str:
     """Текст статуса на фазах подготовки/скачивания/склейки.
 
     `None` (ролик через gallery-dl, колбэк ни разу не позвал) и «подготовка
-    без плана» — один и тот же текст `PREPARING_TEXT`.
+    без плана» — один и тот же текст подготовки; у него (и только у него)
+    есть счётчик «идёт N с» от `elapsed_sec` — иначе строка висит неизменной
+    и кажется зависшей. Без `elapsed_sec` это ровно `PREPARING_TEXT`.
     """
     if status is None or (status.phase is DownloadPhase.PREPARING and status.plan is None):
-        return PREPARING_TEXT
+        return _preparing_text(elapsed_sec)
 
     plan = status.plan
     height = plan.chosen_height if plan else None
@@ -166,11 +196,15 @@ def upload_status_text(
     expected_sec: float | None,
     limit_mb: int,
 ) -> str:
-    """Текст статуса при отправке в Telegram: полоска — только оценка."""
+    """Текст статуса при отправке в Telegram: полоска — только оценка.
+
+    Без оценки (`expected_sec` is None — мелкий файл) полоски нет, и вместо
+    неё в заголовке тикает счётчик «идёт N с».
+    """
     height = plan.chosen_height if plan else None
-    title = _title(UPLOAD_TITLE, height, size_mb)
     if expected_sec is None or elapsed_sec is None:
-        return _append_note(title, plan, limit_mb)
+        return _append_note(_title(UPLOAD_TITLE, height, size_mb, elapsed_sec), plan, limit_mb)
+    title = _title(UPLOAD_TITLE, height, size_mb)
     body = _upload_progress_line(elapsed_sec, expected_sec)
     return _append_note(f"{title}\n{body}", plan, limit_mb)
 

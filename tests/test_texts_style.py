@@ -60,6 +60,8 @@ def _user_facing_texts() -> list[str]:
         QUEUED_TEXT,
         download_status_text(None, limit_mb=1500),
         upload_status_text(None, size_mb=12.0, elapsed_sec=None, expected_sec=None, limit_mb=1500),
+        upload_status_text(None, size_mb=2.0, elapsed_sec=65, expected_sec=None, limit_mb=1500),
+        download_status_text(None, limit_mb=1500, elapsed_sec=65),
         queue_status_text(2),
         refusal_text(
             [("https://youtu.be/abc", Admission.DUPLICATE), ("https://youtu.be/def", Admission.FULL)],
